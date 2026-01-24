@@ -28,11 +28,11 @@ class IVFIndex {
   virtual Status Add(const AlignedVector<VectorRecord>& recs) = 0;
 
   // TS: Searches specified versions using whitened query.
-  virtual Result<std::vector<Candidate>> Search(Eigen::Ref<const Eigen::VectorXf> qw,
-                                                uint32_t topk,
-                                                uint32_t nprobe,
-                                                const VersionSet& route_versions,
-                                                uint8_t from_new) const = 0;
+  virtual Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> qw,
+                                      uint32_t topk,
+                                      uint32_t nprobe,
+                                      const VersionSet& route_versions,
+                                      uint8_t from_new) const = 0;
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;

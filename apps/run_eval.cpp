@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -43,9 +44,18 @@ MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
 struct EvalMetrics {
   bool use_whitening{false};
   double recall{0.0};
-  double p50_ms{0.0};
-  double p99_ms{0.0};
+  double whitening_p50{0.0};
+  double whitening_p99{0.0};
+  double avg_whiten_ms{0.0};
+  double search_p50{0.0};
+  double search_p99{0.0};
+  double total_p50{0.0};
+  double total_p99{0.0};
   double qps{0.0};
+  double scanned_avg{0.0};
+  double scanned_p50{0.0};
+  double scanned_p99{0.0};
+  double scanned_max{0.0};
 };
 
 int main(int argc, char** argv) {
@@ -235,27 +245,40 @@ int main(int argc, char** argv) {
       return ivf_version_res.status();
     }
     VersionSet versions{whiten_version, 0, ivf_version_res.value()};
+    AlignedVector<VectorRecord> records;
+    records.reserve(static_cast<size_t>(X_index.rows()));
+    const int64_t list_count = std::max<int64_t>(1, static_cast<int64_t>(ivf_params.nlist));
+    for (int64_t i = 0; i < X_index.rows(); ++i) {
+      VectorRecord rec;
+      rec.doc_id = ids[static_cast<size_t>(i)];
+      rec.dim = config.dim;
+      rec.versions = versions;
+      rec.ivf_id = static_cast<uint32_t>(i % list_count);
+      rec.x = X_index.row(i).transpose();
+      records.push_back(std::move(rec));
+    }
+    Status add_status = ivf->Add(records);
+    if (!add_status.ok()) {
+      return add_status;
+    }
     Status index_status = searcher->SetIndex(ivf, versions);
     if (!index_status.ok()) {
       return index_status;
     }
-    if (use_whitening) {
-      Status wstatus = searcher->SetWhitening(whitening, whiten_version);
-      if (!wstatus.ok()) {
-        return wstatus;
-      }
-    } else {
-      searcher->SetWhitening(nullptr, 0);
-    }
 
     SearchParams params = base_params;
-    params.use_whitening = use_whitening;
+    params.use_whitening = false;
 
     std::vector<std::vector<DocId>> predictions(nq);
-    std::vector<double> latencies_ms(nq, 0.0);
+    std::vector<double> whitening_ms(nq, 0.0);
+    std::vector<double> search_ms(nq, 0.0);
+    std::vector<double> total_ms(nq, 0.0);
+    std::vector<double> scanned_counts(nq, 0.0);
     std::atomic<bool> failed{false};
     std::mutex error_mu;
     Status error_status;
+
+    Timer wall_timer;
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -265,9 +288,28 @@ int main(int argc, char** argv) {
         continue;
       }
       Eigen::VectorXf qvec = Q.row(i).transpose();
-      Timer timer;
-      auto search_res = searcher->Search(qvec, params);
-      double elapsed = timer.ElapsedMillis();
+      double whiten_elapsed = 0.0;
+      const Eigen::VectorXf* query_ptr = &qvec;
+      if (use_whitening) {
+        static thread_local Eigen::VectorXf tls_whiten_buf;
+        if (tls_whiten_buf.size() != qvec.size()) {
+          tls_whiten_buf.resize(qvec.size());
+        }
+        Timer wtimer;
+        auto wstatus = whitening->Transform(qvec, whiten_version, tls_whiten_buf);
+        whiten_elapsed = wtimer.ElapsedMillis();
+        if (!wstatus.ok()) {
+          std::lock_guard<std::mutex> lock(error_mu);
+          if (!failed.exchange(true)) {
+            error_status = wstatus.status();
+          }
+          continue;
+        }
+        query_ptr = &tls_whiten_buf;
+      }
+      Timer search_timer;
+      auto search_res = searcher->Search(*query_ptr, params);
+      double search_elapsed = search_timer.ElapsedMillis();
       if (!search_res.ok()) {
         std::lock_guard<std::mutex> lock(error_mu);
         if (!failed.exchange(true)) {
@@ -281,8 +323,13 @@ int main(int argc, char** argv) {
         row.push_back(cand.doc_id);
       }
       predictions[i] = std::move(row);
-      latencies_ms[i] = elapsed;
+      whitening_ms[i] = whiten_elapsed;
+      search_ms[i] = search_elapsed;
+      total_ms[i] = whiten_elapsed + search_elapsed;
+      scanned_counts[i] = static_cast<double>(search_res.value().scanned_candidates);
     }
+
+    double wall_elapsed_ms = wall_timer.ElapsedMillis();
 
     if (failed.load()) {
       return error_status;
@@ -293,19 +340,66 @@ int main(int argc, char** argv) {
       return recall_res.status();
     }
 
-    double total_ms = std::accumulate(latencies_ms.begin(), latencies_ms.end(), 0.0);
-    double qps = (total_ms > 0.0) ? (static_cast<double>(nq) / (total_ms / 1000.0)) : 0.0;
-    auto summary = SummarizeLatencies(latencies_ms);
-    if (!summary.ok()) {
-      return summary.status();
+    auto whiten_summary = SummarizeLatencies(whitening_ms);
+    if (!whiten_summary.ok()) {
+      return whiten_summary.status();
     }
+    auto search_summary = SummarizeLatencies(search_ms);
+    if (!search_summary.ok()) {
+      return search_summary.status();
+    }
+    auto total_summary = SummarizeLatencies(total_ms);
+    if (!total_summary.ok()) {
+      return total_summary.status();
+    }
+    double avg_whiten = 0.0;
+    if (nq > 0) {
+      avg_whiten = std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) /
+                   static_cast<double>(nq);
+    }
+    auto percentile = [](std::vector<double> values, double q) -> double {
+      if (values.empty()) {
+        return 0.0;
+      }
+      std::sort(values.begin(), values.end());
+      double idx = q * (values.size() - 1);
+      size_t lo = static_cast<size_t>(std::floor(idx));
+      size_t hi = static_cast<size_t>(std::ceil(idx));
+      double frac = idx - lo;
+      if (hi >= values.size()) {
+        hi = values.size() - 1;
+      }
+      return values[lo] + (values[hi] - values[lo]) * frac;
+    };
+    double scanned_avg = 0.0;
+    double scanned_p50 = 0.0;
+    double scanned_p99 = 0.0;
+    double scanned_max = 0.0;
+    if (nq > 0) {
+      scanned_avg = std::accumulate(scanned_counts.begin(), scanned_counts.end(), 0.0) /
+                    static_cast<double>(nq);
+      scanned_p50 = percentile(scanned_counts, 0.50);
+      scanned_p99 = percentile(scanned_counts, 0.99);
+      scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
+    }
+    double qps =
+        (wall_elapsed_ms > 0.0) ? (static_cast<double>(nq) / (wall_elapsed_ms / 1000.0)) : 0.0;
 
     EvalMetrics metrics;
     metrics.use_whitening = use_whitening;
     metrics.recall = recall_res.value();
-    metrics.p50_ms = summary.value().p50_ms;
-    metrics.p99_ms = summary.value().p99_ms;
+    metrics.whitening_p50 = whiten_summary.value().p50_ms;
+    metrics.whitening_p99 = whiten_summary.value().p99_ms;
+    metrics.avg_whiten_ms = avg_whiten;
+    metrics.search_p50 = search_summary.value().p50_ms;
+    metrics.search_p99 = search_summary.value().p99_ms;
+    metrics.total_p50 = total_summary.value().p50_ms;
+    metrics.total_p99 = total_summary.value().p99_ms;
     metrics.qps = qps;
+    metrics.scanned_avg = scanned_avg;
+    metrics.scanned_p50 = scanned_p50;
+    metrics.scanned_p99 = scanned_p99;
+    metrics.scanned_max = scanned_max;
     return metrics;
   };
 
@@ -329,10 +423,17 @@ int main(int argc, char** argv) {
       ofs << "  \"timestamp\": " << ts << ",\n";
       ofs << "  \"use_whitening\": " << (metrics.use_whitening ? "true" : "false") << ",\n";
       ofs << "  \"metrics\": {\n";
-      ofs << "    \"recall@"
-          << config.topk << "\": " << metrics.recall << ",\n";
-      ofs << "    \"latency_ms\": {\"p50\": " << metrics.p50_ms << ", \"p99\": " << metrics.p99_ms << "},\n";
-      ofs << "    \"qps\": " << metrics.qps << "\n";
+      ofs << "    \"recall@" << config.topk << "\": " << metrics.recall << ",\n";
+      ofs << "    \"latency_ms\": {\n";
+      ofs << "      \"whitening\": {\"p50\": " << metrics.whitening_p50 << ", \"p99\": " << metrics.whitening_p99
+          << ", \"avg\": " << metrics.avg_whiten_ms << "},\n";
+      ofs << "      \"search\": {\"p50\": " << metrics.search_p50 << ", \"p99\": " << metrics.search_p99 << "},\n";
+      ofs << "      \"total\": {\"p50\": " << metrics.total_p50 << ", \"p99\": " << metrics.total_p99 << "}\n";
+      ofs << "    },\n";
+      ofs << "    \"qps\": " << metrics.qps << ",\n";
+      ofs << "    \"scanned_candidates\": {\"avg\": " << metrics.scanned_avg << ", \"p50\": "
+          << metrics.scanned_p50 << ", \"p99\": " << metrics.scanned_p99 << ", \"max\": "
+          << metrics.scanned_max << "}\n";
       ofs << "  },\n";
       ofs << "  \"params\": {\n";
       ofs << "    \"topk\": " << config.topk << ",\n";
@@ -366,8 +467,13 @@ int main(int argc, char** argv) {
     const EvalMetrics& metrics = metrics_res.value();
     std::cout << (mode ? "[IVF+ZCA] " : "[IVF] ") << "Recall@" << config.topk << " = " << metrics.recall
               << " (nprobe=" << base_params.nprobe << ")" << std::endl;
-    std::cout << "Latency p50=" << metrics.p50_ms << "ms, p99=" << metrics.p99_ms << "ms, QPS=" << metrics.qps
-              << std::endl;
+    std::cout << "Search p50=" << metrics.search_p50 << "ms, p99=" << metrics.search_p99 << "ms; "
+              << "Total p50=" << metrics.total_p50 << "ms, p99=" << metrics.total_p99 << "ms; "
+              << "Whitening p50=" << metrics.whitening_p50 << "ms, p99=" << metrics.whitening_p99
+              << "ms, avg=" << metrics.avg_whiten_ms << "ms; "
+              << "Scanned avg=" << metrics.scanned_avg << ", p50=" << metrics.scanned_p50
+              << ", p99=" << metrics.scanned_p99 << ", max=" << metrics.scanned_max << "; "
+              << "QPS=" << metrics.qps << std::endl;
     save_metrics(metrics);
   }
 

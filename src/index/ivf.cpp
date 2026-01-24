@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
 #include <random>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ann {
@@ -31,7 +33,55 @@ struct IndexData {
   VersionId version{0};
   MatrixRM centroids;
   std::vector<AlignedVector<ListEntry>> lists;
+  std::unordered_set<DocId> doc_ids;
+  uint64_t ntotal{0};
 };
+
+struct ListStats {
+  uint64_t total{0};
+  uint32_t min{0};
+  double avg{0.0};
+  double p99{0.0};
+  uint32_t max{0};
+};
+
+ListStats ComputeListStats(const IndexData& data) {
+  ListStats stats;
+  if (data.lists.empty()) {
+    return stats;
+  }
+  std::vector<uint32_t> sizes;
+  sizes.reserve(data.lists.size());
+  uint64_t total = 0;
+  uint32_t min_sz = std::numeric_limits<uint32_t>::max();
+  uint32_t max_sz = 0;
+  for (const auto& list : data.lists) {
+    const uint32_t sz = static_cast<uint32_t>(list.size());
+    sizes.push_back(sz);
+    total += sz;
+    min_sz = std::min(min_sz, sz);
+    max_sz = std::max(max_sz, sz);
+  }
+  stats.total = total;
+  stats.min = min_sz;
+  stats.max = max_sz;
+  stats.avg = static_cast<double>(total) / static_cast<double>(sizes.size());
+  std::sort(sizes.begin(), sizes.end());
+  const double rank = 0.99 * static_cast<double>(sizes.size() - 1);
+  const size_t lo = static_cast<size_t>(rank);
+  const size_t hi = std::min(sizes.size() - 1, lo + 1);
+  const double frac = rank - static_cast<double>(lo);
+  stats.p99 = static_cast<double>(sizes[lo]) +
+              (static_cast<double>(sizes[hi]) - static_cast<double>(sizes[lo])) * frac;
+  return stats;
+}
+
+void LogListStats(const IndexData& data) {
+  ListStats stats = ComputeListStats(data);
+  std::cout << "[IVF] lists total=" << stats.total << " (ntotal=" << data.ntotal
+            << ") min=" << stats.min << " avg=" << stats.avg << " p99=" << stats.p99
+            << " max=" << stats.max << std::endl;
+}
 
 int NearestCentroid(Eigen::Ref<const Eigen::VectorXf> vec, const IndexData& data) {
   float best = std::numeric_limits<float>::max();
@@ -128,27 +178,10 @@ class KMeansIVFIndex : public IVFIndex {
     data->dim = dim;
     data->nlist = nlist;
     data->centroids = std::move(centroids);
+    data->lists.clear();
     data->lists.resize(nlist);
-
-    // Assign vectors to lists.
-    for (int64_t i = 0; i < Xw.rows(); ++i) {
-      Eigen::VectorXf vec = Xw.row(i).transpose();
-      float best = std::numeric_limits<float>::max();
-      int best_idx = 0;
-      for (uint32_t c = 0; c < nlist; ++c) {
-        float dist = (data->centroids.row(c).transpose() - vec).squaredNorm();
-        if (dist < best) {
-          best = dist;
-          best_idx = static_cast<int>(c);
-        }
-      }
-      ListEntry entry;
-      entry.doc_id = ids[i];
-      entry.versions = VersionSet{0, 0, 0};
-      entry.vector = std::move(vec);
-      entry.norm = entry.vector.squaredNorm();
-      data->lists[best_idx].push_back(std::move(entry));
-    }
+    data->doc_ids.clear();
+    data->ntotal = 0;
 
     std::unique_lock lock(mu_);
     VersionId version = (index_version == 0) ? next_version_++ : index_version;
@@ -177,6 +210,9 @@ class KMeansIVFIndex : public IVFIndex {
       if (rec.x.size() != data.dim) {
         return Status::InvalidArgument("Record dim mismatch");
       }
+      if (!data.doc_ids.insert(rec.doc_id).second) {
+        return Status::AlreadyExists("doc_id already present in IVF");
+      }
       int centroid = NearestCentroid(rec.x, data);
       ListEntry entry;
       entry.doc_id = rec.doc_id;
@@ -185,15 +221,17 @@ class KMeansIVFIndex : public IVFIndex {
       entry.vector = rec.x;
       entry.norm = entry.vector.squaredNorm();
       data.lists[centroid].push_back(std::move(entry));
+      ++data.ntotal;
     }
+    LogListStats(data);
     return Status::OK();
   }
 
-  Result<std::vector<Candidate>> Search(Eigen::Ref<const Eigen::VectorXf> qw,
-                                        uint32_t topk,
-                                        uint32_t nprobe,
-                                        const VersionSet& route_versions,
-                                        uint8_t from_new) const override {
+  Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> qw,
+                              uint32_t topk,
+                              uint32_t nprobe,
+                              const VersionSet& route_versions,
+                              uint8_t from_new) const override {
     if (topk == 0) {
       return Status::InvalidArgument("topk must be positive");
     }
@@ -216,11 +254,17 @@ class KMeansIVFIndex : public IVFIndex {
     std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    std::vector<Candidate> candidates;
+    auto heap_cmp = [](const Candidate& a, const Candidate& b) {
+      return a.approx_dist < b.approx_dist;
+    };
+    std::vector<Candidate> heap;
+    heap.reserve(topk);
+    uint64_t scanned = 0;
     const float qnorm = qw.squaredNorm();
     for (uint32_t pi = 0; pi < probes; ++pi) {
       uint32_t list_id = centroid_dists[pi].second;
       for (const auto& entry : data.lists[list_id]) {
+        ++scanned;
         Candidate cand;
         cand.doc_id = entry.doc_id;
         const float dot = entry.vector.dot(qw);
@@ -229,22 +273,29 @@ class KMeansIVFIndex : public IVFIndex {
         cand.versions = entry.versions;
         cand.versions.index_version = data.version;
         cand.from_new = from_new;
-        candidates.push_back(std::move(cand));
+        if (heap.size() < topk) {
+          heap.push_back(std::move(cand));
+          std::push_heap(heap.begin(), heap.end(), heap_cmp);
+        } else if (!heap.empty() && cand.approx_dist < heap.front().approx_dist) {
+          std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+          heap.back() = std::move(cand);
+          std::push_heap(heap.begin(), heap.end(), heap_cmp);
+        }
       }
     }
 
-    if (candidates.empty()) {
-      return candidates;
+    if (heap.empty()) {
+      SearchResult result;
+      result.scanned_candidates = scanned;
+      return result;
     }
 
-    if (candidates.size() > topk) {
-      std::nth_element(candidates.begin(), candidates.begin() + topk, candidates.end(),
-                       [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
-      candidates.resize(topk);
-    }
-    std::sort(candidates.begin(), candidates.end(),
+    std::sort(heap.begin(), heap.end(),
               [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
-    return candidates;
+    SearchResult result;
+    result.topk = std::move(heap);
+    result.scanned_candidates = scanned;
+    return result;
   }
 
   Result<std::vector<uint8_t>> Serialize() const override { return std::vector<uint8_t>{}; }

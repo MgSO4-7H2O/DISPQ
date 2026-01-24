@@ -12,7 +12,7 @@
 namespace ann {
 namespace {
 
-constexpr float kDefaultEpsilon = 1e-5f;
+constexpr float kDefaultEpsilon = 0;
 
 struct VersionPayload {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -228,13 +228,18 @@ class ZCAWhiteningModel : public WhiteningModel {
     }
     Eigen::VectorXf eigenvalues = solver.eigenvalues();
     MatrixRM eigenvectors = solver.eigenvectors();
-    Eigen::VectorXf inv_sqrt = (eigenvalues.array() + payload->epsilon).sqrt().inverse();
-    MatrixRM diag = inv_sqrt.asDiagonal();
-    payload->transform = eigenvectors * diag * eigenvectors.transpose();
-    Eigen::VectorXf sqrt_vals = (eigenvalues.array() + payload->epsilon).sqrt();
-    payload->transform_inv = eigenvectors * sqrt_vals.asDiagonal() * eigenvectors.transpose();
+  
+    // transform = sqrt(Sigma) = V * sqrt(D) * V^T
+    Eigen::VectorXf sqrt_vals = eigenvalues.array().sqrt();
+    payload->transform = eigenvectors * sqrt_vals.asDiagonal() * eigenvectors.transpose();
+  
+    // transform_inv = inv_sqrt(Sigma) = V * (1/sqrt(D)) * V^T
+    Eigen::VectorXf inv_sqrt = eigenvalues.array().sqrt().inverse();
+    payload->transform_inv = eigenvectors * inv_sqrt.asDiagonal() * eigenvectors.transpose();
+  
     return Status::OK();
   }
+  
 
   void ResetPending() {
     pending_sum_.resize(0);
