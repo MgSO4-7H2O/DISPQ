@@ -10,7 +10,6 @@
 #include "common/result.h"
 #include "common/types.h"
 #include "index/ivf.h"
-#include "quant/rvq.h"
 #include "whitening/whitening.h"
 
 using namespace ann;
@@ -50,7 +49,6 @@ int main(int argc, char** argv) {
   std::cout << "Loaded " << config.ToString() << std::endl;
 
   auto whitening = CreateWhiteningModel();
-  auto rvq = CreateRVQCodebook();
   auto ivf = CreateIVFIndex();
 
   std::optional<std::string> base_dataset_path;
@@ -104,19 +102,6 @@ int main(int argc, char** argv) {
     X_for_ivf = batch_res.value();
   }
 
-  RVQParams rvq_params;
-  rvq_params.num_layers = config.rvq_layers;
-  rvq_params.codewords = config.rvq_codewords;
-
-  MatrixRM rvq_train = config.use_whitening ? X_for_ivf : X;
-
-  auto rvq_version_res = rvq->Train(rvq_train, rvq_params);
-  if (!rvq_version_res.ok()) {
-    std::cerr << rvq_version_res.status().ToString() << std::endl;
-    return 1;
-  }
-  VersionId rvq_version = rvq_version_res.value();
-
   std::vector<DocId> ids(num_vectors);
   for (uint32_t i = 0; i < num_vectors; ++i) {
     ids[i] = i;
@@ -138,7 +123,7 @@ int main(int argc, char** argv) {
     VectorRecord rec;
     rec.doc_id = ids[i];
     rec.dim = config.dim;
-    rec.versions = VersionSet{whiten_version, rvq_version, ivf_version};
+    rec.versions = VersionSet{whiten_version, ivf_version};
     rec.ivf_id = i % std::max(1u, ivf_params.nlist);
     Eigen::VectorXf original = X.row(i).transpose();
     Eigen::VectorXf xw = original;
@@ -151,14 +136,6 @@ int main(int argc, char** argv) {
     }
     rec.x = xw;
 
-    Eigen::VectorXf residual(config.dim);
-    std::vector<uint32_t> codes;
-    auto encode_res = rvq->Encode(xw, rvq_version, &codes, &residual);
-    if (!encode_res.ok()) {
-      std::cerr << encode_res.status().ToString() << std::endl;
-      return 1;
-    }
-    rec.codes = std::move(codes);
     records.push_back(rec);
   }
 

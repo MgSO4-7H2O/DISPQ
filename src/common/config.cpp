@@ -33,8 +33,6 @@ bool ExtractBool(const std::string& text, const std::string& key, bool* out) {
 std::string Config::ToString() const {
   std::ostringstream oss;
   oss << "Config{"
-      << "rvq_layers=" << rvq_layers << ", "
-      << "rvq_codewords=" << rvq_codewords << ", "
       << "ivf_nlist=" << ivf_nlist << ", "
       << "topk=" << topk << ", "
       << "nprobe=" << nprobe << ", "
@@ -55,8 +53,6 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   const std::string text = buffer.str();
 
   Config cfg;
-  ExtractUint(text, "rvq_layers", &cfg.rvq_layers);
-  ExtractUint(text, "rvq_codewords", &cfg.rvq_codewords);
   ExtractUint(text, "ivf_nlist", &cfg.ivf_nlist);
   ExtractUint(text, "topk", &cfg.topk);
   ExtractUint(text, "nprobe", &cfg.nprobe);

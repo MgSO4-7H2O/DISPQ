@@ -31,7 +31,7 @@ struct IndexData {
   uint32_t dim{0};
   uint32_t nlist{0};
   VersionId version{0};
-  MatrixRM centroids;
+  MatrixRM routing_centroids;
   std::vector<AlignedVector<ListEntry>> lists;
   std::unordered_set<DocId> doc_ids;
   uint64_t ntotal{0};
@@ -86,8 +86,8 @@ void LogListStats(const IndexData& data) {
 int NearestCentroid(Eigen::Ref<const Eigen::VectorXf> vec, const IndexData& data) {
   float best = std::numeric_limits<float>::max();
   int best_idx = 0;
-  for (int i = 0; i < data.centroids.rows(); ++i) {
-    float dist = (data.centroids.row(i).transpose() - vec).squaredNorm();
+  for (int i = 0; i < data.routing_centroids.rows(); ++i) {
+    float dist = (data.routing_centroids.row(i).transpose() - vec).squaredNorm();
     if (dist < best) {
       best = dist;
       best_idx = i;
@@ -177,7 +177,7 @@ class KMeansIVFIndex : public IVFIndex {
     auto data = std::make_unique<IndexData>();
     data->dim = dim;
     data->nlist = nlist;
-    data->centroids = std::move(centroids);
+    data->routing_centroids = std::move(centroids);
     data->lists.clear();
     data->lists.resize(nlist);
     data->doc_ids.clear();
@@ -248,7 +248,7 @@ class KMeansIVFIndex : public IVFIndex {
 
     std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
     for (uint32_t i = 0; i < data.nlist; ++i) {
-      float dist = (data.centroids.row(i).transpose() - qw).squaredNorm();
+      float dist = (data.routing_centroids.row(i).transpose() - qw).squaredNorm();
       centroid_dists[i] = {dist, i};
     }
     std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),

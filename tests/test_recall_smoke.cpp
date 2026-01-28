@@ -36,7 +36,7 @@ int main() {
   auto searcher_res = CreateHybridSearcher(cfg);
   assert(searcher_res.ok());
   std::unique_ptr<HybridSearcher> searcher = std::move(searcher_res.value());
-  VersionSet versions{0, 0, version_res.value()};
+  VersionSet versions{0, version_res.value()};
   assert(searcher->SetIndex(ivf, versions).ok());
 
   SearchParams params;

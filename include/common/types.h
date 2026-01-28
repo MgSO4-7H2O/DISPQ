@@ -17,7 +17,6 @@ using AlignedVector = std::vector<T, Eigen::aligned_allocator<T>>;
 
 struct VersionSet {
   VersionId whiten_version{0};
-  VersionId codebook_version{0};
   VersionId index_version{0};
 };
 
@@ -41,7 +40,6 @@ struct VectorRecord {
   uint32_t dim{0};
   VersionSet versions{};
   uint32_t ivf_id{0};
-  std::vector<uint32_t> codes;
   Eigen::VectorXf x;
 };
 

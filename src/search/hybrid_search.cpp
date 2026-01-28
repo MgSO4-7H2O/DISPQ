@@ -43,17 +43,16 @@ class ConcreteHybridSearcher : public HybridSearcher {
     if (!ivf_) {
       return Status::Unavailable("IVF index not initialized");
     }
+    const uint8_t from_new = params.enable_dual_route ? 1 : 0;
     if (params.use_whitening && whitening_) {
       Eigen::VectorXf query_buf(query.size());
       auto tstatus = whitening_->Transform(query, whitening_version_, query_buf);
       if (!tstatus.ok()) {
         return tstatus.status();
       }
-      return ivf_->Search(query_buf, params.topk, params.nprobe, route_versions_,
-                          params.enable_dual_route ? 1 : 0);
+      return ivf_->Search(query_buf, params.topk, params.nprobe, route_versions_, from_new);
     }
-    return ivf_->Search(query, params.topk, params.nprobe, route_versions_,
-                        params.enable_dual_route ? 1 : 0);
+    return ivf_->Search(query, params.topk, params.nprobe, route_versions_, from_new);
   }
 
  private:

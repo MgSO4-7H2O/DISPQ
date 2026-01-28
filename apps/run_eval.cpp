@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
     if (!ivf_version_res.ok()) {
       return ivf_version_res.status();
     }
-    VersionSet versions{whiten_version, 0, ivf_version_res.value()};
+    VersionSet versions{whiten_version, ivf_version_res.value()};
     AlignedVector<VectorRecord> records;
     records.reserve(static_cast<size_t>(X_index.rows()));
     const int64_t list_count = std::max<int64_t>(1, static_cast<int64_t>(ivf_params.nlist));
@@ -439,8 +439,6 @@ int main(int argc, char** argv) {
       ofs << "    \"topk\": " << config.topk << ",\n";
       ofs << "    \"nprobe\": " << base_params.nprobe << ",\n";
       ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
-      ofs << "    \"rvq_layers\": " << config.rvq_layers << ",\n";
-      ofs << "    \"rvq_codewords\": " << config.rvq_codewords << ",\n";
       ofs << "    \"use_whitening\": " << (metrics.use_whitening ? "true" : "false") << "\n";
       ofs << "  }\n";
       ofs << "}\n";

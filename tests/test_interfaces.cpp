@@ -15,7 +15,6 @@
 #include "index/ivf.h"
 #include "index/postings.h"
 #include "monitor/drift.h"
-#include "quant/rvq.h"
 #include "search/hybrid_search.h"
 #include "search/rerank.h"
 #include "whitening/whitening.h"
@@ -28,7 +27,6 @@ int main() {
   MatrixRM X = MatrixRM::Random(4, cfg.dim);
 
   auto whitening = CreateWhiteningModel();
-  auto rvq = CreateRVQCodebook();
   auto ivf = CreateIVFIndex();
 
   auto whiten_version = whitening->Fit(X);
@@ -46,37 +44,26 @@ int main() {
   auto bridge = whitening->Bridge(whiten_version.value(), whiten_version.value());
   assert(bridge.ok());
 
-  RVQParams params;
-  params.num_layers = 2;
-  params.codewords = 4;
-  auto rvq_version = rvq->Train(X, params);
-  assert(rvq_version.ok());
-
-  std::vector<uint32_t> codes;
-  Eigen::VectorXf residual(cfg.dim);
-  auto encode_status = rvq->Encode(xw, rvq_version.value(), &codes, &residual);
-  assert(encode_status.ok());
-
   std::vector<DocId> ids = {0, 1, 2, 3};
   IVFParams ivf_params;
   ivf_params.nlist = 2;
   ivf_params.dim = cfg.dim;
-  auto ivf_version = ivf->Build(X, ids, ivf_params, 1);
+  auto ivf_version = ivf->Build(whitened, ids, ivf_params, 1);
   assert(ivf_version.ok());
 
   VectorRecord rec;
   rec.doc_id = 0;
   rec.dim = cfg.dim;
-  rec.versions = VersionSet{whiten_version.value(), rvq_version.value(), ivf_version.value()};
+  rec.versions = VersionSet{whiten_version.value(), ivf_version.value()};
   rec.ivf_id = 0;
-  rec.codes = codes;
-  rec.x = sample;
+  rec.x = xw;
   AlignedVector<VectorRecord> recs = {rec};
   assert(ivf->Add(recs).ok());
 
   VersionSet routes = rec.versions;
   auto search_res = ivf->Search(xw, 2, 1, routes, 0);
   assert(search_res.ok());
+  assert(search_res.value().scanned_candidates >= search_res.value().topk.size());
 
   VersionSet bad_routes = routes;
   bad_routes.index_version = 999;
@@ -86,7 +73,7 @@ int main() {
   auto hybrid_res = CreateHybridSearcher(cfg);
   assert(hybrid_res.ok());
   auto searcher = std::move(hybrid_res.value());
-  VersionSet route_versions{whiten_version.value(), 0, ivf_version.value()};
+  VersionSet route_versions{whiten_version.value(), ivf_version.value()};
   assert(searcher->SetIndex(ivf, route_versions).ok());
   assert(searcher->SetWhitening(whitening, whiten_version.value()).ok());
   SearchParams search_params;
@@ -100,10 +87,6 @@ int main() {
   assert(posting_store.AddPosting(routes.index_version, 0, rec).ok());
   auto posting_view = posting_store.GetPostingList(routes.index_version, 0);
   assert(posting_view.ok());
-
-  auto serialized = rvq->Serialize();
-  assert(serialized.ok());
-  assert(rvq->Deserialize(serialized.value()).ok());
 
   std::vector<uint8_t> payload = {1, 2, 3};
   const std::string tmp_file = "test_serialization.bin";

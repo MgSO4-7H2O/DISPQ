@@ -8,8 +8,6 @@
 namespace ann {
 
 struct Config {
-  uint32_t rvq_layers{2};
-  uint32_t rvq_codewords{256};
   uint32_t ivf_nlist{1024};
   uint32_t topk{10};
   uint32_t nprobe{8};
