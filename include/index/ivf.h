@@ -10,9 +10,17 @@
 
 namespace ann {
 
+struct PQParams {
+  bool enable{false};
+  uint32_t M{0};
+  uint32_t nbits{8};
+  bool residual{true};
+};
+
 struct IVFParams {
   uint32_t nlist{1024};
   uint32_t dim{0};
+  PQParams pq;
 };
 
 class IVFIndex {

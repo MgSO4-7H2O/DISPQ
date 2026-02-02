@@ -39,7 +39,12 @@ std::string Config::ToString() const {
       << "use_whitening=" << std::boolalpha << use_whitening << ", "
       << "enable_dual_route=" << std::boolalpha << enable_dual_route << ", "
       << "dim=" << dim << ", "
-      << "seed=" << seed << "}";
+      << "seed=" << seed << ", "
+      << "pq_enable=" << std::boolalpha << pq_enable << ", "
+      << "pq_m=" << pq_m << ", "
+      << "pq_nbits=" << pq_nbits << ", "
+      << "pq_residual=" << std::boolalpha << pq_residual << ", "
+      << "max_queries=" << max_queries << "}";
   return oss.str();
 }
 
@@ -60,6 +65,11 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "seed", &cfg.seed);
   ExtractBool(text, "use_whitening", &cfg.use_whitening);
   ExtractBool(text, "enable_dual_route", &cfg.enable_dual_route);
+  ExtractBool(text, "pq_enable", &cfg.pq_enable);
+  ExtractUint(text, "pq_m", &cfg.pq_m);
+  ExtractUint(text, "pq_nbits", &cfg.pq_nbits);
+  ExtractBool(text, "pq_residual", &cfg.pq_residual);
+  ExtractUint(text, "max_queries", &cfg.max_queries);
 
   return cfg;
 }

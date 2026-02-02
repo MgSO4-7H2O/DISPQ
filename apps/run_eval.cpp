@@ -173,8 +173,14 @@ int main(int argc, char** argv) {
       }
     }
   } else {
-    nq = 8;
+    nq = (config.max_queries > 0) ? config.max_queries : 8;
     Q = GenerateRandom(nq, config.dim, config.seed + 1);
+  }
+
+  if (config.max_queries > 0 && nq > config.max_queries) {
+    MatrixRM limited = Q.topRows(config.max_queries);
+    Q = limited;
+    nq = config.max_queries;
   }
 
   auto exact_res = ExactSearchBatch(Q, X, config.topk);
@@ -240,6 +246,10 @@ int main(int argc, char** argv) {
     IVFParams ivf_params;
     ivf_params.nlist = std::max(1u, config.ivf_nlist);
     ivf_params.dim = config.dim;
+    ivf_params.pq.enable = config.pq_enable;
+    ivf_params.pq.M = config.pq_m;
+    ivf_params.pq.nbits = config.pq_nbits;
+    ivf_params.pq.residual = config.pq_residual;
     auto ivf_version_res = ivf->Build(X_index, ids, ivf_params, 0);
     if (!ivf_version_res.ok()) {
       return ivf_version_res.status();

@@ -24,6 +24,7 @@ struct ListEntry {
   VersionSet versions;
   Eigen::VectorXf vector;
   float norm{0.0f};
+  std::vector<uint8_t> pq_code;
 };
 
 struct IndexData {
@@ -31,7 +32,14 @@ struct IndexData {
   uint32_t dim{0};
   uint32_t nlist{0};
   VersionId version{0};
+  bool use_pq{false};
+  bool pq_residual{true};
+  uint32_t M{0};
+  uint32_t nbits{8};
+  uint32_t Ks{0};
+  uint32_t dsub{0};
   MatrixRM routing_centroids;
+  std::vector<MatrixRM> pq_codebooks;
   std::vector<AlignedVector<ListEntry>> lists;
   std::unordered_set<DocId> doc_ids;
   uint64_t ntotal{0};
@@ -169,6 +177,17 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::InvalidArgument("nlist must be >0");
     }
     uint32_t dim = static_cast<uint32_t>(Xw.cols());
+    if (p.pq.enable) {
+      if (p.pq.M == 0) {
+        return Status::InvalidArgument("PQ M must be >0");
+      }
+      if (dim % p.pq.M != 0) {
+        return Status::InvalidArgument("dim must be divisible by PQ M");
+      }
+      if (p.pq.nbits == 0 || p.pq.nbits > 8) {
+        return Status::InvalidArgument("PQ nbits must be in [1,8]");
+      }
+    }
     const uint32_t nlist = std::min<uint32_t>(p.nlist, static_cast<uint32_t>(Xw.rows()));
 
     MatrixRM centroids = InitializeCentroids(Xw, nlist);
@@ -178,10 +197,45 @@ class KMeansIVFIndex : public IVFIndex {
     data->dim = dim;
     data->nlist = nlist;
     data->routing_centroids = std::move(centroids);
+    data->use_pq = p.pq.enable;
+    data->pq_residual = p.pq.residual;
+    if (data->use_pq) {
+      data->M = p.pq.M;
+      data->nbits = p.pq.nbits;
+      data->Ks = 1u << data->nbits;
+      data->dsub = dim / data->M;
+    } else {
+      data->M = 0;
+      data->nbits = 8;
+      data->Ks = 0;
+      data->dsub = 0;
+      data->pq_codebooks.clear();
+    }
     data->lists.clear();
     data->lists.resize(nlist);
     data->doc_ids.clear();
     data->ntotal = 0;
+    if (data->use_pq) {
+      data->pq_codebooks.resize(data->M);
+      const int64_t num_vecs = Xw.rows();
+      MatrixRM residuals(num_vecs, dim);
+      for (int64_t i = 0; i < num_vecs; ++i) {
+        Eigen::VectorXf vec = Xw.row(i).transpose();
+        int centroid = NearestCentroid(vec, *data);
+        residuals.row(i) = Xw.row(i);
+        if (data->pq_residual) {
+          residuals.row(i) -= data->routing_centroids.row(centroid);
+        }
+      }
+      for (uint32_t m = 0; m < data->M; ++m) {
+        const Eigen::Index offset = static_cast<Eigen::Index>(m * data->dsub);
+        const Eigen::Index subdim = static_cast<Eigen::Index>(data->dsub);
+        MatrixRM sub = residuals.block(0, offset, residuals.rows(), subdim);
+        MatrixRM codebook = InitializeCentroids(sub, data->Ks);
+        RunKMeans(sub, &codebook);
+        data->pq_codebooks[m] = std::move(codebook);
+      }
+    }
 
     std::unique_lock lock(mu_);
     VersionId version = (index_version == 0) ? next_version_++ : index_version;
@@ -218,8 +272,33 @@ class KMeansIVFIndex : public IVFIndex {
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
-      entry.vector = rec.x;
-      entry.norm = entry.vector.squaredNorm();
+      if (data.use_pq) {
+        if (entry.pq_code.size() != data.M) {
+          entry.pq_code.resize(data.M);
+        }
+        Eigen::VectorXf residual = rec.x;
+        if (data.pq_residual) {
+          residual -= data.routing_centroids.row(centroid).transpose();
+        }
+        for (uint32_t m = 0; m < data.M; ++m) {
+          const MatrixRM& codebook = data.pq_codebooks[m];
+          Eigen::Map<const Eigen::VectorXf> sub(residual.data() + m * data.dsub,
+                                                static_cast<Eigen::Index>(data.dsub));
+          float best = std::numeric_limits<float>::max();
+          uint32_t best_idx = 0;
+          for (uint32_t k = 0; k < data.Ks; ++k) {
+            float dist = (codebook.row(k).transpose() - sub).squaredNorm();
+            if (dist < best) {
+              best = dist;
+              best_idx = k;
+            }
+          }
+          entry.pq_code[m] = static_cast<uint8_t>(best_idx);
+        }
+      } else {
+        entry.vector = rec.x;
+        entry.norm = entry.vector.squaredNorm();
+      }
       data.lists[centroid].push_back(std::move(entry));
       ++data.ntotal;
     }
@@ -245,6 +324,8 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::InvalidArgument("Query dim mismatch");
     }
     const uint32_t probes = std::max<uint32_t>(1, std::min<uint32_t>(nprobe, data.nlist));
+    const bool use_pq = data.use_pq && data.M > 0 && data.Ks > 0 && data.dsub > 0 &&
+                        data.pq_codebooks.size() == data.M;
 
     std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
     for (uint32_t i = 0; i < data.nlist; ++i) {
@@ -260,15 +341,46 @@ class KMeansIVFIndex : public IVFIndex {
     std::vector<Candidate> heap;
     heap.reserve(topk);
     uint64_t scanned = 0;
-    const float qnorm = qw.squaredNorm();
+    const float qnorm = use_pq ? 0.0f : qw.squaredNorm();
+    std::vector<float> distance_table;
+    if (use_pq) {
+      distance_table.resize(static_cast<size_t>(data.M) * data.Ks);
+    }
     for (uint32_t pi = 0; pi < probes; ++pi) {
       uint32_t list_id = centroid_dists[pi].second;
+      Eigen::VectorXf qres = qw;
+      if (use_pq && data.pq_residual) {
+        qres -= data.routing_centroids.row(list_id).transpose();
+      }
+      if (use_pq) {
+        for (uint32_t m = 0; m < data.M; ++m) {
+          const MatrixRM& codebook = data.pq_codebooks[m];
+          Eigen::Map<const Eigen::VectorXf> qsub(qres.data() + m * data.dsub,
+                                                 static_cast<Eigen::Index>(data.dsub));
+          for (uint32_t k = 0; k < data.Ks; ++k) {
+            float dist = (qsub - codebook.row(k).transpose()).squaredNorm();
+            distance_table[static_cast<size_t>(m) * data.Ks + k] = dist;
+          }
+        }
+      }
       for (const auto& entry : data.lists[list_id]) {
         ++scanned;
         Candidate cand;
         cand.doc_id = entry.doc_id;
-        const float dot = entry.vector.dot(qw);
-        cand.approx_dist = qnorm + entry.norm - 2.0f * dot;
+        if (use_pq) {
+          if (entry.pq_code.size() != data.M) {
+            continue;
+          }
+          float approx = 0.0f;
+          for (uint32_t m = 0; m < data.M; ++m) {
+            uint8_t code = entry.pq_code[m];
+            approx += distance_table[static_cast<size_t>(m) * data.Ks + code];
+          }
+          cand.approx_dist = approx;
+        } else {
+          const float dot = entry.vector.dot(qw);
+          cand.approx_dist = qnorm + entry.norm - 2.0f * dot;
+        }
         cand.rerank_dist = cand.approx_dist;
         cand.versions = entry.versions;
         cand.versions.index_version = data.version;

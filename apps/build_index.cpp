@@ -110,6 +110,10 @@ int main(int argc, char** argv) {
   IVFParams ivf_params;
   ivf_params.nlist = std::max(1u, config.ivf_nlist);
   ivf_params.dim = config.dim;
+  ivf_params.pq.enable = config.pq_enable;
+  ivf_params.pq.M = config.pq_m;
+  ivf_params.pq.nbits = config.pq_nbits;
+  ivf_params.pq.residual = config.pq_residual;
   auto ivf_version_res = ivf->Build(X_for_ivf, ids, ivf_params, 1);
   if (!ivf_version_res.ok()) {
     std::cerr << ivf_version_res.status().ToString() << std::endl;
