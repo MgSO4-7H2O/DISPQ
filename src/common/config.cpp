@@ -44,7 +44,8 @@ std::string Config::ToString() const {
       << "pq_m=" << pq_m << ", "
       << "pq_nbits=" << pq_nbits << ", "
       << "pq_residual=" << std::boolalpha << pq_residual << ", "
-      << "max_queries=" << max_queries << "}";
+      << "max_queries=" << max_queries << ", "
+      << "snapshot_interval=" << snapshot_interval << "}";
   return oss.str();
 }
 
@@ -70,6 +71,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "pq_nbits", &cfg.pq_nbits);
   ExtractBool(text, "pq_residual", &cfg.pq_residual);
   ExtractUint(text, "max_queries", &cfg.max_queries);
+  ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
 
   return cfg;
 }

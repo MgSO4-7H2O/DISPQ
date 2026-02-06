@@ -20,6 +20,7 @@ struct Config {
   uint32_t pq_nbits{8};
   bool pq_residual{true};
   uint32_t max_queries{0};
+  uint32_t snapshot_interval{0};
 
   std::string ToString() const;
 };

@@ -3,9 +3,15 @@
   "rvq_codewords": 256,
   "ivf_nlist": 1024,
   "topk": 100,
-  "nprobe": 32,
+  "nprobe": 64,
   "use_whitening": true,
   "enable_dual_route": false,
   "dim": 512,
-  "seed": 2024
+  "seed": 2024,
+  "pq_enable": true,
+  "pq_m": 64,
+  "pq_nbits": 8,
+  "pq_residual": true,
+  "max_queries": 1000,
+  "snapshot_interval": 5000
 }
