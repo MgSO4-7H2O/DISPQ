@@ -7,5 +7,11 @@
   "use_whitening": true,
   "enable_dual_route": true,
   "dim": 128,
-  "seed": 1337
+  "seed": 1337,
+  "pq_enable": true,
+  "pq_m": 16,
+  "pq_nbits": 8,
+  "pq_residual": true,
+  "max_queries": 10000,
+  "snapshot_interval": 100000
 }
