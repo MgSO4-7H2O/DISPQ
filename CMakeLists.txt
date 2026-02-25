@@ -11,7 +11,6 @@ add_library(ann
   src/common/config.cpp
   src/common/serialization.cpp
   src/whitening/whitening.cpp
-  src/quant/rvq.cpp
   src/index/ivf.cpp
   src/index/postings.cpp
   src/search/hybrid_search.cpp

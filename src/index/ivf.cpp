@@ -12,6 +12,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace ann {
 namespace {
 
@@ -126,6 +130,9 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X, MatrixRM* centroids) {
 
   for (int iter = 0; iter < kKMeansIterations; ++iter) {
     // Assignment step.
+  #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+  #endif
     for (int64_t i = 0; i < num_vecs; ++i) {
       Eigen::VectorXf vec = X.row(i).transpose();
       float best = std::numeric_limits<float>::max();
@@ -143,10 +150,44 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X, MatrixRM* centroids) {
     // Update step.
     MatrixRM new_centroids = MatrixRM::Zero(k, dim);
     std::vector<int64_t> counts(k, 0);
-    for (int64_t i = 0; i < num_vecs; ++i) {
-      new_centroids.row(assignments[i]) += X.row(i);
-      counts[assignments[i]]++;
-    }
+    #ifdef _OPENMP
+      int num_threads = 1;
+    #pragma omp parallel
+      {
+    #pragma omp single
+        { num_threads = omp_get_num_threads(); }
+      }
+      std::vector<MatrixRM> partial_sums(
+        static_cast<size_t>(num_threads), MatrixRM::Zero(k, dim));
+      std::vector<std::vector<int64_t>> partial_counts(
+        static_cast<size_t>(num_threads), std::vector<int64_t>(static_cast<size_t>(k), 0));
+    
+    #pragma omp parallel
+      {
+        const int tid = omp_get_thread_num();
+        MatrixRM& thread_sum = partial_sums[static_cast<size_t>(tid)];
+        std::vector<int64_t>& thread_counts = partial_counts[static_cast<size_t>(tid)];
+    #pragma omp for schedule(static)
+        for (int64_t i = 0; i < num_vecs; ++i) {
+          const int assign = assignments[i];
+          thread_sum.row(assign) += X.row(i);
+          thread_counts[static_cast<size_t>(assign)]++;
+        }
+      }
+    
+      for (int t = 0; t < num_threads; ++t) {
+        new_centroids += partial_sums[static_cast<size_t>(t)];
+        const auto& thread_counts = partial_counts[static_cast<size_t>(t)];
+        for (int64_t c = 0; c < k; ++c) {
+          counts[static_cast<size_t>(c)] += thread_counts[static_cast<size_t>(c)];
+        }
+      }
+    #else
+      for (int64_t i = 0; i < num_vecs; ++i) {
+        new_centroids.row(assignments[i]) += X.row(i);
+        counts[assignments[i]]++;
+      }
+    #endif
     std::mt19937 gen(kDefaultSeed + iter);
     std::uniform_int_distribution<int64_t> dist_index(0, num_vecs - 1);
     for (int64_t c = 0; c < k; ++c) {
@@ -219,6 +260,9 @@ class KMeansIVFIndex : public IVFIndex {
       data->pq_codebooks.resize(data->M);
       const int64_t num_vecs = Xw.rows();
       MatrixRM residuals(num_vecs, dim);
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(static)
+      #endif 
       for (int64_t i = 0; i < num_vecs; ++i) {
         Eigen::VectorXf vec = Xw.row(i).transpose();
         int centroid = NearestCentroid(vec, *data);
@@ -227,6 +271,9 @@ class KMeansIVFIndex : public IVFIndex {
           residuals.row(i) -= data->routing_centroids.row(centroid);
         }
       }
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(dynamic)
+      #endif
       for (uint32_t m = 0; m < data->M; ++m) {
         const Eigen::Index offset = static_cast<Eigen::Index>(m * data->dsub);
         const Eigen::Index subdim = static_cast<Eigen::Index>(data->dsub);
@@ -260,6 +307,7 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::NotFound("Latest version missing");
     }
     IndexData& data = *it->second;
+    
     for (const auto& rec : recs) {
       if (rec.x.size() != data.dim) {
         return Status::InvalidArgument("Record dim mismatch");
@@ -267,18 +315,29 @@ class KMeansIVFIndex : public IVFIndex {
       if (!data.doc_ids.insert(rec.doc_id).second) {
         return Status::AlreadyExists("doc_id already present in IVF");
       }
-      int centroid = NearestCentroid(rec.x, data);
+    }
+    
+    struct PendingEntry {
+      int centroid{0};
       ListEntry entry;
-      entry.doc_id = rec.doc_id;
-      entry.versions = rec.versions;
-      entry.versions.index_version = data.version;
+    };
+
+    std::vector<PendingEntry> pending(recs.size());
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+        for (int64_t i = 0; i < static_cast<int64_t>(recs.size()); ++i) {
+          const auto& rec = recs[static_cast<size_t>(i)];
+          PendingEntry local;
+          local.centroid = NearestCentroid(rec.x, data);
+          local.entry.doc_id = rec.doc_id;
+          local.entry.versions = rec.versions;
+          local.entry.versions.index_version = data.version;
       if (data.use_pq) {
-        if (entry.pq_code.size() != data.M) {
-          entry.pq_code.resize(data.M);
-        }
+        local.entry.pq_code.resize(data.M);
         Eigen::VectorXf residual = rec.x;
         if (data.pq_residual) {
-          residual -= data.routing_centroids.row(centroid).transpose();
+          residual -= data.routing_centroids.row(local.centroid).transpose();
         }
         for (uint32_t m = 0; m < data.M; ++m) {
           const MatrixRM& codebook = data.pq_codebooks[m];
@@ -293,13 +352,17 @@ class KMeansIVFIndex : public IVFIndex {
               best_idx = k;
             }
           }
-          entry.pq_code[m] = static_cast<uint8_t>(best_idx);
+          local.entry.pq_code[m] = static_cast<uint8_t>(best_idx);
         }
       } else {
-        entry.vector = rec.x;
-        entry.norm = entry.vector.squaredNorm();
+        local.entry.vector = rec.x;
+        local.entry.norm = local.entry.vector.squaredNorm();
       }
-      data.lists[centroid].push_back(std::move(entry));
+      pending[static_cast<size_t>(i)] = std::move(local);
+    }
+
+    for (auto& item : pending) {
+      data.lists[static_cast<size_t>(item.centroid)].push_back(std::move(item.entry));
       ++data.ntotal;
     }
     LogListStats(data);
