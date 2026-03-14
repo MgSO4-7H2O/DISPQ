@@ -40,8 +40,6 @@
 - 查询吞吐高
 - 不参与频繁在线更新
 
-------
-
 #### B. Active Delta Index（活动增量索引）
 
 所有新来的向量先写入这里。
@@ -61,8 +59,6 @@
 - main 和 delta 可以共用同一组 probed lists
 - 实现复杂度大幅下降
 
-------
-
 #### C. Closed Delta Index（封存增量索引）
 
 当 active delta 被 seal 之后，变成 closed delta：
@@ -70,8 +66,6 @@
 - 不再接收写入
 - 继续参与查询
 - 等待 merge 或淘汰或 main rebuild 吸收
-
-------
 
 #### D. Shadow Delta（影子候选索引）
 
@@ -125,7 +119,7 @@ $NPD_t = \mathbb{E}\left[\frac{||r-\hat r||^2}{||r||^2+\epsilon}\right]$
 
 $CM_t = \mathbb{E}\left[\frac{d2-d1}{d1+\epsilon}\right]$
 
-#### 4.4 List Distribution Shift（LDS）
+#### 4.4 List Distribution Shift（LDS）（监控指标，不做drift标准）
 
 统计当前窗口向量分配到各 `list_id` 的概率分布 `P_t(list)`，与 baseline `P_0(list)` 比较：
 
@@ -134,7 +128,7 @@ $LDS_t = JS(P_t || P_0)$
 - 宏观上看热点 coarse 区域是否在迁移
 - 这个量对“全局数据流向变了”很敏感
 
-#### 4.5 Code Usage Entropy（CUE）
+#### 4.5 Code Usage Entropy（CUE）（监控指标，不做drift标准）
 
 统计每个 subquantizer 码字使用分布熵：
 
@@ -277,14 +271,6 @@ old delta 上的：
 
 - 用 `Q_delta_active` 解码距离
 - 扫描 active delta 候选
-
-#### 6.3 Search on Closed Deltas
-
-对最近 `K` 个 closed deltas：
-
-- 复用同一组 list_id
-- 各自用自己的 `Q_delta_i` 做 approx dist
-- 扫描候选
 
 对多个索引源返回的候选：
 

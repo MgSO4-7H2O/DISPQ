@@ -42,7 +42,6 @@ MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
 }  // namespace
 
 struct EvalMetrics {
-  uint32_t snapshot_size{0};
   double recall{0.0};
   double whitening_p50{0.0};
   double whitening_p99{0.0};
@@ -186,7 +185,7 @@ int main(int argc, char** argv) {
   }
 
   if (!config.use_whitening) {
-    std::cout << "[WARN] use_whitening is false in config; snapshot eval will still use whitening."
+    std::cout << "[WARN] use_whitening is false in config; this eval will still use whitening."
               << std::endl;
   }
 
@@ -196,18 +195,14 @@ int main(int argc, char** argv) {
   base_params.use_whitening = false;
   base_params.enable_dual_route = config.enable_dual_route;
 
-  auto run_snapshot = [&](uint32_t snapshot_size) -> Result<EvalMetrics> {
-    if (snapshot_size == 0 || snapshot_size > nx) {
-      return Status::InvalidArgument("Invalid snapshot size.");
-    }
+  auto run_experiment = [&]() -> Result<EvalMetrics> {
     auto ivf = CreateIVFIndex();
     auto searcher_res = CreateHybridSearcher(config);
     if (!searcher_res.ok()) {
       return searcher_res.status();
     }
     std::unique_ptr<HybridSearcher> searcher = std::move(searcher_res.value());
-    MatrixRM X_snapshot = X.topRows(snapshot_size);
-    std::vector<DocId> ids(snapshot_size);
+    std::vector<DocId> ids(nx);
     std::iota(ids.begin(), ids.end(), 0);
 
     MatrixRM X_index;
@@ -217,12 +212,12 @@ int main(int argc, char** argv) {
     VersionSet versions;
 
     Timer rebuild_timer;
-    auto version_res = whitening->Fit(X_snapshot);
+    auto version_res = whitening->Fit(X);
     if (!version_res.ok()) {
       return version_res.status();
     }
     whiten_version = version_res.value();
-    auto base_batch = whitening->TransformBatch(X_snapshot, whiten_version);
+    auto base_batch = whitening->TransformBatch(X, whiten_version);
     if (!base_batch.ok()) {
       return base_batch.status();
     }
@@ -393,7 +388,6 @@ int main(int argc, char** argv) {
         (wall_elapsed_ms > 0.0) ? (static_cast<double>(nq) / (wall_elapsed_ms / 1000.0)) : 0.0;
 
     EvalMetrics metrics;
-    metrics.snapshot_size = snapshot_size;
     metrics.recall = recall_res.value();
     metrics.whitening_p50 = whiten_summary.value().p50_ms;
     metrics.whitening_p99 = whiten_summary.value().p99_ms;
@@ -412,7 +406,7 @@ int main(int argc, char** argv) {
     return metrics;
   };
 
-  auto save_metrics = [&](const std::vector<EvalMetrics>& snapshots) {
+  auto save_metrics = [&](const EvalMetrics& metrics) {
     std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
     std::error_code ec;
     std::filesystem::create_directories(results_dir, ec);
@@ -420,7 +414,7 @@ int main(int argc, char** argv) {
     const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
     std::string file_name = "topk" + std::to_string(config.topk) + "_np" +
                             std::to_string(base_params.nprobe) + "_nl" +
-                            std::to_string(config.ivf_nlist) + "_snapshots_zca_" +
+                            std::to_string(config.ivf_nlist) + "_zca_" +
                             std::to_string(ts) + ".json";
     std::filesystem::path result_path = results_dir / file_name;
     std::ofstream ofs(result_path);
@@ -435,22 +429,12 @@ int main(int argc, char** argv) {
       ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
       ofs << "    \"use_whitening\": true\n";
       ofs << "  },\n";
-      ofs << "  \"snapshots\": [\n";
-      for (size_t i = 0; i < snapshots.size(); ++i) {
-        const auto& metrics = snapshots[i];
-        ofs << "    {\n";
-        ofs << "      \"snapshot_size\": " << metrics.snapshot_size << ",\n";
-        ofs << "      \"avg_query_ms\": " << metrics.avg_query_ms << ",\n";
-        ofs << "      \"qps\": " << metrics.qps << ",\n";
-        ofs << "      \"recall@" << config.topk << "\": " << metrics.recall << ",\n";
-        ofs << "      \"rebuild_ms\": " << metrics.rebuild_ms << "\n";
-        ofs << "    }";
-        if (i + 1 < snapshots.size()) {
-          ofs << ",";
-        }
-        ofs << "\n";
-      }
-      ofs << "  ]\n";
+      ofs << "  \"metrics\": {\n";
+      ofs << "    \"avg_query_ms\": " << metrics.avg_query_ms << ",\n";
+      ofs << "    \"qps\": " << metrics.qps << ",\n";
+      ofs << "    \"recall@" << config.topk << "\": " << metrics.recall << ",\n";
+      ofs << "    \"rebuild_ms\": " << metrics.rebuild_ms << "\n";
+      ofs << "  }\n";
       ofs << "}\n";
       std::cout << "Saved metrics to " << result_path << std::endl;
     } else {
@@ -458,43 +442,26 @@ int main(int argc, char** argv) {
     }
   };
 
-  uint32_t interval = config.snapshot_interval;
-  if (interval == 0) {
-    interval = nx;
+  auto metrics_res = run_experiment();
+  if (!metrics_res.ok()) {
+    std::cerr << metrics_res.status().ToString() << std::endl;
+    return 1;
   }
-  std::vector<uint32_t> snapshots;
-  for (uint32_t end = interval; end < nx; end += interval) {
-    snapshots.push_back(end);
-  }
-  if (snapshots.empty() || snapshots.back() != nx) {
-    snapshots.push_back(nx);
-  }
+  const EvalMetrics& metrics = metrics_res.value();
+  std::cout << "[FULL BUILD] "
+            << "Recall@" << config.topk << " = " << metrics.recall
+            << " (nprobe=" << base_params.nprobe << ")" << std::endl;
+  std::cout << "Avg query=" << metrics.avg_query_ms << "ms; "
+            << "Search p50=" << metrics.search_p50 << "ms, p99=" << metrics.search_p99 << "ms; "
+            << "Total p50=" << metrics.total_p50 << "ms, p99=" << metrics.total_p99 << "ms; "
+            << "Whitening p50=" << metrics.whitening_p50 << "ms, p99=" << metrics.whitening_p99
+            << "ms, avg=" << metrics.avg_whiten_ms << "ms; "
+            << "Rebuild=" << metrics.rebuild_ms << "ms; "
+            << "Scanned avg=" << metrics.scanned_avg << ", p50=" << metrics.scanned_p50
+            << ", p99=" << metrics.scanned_p99 << ", max=" << metrics.scanned_max << "; "
+            << "QPS=" << metrics.qps << std::endl;
 
-  std::vector<EvalMetrics> all_metrics;
-  all_metrics.reserve(snapshots.size());
-  for (uint32_t snapshot_size : snapshots) {
-    auto metrics_res = run_snapshot(snapshot_size);
-    if (!metrics_res.ok()) {
-      std::cerr << metrics_res.status().ToString() << std::endl;
-      return 1;
-    }
-    const EvalMetrics& metrics = metrics_res.value();
-    all_metrics.push_back(metrics);
-    std::cout << "[SNAPSHOT " << metrics.snapshot_size << "] "
-              << "Recall@" << config.topk << " = " << metrics.recall
-              << " (nprobe=" << base_params.nprobe << ")" << std::endl;
-    std::cout << "Avg query=" << metrics.avg_query_ms << "ms; "
-              << "Search p50=" << metrics.search_p50 << "ms, p99=" << metrics.search_p99 << "ms; "
-              << "Total p50=" << metrics.total_p50 << "ms, p99=" << metrics.total_p99 << "ms; "
-              << "Whitening p50=" << metrics.whitening_p50 << "ms, p99=" << metrics.whitening_p99
-              << "ms, avg=" << metrics.avg_whiten_ms << "ms; "
-              << "Rebuild=" << metrics.rebuild_ms << "ms; "
-              << "Scanned avg=" << metrics.scanned_avg << ", p50=" << metrics.scanned_p50
-              << ", p99=" << metrics.scanned_p99 << ", max=" << metrics.scanned_max << "; "
-              << "QPS=" << metrics.qps << std::endl;
-  }
-
-  save_metrics(all_metrics);
+  save_metrics(metrics);
 
   return 0;
 }

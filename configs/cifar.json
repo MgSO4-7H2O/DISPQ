@@ -12,6 +12,5 @@
   "pq_m": 64,
   "pq_nbits": 8,
   "pq_residual": true,
-  "max_queries": 1000,
-  "snapshot_interval": 5000
+  "max_queries": 1000
 }
