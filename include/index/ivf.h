@@ -21,6 +21,8 @@ struct IVFParams {
   uint32_t nlist{1024};
   uint32_t dim{0};
   PQParams pq;
+  bool use_fixed_routing_centroids{false};
+  MatrixRM fixed_routing_centroids;
 };
 
 class IVFIndex {
@@ -41,6 +43,8 @@ class IVFIndex {
                                       uint32_t nprobe,
                                       const VersionSet& route_versions,
                                       uint8_t from_new) const = 0;
+
+  virtual Result<MatrixRM> GetRoutingCentroids(const VersionSet& route_versions) const = 0;
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;

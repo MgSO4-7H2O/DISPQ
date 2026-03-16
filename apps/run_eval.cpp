@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -10,6 +11,8 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -19,6 +22,7 @@
 #include "common/types.h"
 #include "eval/metrics.h"
 #include "index/ivf.h"
+#include "monitor/drift.h"
 #include "search/exact_search.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
@@ -39,13 +43,36 @@ MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
   return m;
 }
 
-}  // namespace
+uint32_t ResolveMainRows(const Config& config, uint32_t total_rows) {
+  if (total_rows == 0) {
+    return 0;
+  }
+  if (!config.enable_streaming) {
+    return total_rows;
+  }
+  uint32_t main_rows = config.main_index_rows;
+  if (main_rows == 0) {
+    main_rows = std::max<uint32_t>(1, total_rows / 2);
+  }
+  if (total_rows > 1 && main_rows >= total_rows) {
+    main_rows = total_rows - 1;
+  }
+  return std::max<uint32_t>(1, main_rows);
+}
+
+struct DeltaShard {
+  std::shared_ptr<IVFIndex> ivf;
+  VersionSet versions{};
+  uint32_t rows{0};
+  uint32_t shard_id{0};
+};
 
 struct EvalMetrics {
   double recall{0.0};
   double whitening_p50{0.0};
   double whitening_p99{0.0};
   double avg_whiten_ms{0.0};
+  double avg_search_ms{0.0};
   double search_p50{0.0};
   double search_p99{0.0};
   double total_p50{0.0};
@@ -57,7 +84,411 @@ struct EvalMetrics {
   double scanned_p50{0.0};
   double scanned_p99{0.0};
   double scanned_max{0.0};
+  double update_total_ms{0.0};
+  double update_per_vector_ms{0.0};
 };
+
+struct DriftState {
+  DriftMetrics metrics{};
+  bool soft_hit{false};
+  bool hard_hit{false};
+  bool trigger_new_delta{false};
+  bool trigger_seal_delta{false};
+  bool trigger_rebuild_main{false};
+  double candidate_gain{0.0};
+};
+
+struct SnapshotRecord {
+  uint32_t base_rows{0};
+  uint32_t main_rows{0};
+  uint32_t delta_rows{0};
+  uint32_t closed_delta_count{0};
+  uint32_t active_delta_docs{0};
+  double recall{0.0};
+  double avg_search_ms{0.0};
+  double avg_scanned{0.0};
+  double qps{0.0};
+  double update_ms{0.0};
+  DriftMetrics drift{};
+  bool soft_hit{false};
+  bool hard_hit{false};
+  bool trigger_new_delta{false};
+  bool trigger_seal_delta{false};
+  bool trigger_rebuild_main{false};
+  double candidate_gain{0.0};
+  uint32_t new_delta_count{0};
+  uint32_t seal_delta_count{0};
+  uint32_t rebuild_main_count{0};
+};
+
+struct SearchRoute {
+  std::shared_ptr<IVFIndex> ivf;
+  VersionSet versions{};
+  uint8_t from_new{0};
+};
+
+Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
+                       const MatrixRM& x_whitened,
+                       uint32_t begin,
+                       uint32_t end,
+                       uint32_t dim,
+                       const VersionSet& versions) {
+  if (!ivf) {
+    return Status::InvalidArgument("AddRangeToIndex: null ivf");
+  }
+  if (begin > end || end > static_cast<uint32_t>(x_whitened.rows())) {
+    return Status::InvalidArgument("AddRangeToIndex: invalid range");
+  }
+  if (begin == end) {
+    return Status::OK();
+  }
+
+  AlignedVector<VectorRecord> records;
+  records.reserve(static_cast<size_t>(end - begin));
+  for (uint32_t i = begin; i < end; ++i) {
+    VectorRecord rec;
+    rec.doc_id = i;
+    rec.dim = dim;
+    rec.versions = versions;
+    rec.ivf_id = 0;
+    rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
+    records.push_back(std::move(rec));
+  }
+  return ivf->Add(records);
+}
+
+Result<DeltaShard> BuildEmptyShard(Eigen::Ref<const MatrixRM> train_data,
+                                   const IVFParams& ivf_params,
+                                   VersionId whiten_version,
+                                   uint32_t shard_id,
+                                   Eigen::Ref<const MatrixRM> shared_centroids) {
+  if (train_data.rows() == 0 || train_data.cols() == 0) {
+    return Status::InvalidArgument("BuildEmptyShard: empty training data");
+  }
+  if (shared_centroids.rows() == 0 || shared_centroids.cols() != train_data.cols()) {
+    return Status::InvalidArgument("BuildEmptyShard: invalid shared_centroids");
+  }
+  auto ivf = CreateIVFIndex();
+  std::vector<DocId> ids(static_cast<size_t>(train_data.rows()));
+  std::iota(ids.begin(), ids.end(), 0);
+  IVFParams delta_params = ivf_params;
+  delta_params.use_fixed_routing_centroids = true;
+  delta_params.fixed_routing_centroids = shared_centroids;
+  auto version_res = ivf->Build(train_data, ids, delta_params, 0);
+  if (!version_res.ok()) {
+    return version_res.status();
+  }
+  DeltaShard shard;
+  shard.ivf = ivf;
+  shard.versions = VersionSet{whiten_version, version_res.value()};
+  shard.rows = 0;
+  shard.shard_id = shard_id;
+  return shard;
+}
+
+MatrixRM SelectTrainingSlice(const MatrixRM& x_whitened,
+                             uint32_t seen_rows,
+                             uint32_t window_size,
+                             uint32_t fallback_rows) {
+  if (x_whitened.rows() == 0 || seen_rows == 0) {
+    return MatrixRM{};
+  }
+  const uint32_t end = std::min<uint32_t>(seen_rows, static_cast<uint32_t>(x_whitened.rows()));
+  uint32_t begin = 0;
+  if (end > window_size) {
+    begin = end - window_size;
+  }
+  uint32_t rows = end - begin;
+  if (rows == 0) {
+    rows = std::min<uint32_t>(fallback_rows, end);
+    begin = end - rows;
+  }
+  if (rows == 0) {
+    return MatrixRM{};
+  }
+  return x_whitened.middleRows(begin, rows);
+}
+
+SearchResult MergeTopK(const std::vector<SearchResult>& partial_results, uint32_t topk) {
+  SearchResult out;
+  if (partial_results.empty() || topk == 0) {
+    return out;
+  }
+  std::unordered_map<DocId, Candidate> best_by_doc;
+  uint64_t scanned = 0;
+  for (const auto& part : partial_results) {
+    scanned += part.scanned_candidates;
+    for (const auto& cand : part.topk) {
+      auto it = best_by_doc.find(cand.doc_id);
+      if (it == best_by_doc.end() || cand.approx_dist < it->second.approx_dist) {
+        best_by_doc[cand.doc_id] = cand;
+      }
+    }
+  }
+
+  std::vector<Candidate> merged;
+  merged.reserve(best_by_doc.size());
+  for (const auto& kv : best_by_doc) {
+    merged.push_back(kv.second);
+  }
+  if (merged.size() > topk) {
+    std::nth_element(merged.begin(),
+                     merged.begin() + static_cast<int64_t>(topk),
+                     merged.end(),
+                     [](const Candidate& a, const Candidate& b) {
+                       return a.approx_dist < b.approx_dist;
+                     });
+    merged.resize(topk);
+  }
+  std::sort(merged.begin(), merged.end(),
+            [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
+  out.topk = std::move(merged);
+  out.scanned_candidates = scanned;
+  return out;
+}
+
+Result<EvalMetrics> EvaluateState(const Config& config,
+                                  const MatrixRM& base_whitened,
+                                  uint32_t seen_rows,
+                                  uint32_t main_rows,
+                                  const MatrixRM& queries_raw,
+                                  const MatrixRM& queries_whitened,
+                                  const std::shared_ptr<WhiteningModel>& whitening,
+                                  VersionId whitening_version,
+                                  const std::shared_ptr<IVFIndex>& main_ivf,
+                                  const VersionSet& main_versions,
+                                  const std::optional<DeltaShard>& active_delta,
+                                  const SearchParams& params) {
+  if (seen_rows == 0 || seen_rows > static_cast<uint32_t>(base_whitened.rows())) {
+    return Status::InvalidArgument("EvaluateState: invalid seen_rows");
+  }
+  if (main_rows == 0 || main_rows > seen_rows) {
+    return Status::InvalidArgument("EvaluateState: invalid main_rows");
+  }
+  if (!main_ivf) {
+    return Status::InvalidArgument("EvaluateState: main index is null");
+  }
+
+  const uint32_t active_docs = (active_delta.has_value() ? active_delta->rows : 0u);
+  if (active_docs > seen_rows) {
+    return Status::InvalidArgument("EvaluateState: invalid active docs");
+  }
+  const uint32_t searchable_rows = main_rows + active_docs;
+  MatrixRM searchable_db(searchable_rows, base_whitened.cols());
+  std::vector<DocId> searchable_doc_ids(static_cast<size_t>(searchable_rows));
+  if (main_rows > 0) {
+    searchable_db.topRows(main_rows) = base_whitened.topRows(main_rows);
+    for (uint32_t i = 0; i < main_rows; ++i) {
+      searchable_doc_ids[static_cast<size_t>(i)] = i;
+    }
+  }
+  if (active_docs > 0) {
+    const uint32_t active_begin = seen_rows - active_docs;
+    searchable_db.middleRows(main_rows, active_docs) =
+        base_whitened.middleRows(active_begin, active_docs);
+    for (uint32_t i = 0; i < active_docs; ++i) {
+      searchable_doc_ids[static_cast<size_t>(main_rows + i)] = active_begin + i;
+    }
+  }
+
+  auto gt_res = ExactSearchBatch(queries_whitened, searchable_db, config.topk);
+  if (!gt_res.ok()) {
+    return gt_res.status();
+  }
+  std::vector<std::vector<DocId>> ground_truth = gt_res.value();
+  for (auto& row : ground_truth) {
+    for (auto& did : row) {
+      const size_t idx = static_cast<size_t>(did);
+      if (idx < searchable_doc_ids.size()) {
+        did = searchable_doc_ids[idx];
+      }
+    }
+  }
+
+  std::vector<SearchRoute> routes;
+  routes.push_back(SearchRoute{main_ivf, main_versions, 0});
+  if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
+    routes.push_back(SearchRoute{active_delta->ivf, active_delta->versions, 1});
+  }
+
+  const uint32_t nq = static_cast<uint32_t>(queries_raw.rows());
+  const uint32_t route_count = static_cast<uint32_t>(routes.size());
+  std::vector<std::vector<DocId>> predictions(nq);
+  std::vector<double> whitening_ms(nq, 0.0);
+  std::vector<double> search_ms(nq, 0.0);
+  std::vector<double> total_ms(nq, 0.0);
+  std::vector<double> scanned_counts(nq, 0.0);
+
+  std::atomic<bool> failed{false};
+  std::mutex error_mu;
+  Status error_status;
+
+  MatrixRM queries_whitened_runtime(queries_raw.rows(), queries_raw.cols());
+  std::vector<std::vector<SearchResult>> route_results(
+      nq, std::vector<SearchResult>(route_count));
+  std::vector<double> route_search_ms(static_cast<size_t>(nq) * route_count, 0.0);
+
+  Timer wall_timer;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int64_t i = 0; i < static_cast<int64_t>(nq); ++i) {
+    if (failed.load()) {
+      continue;
+    }
+    Eigen::VectorXf qvec = queries_raw.row(i).transpose();
+    Timer wtimer;
+    Eigen::VectorXf qbuf(qvec.size());
+    auto wstatus = whitening->Transform(qvec, whitening_version, qbuf);
+    const double whiten_elapsed = wtimer.ElapsedMillis();
+    if (!wstatus.ok()) {
+      std::lock_guard<std::mutex> lock(error_mu);
+      if (!failed.exchange(true)) {
+        error_status = wstatus.status();
+      }
+      continue;
+    }
+    queries_whitened_runtime.row(i) = qbuf.transpose();
+    whitening_ms[static_cast<size_t>(i)] = whiten_elapsed;
+  }
+
+  if (failed.load()) {
+    return error_status;
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(dynamic)
+#endif
+  for (int64_t qi = 0; qi < static_cast<int64_t>(nq); ++qi) {
+    for (int64_t ri = 0; ri < static_cast<int64_t>(route_count); ++ri) {
+      if (failed.load()) {
+        continue;
+      }
+      Eigen::VectorXf q = queries_whitened_runtime.row(qi).transpose();
+      Timer stimer;
+      auto sres = routes[static_cast<size_t>(ri)].ivf->Search(
+          q,
+          params.topk,
+          params.nprobe,
+          routes[static_cast<size_t>(ri)].versions,
+          routes[static_cast<size_t>(ri)].from_new);
+      const double elapsed = stimer.ElapsedMillis();
+      route_search_ms[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)] = elapsed;
+      if (!sres.ok()) {
+        std::lock_guard<std::mutex> lock(error_mu);
+        if (!failed.exchange(true)) {
+          error_status = sres.status();
+        }
+        continue;
+      }
+      route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] = sres.value();
+    }
+  }
+
+  if (failed.load()) {
+    return error_status;
+  }
+
+  for (uint32_t qi = 0; qi < nq; ++qi) {
+    SearchResult merged = MergeTopK(route_results[static_cast<size_t>(qi)], params.topk);
+    double q_search_ms = 0.0;
+    for (uint32_t ri = 0; ri < route_count; ++ri) {
+      q_search_ms = std::max(
+          q_search_ms,
+          route_search_ms[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)]);
+    }
+    std::vector<DocId> row;
+    row.reserve(merged.topk.size());
+    for (const auto& cand : merged.topk) {
+      row.push_back(cand.doc_id);
+    }
+    predictions[static_cast<size_t>(qi)] = std::move(row);
+    search_ms[static_cast<size_t>(qi)] = q_search_ms;
+    total_ms[static_cast<size_t>(qi)] = whitening_ms[static_cast<size_t>(qi)] + q_search_ms;
+    scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
+  }
+
+  const double wall_elapsed_ms = wall_timer.ElapsedMillis();
+
+  auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
+  if (!recall_res.ok()) {
+    return recall_res.status();
+  }
+  auto whiten_summary = SummarizeLatencies(whitening_ms);
+  if (!whiten_summary.ok()) {
+    return whiten_summary.status();
+  }
+  auto search_summary = SummarizeLatencies(search_ms);
+  if (!search_summary.ok()) {
+    return search_summary.status();
+  }
+  auto total_summary = SummarizeLatencies(total_ms);
+  if (!total_summary.ok()) {
+    return total_summary.status();
+  }
+
+  auto percentile = [](std::vector<double> values, double q) -> double {
+    if (values.empty()) {
+      return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const double idx = q * static_cast<double>(values.size() - 1);
+    size_t lo = static_cast<size_t>(std::floor(idx));
+    size_t hi = static_cast<size_t>(std::ceil(idx));
+    if (hi >= values.size()) {
+      hi = values.size() - 1;
+    }
+    const double frac = idx - static_cast<double>(lo);
+    return values[lo] + (values[hi] - values[lo]) * frac;
+  };
+
+  double avg_whiten = 0.0;
+  double avg_search = 0.0;
+  double avg_total = 0.0;
+  if (nq > 0) {
+    avg_whiten =
+        std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) / static_cast<double>(nq);
+    avg_search =
+        std::accumulate(search_ms.begin(), search_ms.end(), 0.0) / static_cast<double>(nq);
+    avg_total = std::accumulate(total_ms.begin(), total_ms.end(), 0.0) / static_cast<double>(nq);
+  }
+
+  double scanned_avg = 0.0;
+  double scanned_p50 = 0.0;
+  double scanned_p99 = 0.0;
+  double scanned_max = 0.0;
+  if (nq > 0) {
+    scanned_avg =
+        std::accumulate(scanned_counts.begin(), scanned_counts.end(), 0.0) / static_cast<double>(nq);
+    scanned_p50 = percentile(scanned_counts, 0.50);
+    scanned_p99 = percentile(scanned_counts, 0.99);
+    scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
+  }
+
+  const double qps =
+      wall_elapsed_ms > 0.0 ? (static_cast<double>(nq) / (wall_elapsed_ms / 1000.0)) : 0.0;
+
+  EvalMetrics metrics;
+  metrics.recall = recall_res.value();
+  metrics.whitening_p50 = whiten_summary.value().p50_ms;
+  metrics.whitening_p99 = whiten_summary.value().p99_ms;
+  metrics.avg_whiten_ms = avg_whiten;
+  metrics.avg_search_ms = avg_search;
+  metrics.search_p50 = search_summary.value().p50_ms;
+  metrics.search_p99 = search_summary.value().p99_ms;
+  metrics.total_p50 = total_summary.value().p50_ms;
+  metrics.total_p99 = total_summary.value().p99_ms;
+  metrics.avg_query_ms = avg_total;
+  metrics.qps = qps;
+  metrics.scanned_avg = scanned_avg;
+  metrics.scanned_p50 = scanned_p50;
+  metrics.scanned_p99 = scanned_p99;
+  metrics.scanned_max = scanned_max;
+  return metrics;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   const std::string config_path = (argc > 1) ? argv[1] : "configs/base.json";
@@ -69,8 +500,10 @@ int main(int argc, char** argv) {
   Config config = config_res.value();
   std::cout << "Loaded " << config.ToString() << std::endl;
 
-  std::optional<std::string> dataset_spec = (argc > 2) ? std::optional<std::string>(argv[2]) : std::nullopt;
-  std::optional<std::string> query_spec = (argc > 3) ? std::optional<std::string>(argv[3]) : std::nullopt;
+  std::optional<std::string> dataset_spec =
+      (argc > 2) ? std::optional<std::string>(argv[2]) : std::nullopt;
+  std::optional<std::string> query_spec =
+      (argc > 3) ? std::optional<std::string>(argv[3]) : std::nullopt;
   std::string dataset_label = "synthetic";
 
   std::optional<std::string> base_dataset_path;
@@ -122,8 +555,6 @@ int main(int argc, char** argv) {
           std::cout << "[INFO] Using query dataset: " << *query_dataset_path << std::endl;
         }
       }
-    } else {
-      dataset_label = spec_path.filename().string();
     }
   }
 
@@ -179,289 +610,535 @@ int main(int argc, char** argv) {
   }
 
   if (config.max_queries > 0 && nq > config.max_queries) {
-    MatrixRM limited = Q.topRows(config.max_queries);
-    Q = limited;
-    nq = config.max_queries;
+    Q = Q.topRows(config.max_queries);
   }
 
-  if (!config.use_whitening) {
-    std::cout << "[WARN] use_whitening is false in config; this eval will still use whitening."
-              << std::endl;
-  }
+  const uint32_t main_rows_initial = ResolveMainRows(config, nx);
+  const uint32_t total_stream_rows = nx > main_rows_initial ? nx - main_rows_initial : 0;
+  std::cout << "[INFO] main_rows=" << main_rows_initial
+            << ", stream_rows=" << total_stream_rows
+            << ", streaming_mode=" << config.streaming_mode << std::endl;
 
-  SearchParams base_params;
-  base_params.topk = config.topk;
-  base_params.nprobe = config.nprobe;
-  base_params.use_whitening = false;
-  base_params.enable_dual_route = config.enable_dual_route;
+  SearchParams params;
+  params.topk = config.topk;
+  params.nprobe = config.nprobe;
+  params.use_whitening = false;
+  params.enable_dual_route = config.enable_dual_route;
 
-  auto run_experiment = [&]() -> Result<EvalMetrics> {
-    auto ivf = CreateIVFIndex();
-    auto searcher_res = CreateHybridSearcher(config);
-    if (!searcher_res.ok()) {
-      return searcher_res.status();
-    }
-    std::unique_ptr<HybridSearcher> searcher = std::move(searcher_res.value());
-    std::vector<DocId> ids(nx);
-    std::iota(ids.begin(), ids.end(), 0);
+  IVFParams ivf_params;
+  ivf_params.nlist = std::max(1u, config.ivf_nlist);
+  ivf_params.dim = config.dim;
+  ivf_params.pq.enable = config.pq_enable;
+  ivf_params.pq.M = config.pq_m;
+  ivf_params.pq.nbits = config.pq_nbits;
+  ivf_params.pq.residual = config.pq_residual;
 
-    MatrixRM X_index;
-    std::shared_ptr<WhiteningModel> whitening = CreateWhiteningModel();
-    VersionId whiten_version = 0;
-    double rebuild_ms = 0.0;
-    VersionSet versions;
+  auto whitening = CreateWhiteningModel();
+  auto main_ivf = CreateIVFIndex();
+  VersionId whiten_version = 0;
+  VersionSet main_versions{};
+  MatrixRM main_routing_centroids;
 
-    Timer rebuild_timer;
-    auto version_res = whitening->Fit(X);
-    if (!version_res.ok()) {
-      return version_res.status();
-    }
-    whiten_version = version_res.value();
-    auto base_batch = whitening->TransformBatch(X, whiten_version);
-    if (!base_batch.ok()) {
-      return base_batch.status();
-    }
-    X_index = base_batch.value();
+  MatrixRM X_whitened;
+  MatrixRM Q_whitened;
+  uint32_t main_rows_current = main_rows_initial;
+  uint32_t next_insert_idx = main_rows_initial;
 
-    IVFParams ivf_params;
-    ivf_params.nlist = std::max(1u, config.ivf_nlist);
-    ivf_params.dim = config.dim;
-    ivf_params.pq.enable = config.pq_enable;
-    ivf_params.pq.M = config.pq_m;
-    ivf_params.pq.nbits = config.pq_nbits;
-    ivf_params.pq.residual = config.pq_residual;
-    auto ivf_version_res = ivf->Build(X_index, ids, ivf_params, 0);
-    if (!ivf_version_res.ok()) {
-      return ivf_version_res.status();
-    }
-    versions = VersionSet{whiten_version, ivf_version_res.value()};
-    AlignedVector<VectorRecord> records;
-    records.reserve(static_cast<size_t>(X_index.rows()));
-    const int64_t list_count = std::max<int64_t>(1, static_cast<int64_t>(ivf_params.nlist));
-    for (int64_t i = 0; i < X_index.rows(); ++i) {
-      VectorRecord rec;
-      rec.doc_id = ids[static_cast<size_t>(i)];
-      rec.dim = config.dim;
-      rec.versions = versions;
-      rec.ivf_id = static_cast<uint32_t>(i % list_count);
-      rec.x = X_index.row(i).transpose();
-      records.push_back(std::move(rec));
-    }
-    Status add_status = ivf->Add(records);
-    if (!add_status.ok()) {
-      return add_status;
-    }
-    Status index_status = searcher->SetIndex(ivf, versions);
-    if (!index_status.ok()) {
-      return index_status;
-    }
-    rebuild_ms = rebuild_timer.ElapsedMillis();
-
-    auto query_batch = whitening->TransformBatch(Q, whiten_version);
-    if (!query_batch.ok()) {
-      return query_batch.status();
-    }
-    MatrixRM Q_whitened = query_batch.value();
-    auto gt_res = ExactSearchBatch(Q_whitened, X_index, config.topk);
-    if (!gt_res.ok()) {
-      return gt_res.status();
-    }
-    const auto& ground_truth = gt_res.value();
-
-    SearchParams params = base_params;
-    params.use_whitening = false;
-
-    std::vector<std::vector<DocId>> predictions(nq);
-    std::vector<double> whitening_ms(nq, 0.0);
-    std::vector<double> search_ms(nq, 0.0);
-    std::vector<double> total_ms(nq, 0.0);
-    std::vector<double> scanned_counts(nq, 0.0);
-    std::atomic<bool> failed{false};
-    std::mutex error_mu;
-    Status error_status;
-
-    Timer wall_timer;
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-    for (int64_t i = 0; i < static_cast<int64_t>(nq); ++i) {
-      if (failed.load()) {
-        continue;
-      }
-      Eigen::VectorXf qvec = Q.row(i).transpose();
-      double whiten_elapsed = 0.0;
-      const Eigen::VectorXf* query_ptr = &qvec;
-      static thread_local Eigen::VectorXf tls_whiten_buf;
-      if (tls_whiten_buf.size() != qvec.size()) {
-        tls_whiten_buf.resize(qvec.size());
-      }
-      Timer wtimer;
-      auto wstatus = whitening->Transform(qvec, whiten_version, tls_whiten_buf);
-      whiten_elapsed = wtimer.ElapsedMillis();
-      if (!wstatus.ok()) {
-        std::lock_guard<std::mutex> lock(error_mu);
-        if (!failed.exchange(true)) {
-          error_status = wstatus.status();
-        }
-        continue;
-      }
-      query_ptr = &tls_whiten_buf;
-      Timer search_timer;
-      auto search_res = searcher->Search(*query_ptr, params);
-      double search_elapsed = search_timer.ElapsedMillis();
-      if (!search_res.ok()) {
-        std::lock_guard<std::mutex> lock(error_mu);
-        if (!failed.exchange(true)) {
-          error_status = search_res.status();
-        }
-        continue;
-      }
-      std::vector<DocId> row;
-      row.reserve(search_res.value().topk.size());
-      for (const auto& cand : search_res.value().topk) {
-        row.push_back(cand.doc_id);
-      }
-      predictions[i] = std::move(row);
-      whitening_ms[i] = whiten_elapsed;
-      search_ms[i] = search_elapsed;
-      total_ms[i] = whiten_elapsed + search_elapsed;
-      scanned_counts[i] = static_cast<double>(search_res.value().scanned_candidates);
-    }
-
-    double wall_elapsed_ms = wall_timer.ElapsedMillis();
-
-    if (failed.load()) {
-      return error_status;
-    }
-
-    auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
-    if (!recall_res.ok()) {
-      return recall_res.status();
-    }
-
-    auto whiten_summary = SummarizeLatencies(whitening_ms);
-    if (!whiten_summary.ok()) {
-      return whiten_summary.status();
-    }
-    auto search_summary = SummarizeLatencies(search_ms);
-    if (!search_summary.ok()) {
-      return search_summary.status();
-    }
-    auto total_summary = SummarizeLatencies(total_ms);
-    if (!total_summary.ok()) {
-      return total_summary.status();
-    }
-    double avg_whiten = 0.0;
-    double avg_total = 0.0;
-    if (nq > 0) {
-      avg_whiten = std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) /
-                   static_cast<double>(nq);
-      avg_total = std::accumulate(total_ms.begin(), total_ms.end(), 0.0) / static_cast<double>(nq);
-    }
-    auto percentile = [](std::vector<double> values, double q) -> double {
-      if (values.empty()) {
-        return 0.0;
-      }
-      std::sort(values.begin(), values.end());
-      double idx = q * (values.size() - 1);
-      size_t lo = static_cast<size_t>(std::floor(idx));
-      size_t hi = static_cast<size_t>(std::ceil(idx));
-      double frac = idx - lo;
-      if (hi >= values.size()) {
-        hi = values.size() - 1;
-      }
-      return values[lo] + (values[hi] - values[lo]) * frac;
-    };
-    double scanned_avg = 0.0;
-    double scanned_p50 = 0.0;
-    double scanned_p99 = 0.0;
-    double scanned_max = 0.0;
-    if (nq > 0) {
-      scanned_avg = std::accumulate(scanned_counts.begin(), scanned_counts.end(), 0.0) /
-                    static_cast<double>(nq);
-      scanned_p50 = percentile(scanned_counts, 0.50);
-      scanned_p99 = percentile(scanned_counts, 0.99);
-      scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
-    }
-    double qps =
-        (wall_elapsed_ms > 0.0) ? (static_cast<double>(nq) / (wall_elapsed_ms / 1000.0)) : 0.0;
-
-    EvalMetrics metrics;
-    metrics.recall = recall_res.value();
-    metrics.whitening_p50 = whiten_summary.value().p50_ms;
-    metrics.whitening_p99 = whiten_summary.value().p99_ms;
-    metrics.avg_whiten_ms = avg_whiten;
-    metrics.search_p50 = search_summary.value().p50_ms;
-    metrics.search_p99 = search_summary.value().p99_ms;
-    metrics.total_p50 = total_summary.value().p50_ms;
-    metrics.total_p99 = total_summary.value().p99_ms;
-    metrics.avg_query_ms = avg_total;
-    metrics.qps = qps;
-    metrics.rebuild_ms = rebuild_ms;
-    metrics.scanned_avg = scanned_avg;
-    metrics.scanned_p50 = scanned_p50;
-    metrics.scanned_p99 = scanned_p99;
-    metrics.scanned_max = scanned_max;
-    return metrics;
-  };
-
-  auto save_metrics = [&](const EvalMetrics& metrics) {
-    std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
-    std::error_code ec;
-    std::filesystem::create_directories(results_dir, ec);
-    const auto now = std::chrono::system_clock::now();
-    const auto ts = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-    std::string file_name = "topk" + std::to_string(config.topk) + "_np" +
-                            std::to_string(base_params.nprobe) + "_nl" +
-                            std::to_string(config.ivf_nlist) + "_zca_" +
-                            std::to_string(ts) + ".json";
-    std::filesystem::path result_path = results_dir / file_name;
-    std::ofstream ofs(result_path);
-    if (ofs) {
-      ofs << "{\n";
-      ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
-      ofs << "  \"timestamp\": " << ts << ",\n";
-      ofs << "  \"use_whitening\": true,\n";
-      ofs << "  \"params\": {\n";
-      ofs << "    \"topk\": " << config.topk << ",\n";
-      ofs << "    \"nprobe\": " << base_params.nprobe << ",\n";
-      ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
-      ofs << "    \"use_whitening\": true\n";
-      ofs << "  },\n";
-      ofs << "  \"metrics\": {\n";
-      ofs << "    \"avg_query_ms\": " << metrics.avg_query_ms << ",\n";
-      ofs << "    \"qps\": " << metrics.qps << ",\n";
-      ofs << "    \"recall@" << config.topk << "\": " << metrics.recall << ",\n";
-      ofs << "    \"rebuild_ms\": " << metrics.rebuild_ms << "\n";
-      ofs << "  }\n";
-      ofs << "}\n";
-      std::cout << "Saved metrics to " << result_path << std::endl;
-    } else {
-      std::cerr << "Failed to write results to " << result_path << std::endl;
-    }
-  };
-
-  auto metrics_res = run_experiment();
-  if (!metrics_res.ok()) {
-    std::cerr << metrics_res.status().ToString() << std::endl;
+  Timer init_timer;
+  auto whiten_version_res = whitening->Fit(X.topRows(main_rows_initial));
+  if (!whiten_version_res.ok()) {
+    std::cerr << whiten_version_res.status().ToString() << std::endl;
     return 1;
   }
-  const EvalMetrics& metrics = metrics_res.value();
-  std::cout << "[FULL BUILD] "
-            << "Recall@" << config.topk << " = " << metrics.recall
-            << " (nprobe=" << base_params.nprobe << ")" << std::endl;
-  std::cout << "Avg query=" << metrics.avg_query_ms << "ms; "
-            << "Search p50=" << metrics.search_p50 << "ms, p99=" << metrics.search_p99 << "ms; "
-            << "Total p50=" << metrics.total_p50 << "ms, p99=" << metrics.total_p99 << "ms; "
-            << "Whitening p50=" << metrics.whitening_p50 << "ms, p99=" << metrics.whitening_p99
-            << "ms, avg=" << metrics.avg_whiten_ms << "ms; "
-            << "Rebuild=" << metrics.rebuild_ms << "ms; "
-            << "Scanned avg=" << metrics.scanned_avg << ", p50=" << metrics.scanned_p50
-            << ", p99=" << metrics.scanned_p99 << ", max=" << metrics.scanned_max << "; "
-            << "QPS=" << metrics.qps << std::endl;
+  whiten_version = whiten_version_res.value();
 
-  save_metrics(metrics);
+  auto xb_res = whitening->TransformBatch(X, whiten_version);
+  if (!xb_res.ok()) {
+    std::cerr << xb_res.status().ToString() << std::endl;
+    return 1;
+  }
+  X_whitened = xb_res.value();
+  auto qb_res = whitening->TransformBatch(Q, whiten_version);
+  if (!qb_res.ok()) {
+    std::cerr << qb_res.status().ToString() << std::endl;
+    return 1;
+  }
+  Q_whitened = qb_res.value();
 
+  std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
+  std::iota(main_ids.begin(), main_ids.end(), 0);
+  MatrixRM main_train = X_whitened.topRows(main_rows_initial);
+  auto main_version_res = main_ivf->Build(main_train, main_ids, ivf_params, 0);
+  if (!main_version_res.ok()) {
+    std::cerr << main_version_res.status().ToString() << std::endl;
+    return 1;
+  }
+  main_versions = VersionSet{whiten_version, main_version_res.value()};
+  Status add_main =
+      AddRangeToIndex(main_ivf, X_whitened, 0, main_rows_initial, config.dim, main_versions);
+  if (!add_main.ok()) {
+    std::cerr << add_main.ToString() << std::endl;
+    return 1;
+  }
+  auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
+  if (!centroids_res.ok()) {
+    std::cerr << centroids_res.status().ToString() << std::endl;
+    return 1;
+  }
+  main_routing_centroids = centroids_res.value();
+  double rebuild_ms_total = init_timer.ElapsedMillis();
+
+  DriftParams drift_params;
+  drift_params.nlist = ivf_params.nlist;
+  drift_params.pq_m =
+      config.pq_enable ? config.pq_m : std::max<uint32_t>(1, std::min<uint32_t>(16, config.dim));
+  drift_params.pq_nbits = config.pq_nbits;
+  drift_params.confirm_k = config.drift_confirm_k;
+  drift_params.confirm_m = config.drift_confirm_m;
+  drift_params.confirm_ratio = config.drift_confirm_ratio;
+  drift_params.min_delta_lifetime_windows = config.drift_min_delta_lifetime_windows;
+  drift_params.soft_npd_ratio = config.drift_soft_npd_ratio;
+  drift_params.soft_gain = config.drift_soft_gain;
+  drift_params.hard_nre_ratio = config.drift_hard_nre_ratio;
+  drift_params.hard_cm_z = config.drift_hard_cm_z;
+  drift_params.hard_lds = config.drift_hard_lds;
+  drift_params.max_closed_deltas = config.drift_max_closed_deltas;
+  drift_params.max_closed_ratio = config.drift_max_closed_ratio;
+  drift_params.active_delta_max_docs = config.drift_active_delta_max_docs;
+
+  DriftMonitor drift_monitor;
+  Status drift_init = drift_monitor.Initialize(main_train, drift_params);
+  if (!drift_init.ok()) {
+    std::cerr << drift_init.ToString() << std::endl;
+    return 1;
+  }
+
+  std::vector<DeltaShard> closed_deltas;
+  uint32_t closed_delta_docs = 0;
+  std::optional<DeltaShard> active_delta;
+  uint32_t next_shard_id = 1;
+  if (config.enable_streaming && total_stream_rows > 0) {
+    auto active_res = BuildEmptyShard(main_train,
+                                      ivf_params,
+                                      whiten_version,
+                                      next_shard_id++,
+                                      main_routing_centroids);
+    if (!active_res.ok()) {
+      std::cerr << active_res.status().ToString() << std::endl;
+      return 1;
+    }
+    active_delta = active_res.value();
+  }
+
+  DriftState drift_state{};
+  auto baseline_metrics_res = drift_monitor.BaselineMetrics();
+  if (baseline_metrics_res.ok()) {
+    drift_state.metrics = baseline_metrics_res.value();
+  }
+
+  uint32_t new_delta_count = 0;
+  uint32_t seal_delta_count = 0;
+  uint32_t rebuild_count = 0;
+
+  std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
+  std::error_code ec;
+  std::filesystem::create_directories(results_dir, ec);
+  const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+
+  const bool collect_snapshots = config.enable_streaming && total_stream_rows > 0 &&
+                                 config.snapshot_interval > 0;
+  std::vector<SnapshotRecord> snapshots;
+
+  auto evaluate_rows = [&](uint32_t active_rows) -> Result<EvalMetrics> {
+    auto res = EvaluateState(config,
+                             X_whitened,
+                             active_rows,
+                             main_rows_current,
+                             Q,
+                             Q_whitened,
+                             whitening,
+                             whiten_version,
+                             main_ivf,
+                             main_versions,
+                             active_delta,
+                             params);
+    if (!res.ok()) {
+      return res.status();
+    }
+    EvalMetrics m = res.value();
+    m.rebuild_ms = rebuild_ms_total;
+    return m;
+  };
+
+  auto write_snapshot = [&](uint32_t active_rows, const EvalMetrics& metrics, double update_ms) {
+    if (!collect_snapshots) {
+      return;
+    }
+    SnapshotRecord snap;
+    snap.base_rows = active_rows;
+    snap.main_rows = main_rows_current;
+    snap.delta_rows = active_rows > main_rows_initial ? active_rows - main_rows_initial : 0;
+    snap.closed_delta_count = static_cast<uint32_t>(closed_deltas.size());
+    snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
+    snap.recall = metrics.recall;
+    snap.avg_search_ms = metrics.avg_search_ms;
+    snap.avg_scanned = metrics.scanned_avg;
+    snap.qps = metrics.qps;
+    snap.update_ms = update_ms;
+    snap.drift = drift_state.metrics;
+    snap.soft_hit = drift_state.soft_hit;
+    snap.hard_hit = drift_state.hard_hit;
+    snap.trigger_new_delta = drift_state.trigger_new_delta;
+    snap.trigger_seal_delta = drift_state.trigger_seal_delta;
+    snap.trigger_rebuild_main = drift_state.trigger_rebuild_main;
+    snap.candidate_gain = drift_state.candidate_gain;
+    snap.new_delta_count = new_delta_count;
+    snap.seal_delta_count = seal_delta_count;
+    snap.rebuild_main_count = rebuild_count;
+    snapshots.push_back(std::move(snap));
+  };
+
+  uint32_t inserted_rows = 0;
+  double total_update_ms = 0.0;
+  double pending_update_ms = 0.0;
+  uint32_t drift_cursor = next_insert_idx;
+
+  if (collect_snapshots) {
+    auto mres = evaluate_rows(next_insert_idx);
+    if (!mres.ok()) {
+      std::cerr << mres.status().ToString() << std::endl;
+      return 1;
+    }
+    write_snapshot(next_insert_idx, mres.value(), 0.0);
+  }
+
+  if (config.enable_streaming && total_stream_rows > 0) {
+    const uint32_t insert_step =
+        config.streaming_mode == "streaming" ? 1u : std::max(1u, config.stream_batch_size);
+    const uint32_t drift_window = std::max(1u, config.drift_window_size);
+    uint32_t next_snapshot_target = std::max(1u, config.snapshot_interval);
+
+    while (next_insert_idx < nx) {
+      const uint32_t chunk = std::min<uint32_t>(insert_step, nx - next_insert_idx);
+      const uint32_t begin = next_insert_idx;
+      const uint32_t end = begin + chunk;
+
+      Timer update_timer;
+      if (active_delta.has_value()) {
+        Status add_status =
+            AddRangeToIndex(active_delta->ivf, X_whitened, begin, end, config.dim, active_delta->versions);
+        if (!add_status.ok()) {
+          std::cerr << add_status.ToString() << std::endl;
+          return 1;
+        }
+        active_delta->rows += chunk;
+      }
+      const double step_update_ms = update_timer.ElapsedMillis();
+
+      next_insert_idx = end;
+      inserted_rows = next_insert_idx - main_rows_initial;
+      total_update_ms += step_update_ms;
+      pending_update_ms += step_update_ms;
+
+      bool rebuild_happened = false;
+      while (next_insert_idx > drift_cursor &&
+             (next_insert_idx - drift_cursor >= drift_window || next_insert_idx == nx)) {
+        const uint32_t window_end = std::min<uint32_t>(next_insert_idx, drift_cursor + drift_window);
+        const uint32_t window_rows = window_end - drift_cursor;
+        if (window_rows == 0) {
+          break;
+        }
+
+        MatrixRM drift_batch = X_whitened.middleRows(drift_cursor, window_rows);
+        DriftContext ctx;
+        ctx.total_docs = next_insert_idx;
+        ctx.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
+        ctx.closed_delta_count = static_cast<uint32_t>(closed_deltas.size());
+        ctx.closed_delta_docs = closed_delta_docs;
+
+        auto decision_res = drift_monitor.ObserveWindow(drift_batch, ctx);
+        if (!decision_res.ok()) {
+          std::cerr << decision_res.status().ToString() << std::endl;
+          return 1;
+        }
+        const DriftDecision decision = decision_res.value();
+        drift_state.metrics = decision.metrics;
+        drift_state.soft_hit = decision.soft_hit;
+        drift_state.hard_hit = decision.hard_hit;
+        drift_state.trigger_new_delta = decision.trigger_new_delta;
+        drift_state.trigger_seal_delta = decision.trigger_new_delta;
+        drift_state.trigger_rebuild_main = decision.trigger_rebuild_main;
+        drift_state.candidate_gain = decision.candidate_gain;
+
+        if (decision.trigger_rebuild_main) {
+          Timer rebuild_timer;
+
+          auto new_wver_res = whitening->Fit(X.topRows(next_insert_idx));
+          if (!new_wver_res.ok()) {
+            std::cerr << new_wver_res.status().ToString() << std::endl;
+            return 1;
+          }
+          whiten_version = new_wver_res.value();
+
+          auto new_xw_res = whitening->TransformBatch(X, whiten_version);
+          if (!new_xw_res.ok()) {
+            std::cerr << new_xw_res.status().ToString() << std::endl;
+            return 1;
+          }
+          X_whitened = new_xw_res.value();
+          auto new_qw_res = whitening->TransformBatch(Q, whiten_version);
+          if (!new_qw_res.ok()) {
+            std::cerr << new_qw_res.status().ToString() << std::endl;
+            return 1;
+          }
+          Q_whitened = new_qw_res.value();
+
+          main_rows_current = next_insert_idx;
+          auto rebuilt_main = CreateIVFIndex();
+          std::vector<DocId> ids(static_cast<size_t>(main_rows_current));
+          std::iota(ids.begin(), ids.end(), 0);
+          MatrixRM rebuild_train = X_whitened.topRows(main_rows_current);
+          auto rebuilt_ver = rebuilt_main->Build(rebuild_train, ids, ivf_params, 0);
+          if (!rebuilt_ver.ok()) {
+            std::cerr << rebuilt_ver.status().ToString() << std::endl;
+            return 1;
+          }
+          VersionSet rebuilt_versions{whiten_version, rebuilt_ver.value()};
+          Status add_rebuild =
+              AddRangeToIndex(rebuilt_main, X_whitened, 0, main_rows_current, config.dim, rebuilt_versions);
+          if (!add_rebuild.ok()) {
+            std::cerr << add_rebuild.ToString() << std::endl;
+            return 1;
+          }
+          main_ivf = rebuilt_main;
+          main_versions = rebuilt_versions;
+          auto rebuilt_centroids = main_ivf->GetRoutingCentroids(main_versions);
+          if (!rebuilt_centroids.ok()) {
+            std::cerr << rebuilt_centroids.status().ToString() << std::endl;
+            return 1;
+          }
+          main_routing_centroids = rebuilt_centroids.value();
+
+          closed_deltas.clear();
+          closed_delta_docs = 0;
+          active_delta.reset();
+          if (next_insert_idx < nx) {
+            MatrixRM train = SelectTrainingSlice(
+                X_whitened, next_insert_idx, drift_window, std::max(1u, main_rows_current));
+            auto active_res = BuildEmptyShard(train,
+                                              ivf_params,
+                                              whiten_version,
+                                              next_shard_id++,
+                                              main_routing_centroids);
+            if (!active_res.ok()) {
+              std::cerr << active_res.status().ToString() << std::endl;
+              return 1;
+            }
+            active_delta = active_res.value();
+          }
+
+          Status rebuilt_drift = drift_monitor.OnMainRebuilt(X_whitened.topRows(main_rows_current));
+          if (!rebuilt_drift.ok()) {
+            std::cerr << rebuilt_drift.ToString() << std::endl;
+            return 1;
+          }
+          auto baseline_res = drift_monitor.BaselineMetrics();
+          if (baseline_res.ok()) {
+            drift_state.metrics = baseline_res.value();
+          }
+
+          rebuild_ms_total += rebuild_timer.ElapsedMillis();
+          rebuild_count++;
+          rebuild_happened = true;
+          drift_cursor = next_insert_idx;
+          break;
+        }
+
+        if (decision.trigger_new_delta) {
+          if (active_delta.has_value() && active_delta->rows > 0) {
+            closed_delta_docs += active_delta->rows;
+            closed_deltas.push_back(*active_delta);
+            seal_delta_count++;
+          }
+          new_delta_count++;
+          active_delta.reset();
+          if (next_insert_idx < nx) {
+            MatrixRM train = SelectTrainingSlice(
+                X_whitened, next_insert_idx, drift_window, std::max(1u, main_rows_current));
+            auto active_res = BuildEmptyShard(train,
+                                              ivf_params,
+                                              whiten_version,
+                                              next_shard_id++,
+                                              main_routing_centroids);
+            if (!active_res.ok()) {
+              std::cerr << active_res.status().ToString() << std::endl;
+              return 1;
+            }
+            active_delta = active_res.value();
+          }
+          Status promoted = drift_monitor.OnNewDeltaPromoted(decision.trigger_new_delta);
+          if (!promoted.ok()) {
+            std::cerr << promoted.ToString() << std::endl;
+            return 1;
+          }
+        }
+
+        drift_cursor = window_end;
+      }
+
+      bool take_snapshot = false;
+      if (collect_snapshots) {
+        if (config.snapshot_interval == 0) {
+          take_snapshot = false;
+        } else if (inserted_rows >= next_snapshot_target) {
+          take_snapshot = true;
+          while (inserted_rows >= next_snapshot_target) {
+            next_snapshot_target += config.snapshot_interval;
+          }
+        } else if (inserted_rows == total_stream_rows) {
+          take_snapshot = true;
+        }
+      }
+      if (take_snapshot) {
+        auto mres = evaluate_rows(next_insert_idx);
+        if (!mres.ok()) {
+          std::cerr << mres.status().ToString() << std::endl;
+          return 1;
+        }
+        write_snapshot(next_insert_idx, mres.value(), pending_update_ms);
+        pending_update_ms = 0.0;
+      }
+
+      if (rebuild_happened) {
+        continue;
+      }
+    }
+  }
+
+  auto final_res = evaluate_rows(next_insert_idx);
+  if (!final_res.ok()) {
+    std::cerr << final_res.status().ToString() << std::endl;
+    return 1;
+  }
+  EvalMetrics final_metrics = final_res.value();
+  final_metrics.update_total_ms = total_update_ms;
+  final_metrics.update_per_vector_ms =
+      inserted_rows > 0 ? total_update_ms / static_cast<double>(inserted_rows) : 0.0;
+
+  std::cout << "[ONLINE EVAL] "
+            << "Recall@" << config.topk << " = " << final_metrics.recall
+            << " (nprobe=" << params.nprobe << ")" << std::endl;
+  std::cout << "Avg query=" << final_metrics.avg_query_ms << "ms; "
+            << "Search p50=" << final_metrics.search_p50 << "ms, p99=" << final_metrics.search_p99
+            << "ms; "
+            << "Total p50=" << final_metrics.total_p50 << "ms, p99=" << final_metrics.total_p99
+            << "ms; "
+            << "Build/Rebuild=" << rebuild_ms_total << "ms; "
+            << "Update total=" << final_metrics.update_total_ms
+            << "ms, per_vec=" << final_metrics.update_per_vector_ms << "ms; "
+            << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
+            << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
+            << "; QPS=" << final_metrics.qps << std::endl;
+  std::cout << "[DRIFT ACTIONS] new_delta=" << new_delta_count
+            << ", seal_delta=" << seal_delta_count
+            << ", rebuild_main=" << rebuild_count
+            << ", closed_delta_count=" << closed_deltas.size()
+            << ", closed_delta_docs=" << closed_delta_docs << std::endl;
+
+  std::string file_name = "online_eval.json";
+  std::filesystem::path result_path = results_dir / file_name;
+  std::ofstream ofs(result_path);
+  if (!ofs) {
+    std::cerr << "Failed to write results to " << result_path << std::endl;
+    return 1;
+  }
+
+  ofs << "{\n";
+  ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
+  ofs << "  \"timestamp\": " << ts << ",\n";
+  ofs << "  \"params\": {\n";
+  ofs << "    \"topk\": " << config.topk << ",\n";
+  ofs << "    \"nprobe\": " << params.nprobe << ",\n";
+  ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+  ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
+  ofs << "    \"main_index_rows_initial\": " << main_rows_initial << ",\n";
+  ofs << "    \"main_rows_final\": " << main_rows_current << ",\n";
+  ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
+  ofs << "    \"streaming_mode\": \""
+      << (config.enable_streaming ? config.streaming_mode : "offline") << "\",\n";
+  ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
+  ofs << "    \"drift_window_size\": " << config.drift_window_size << "\n";
+  ofs << "  },\n";
+  ofs << "  \"metrics\": {\n";
+  ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
+  ofs << "    \"qps\": " << final_metrics.qps << ",\n";
+  ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
+  ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
+  ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
+  ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
+  ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << "\n";
+  ofs << "  },\n";
+  ofs << "  \"drift\": {\n";
+  ofs << "    \"nre\": " << drift_state.metrics.nre << ",\n";
+  ofs << "    \"npd\": " << drift_state.metrics.npd << ",\n";
+  ofs << "    \"cm\": " << drift_state.metrics.cm << ",\n";
+  ofs << "    \"lds\": " << drift_state.metrics.lds << ",\n";
+  ofs << "    \"cue\": " << drift_state.metrics.cue << ",\n";
+  ofs << "    \"nre_ratio\": " << drift_state.metrics.nre_ratio << ",\n";
+  ofs << "    \"npd_ratio\": " << drift_state.metrics.npd_ratio << ",\n";
+  ofs << "    \"cm_z\": " << drift_state.metrics.cm_z << ",\n";
+  ofs << "    \"cue_ratio\": " << drift_state.metrics.cue_ratio << ",\n";
+  ofs << "    \"candidate_gain\": " << drift_state.candidate_gain << ",\n";
+  ofs << "    \"new_delta_count\": " << new_delta_count << ",\n";
+  ofs << "    \"seal_delta_count\": " << seal_delta_count << ",\n";
+  ofs << "    \"rebuild_main_count\": " << rebuild_count << ",\n";
+  ofs << "    \"closed_delta_count\": " << closed_deltas.size() << ",\n";
+  ofs << "    \"closed_delta_docs\": " << closed_delta_docs << "\n";
+  ofs << "  },\n";
+  ofs << "  \"snapshots\": [\n";
+  for (size_t i = 0; i < snapshots.size(); ++i) {
+    const auto& snap = snapshots[i];
+    ofs << "    {\n";
+    ofs << "      \"base_rows\": " << snap.base_rows << ",\n";
+    ofs << "      \"main_rows\": " << snap.main_rows << ",\n";
+    ofs << "      \"delta_rows\": " << snap.delta_rows << ",\n";
+    ofs << "      \"closed_delta_count\": " << snap.closed_delta_count << ",\n";
+    ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
+    ofs << "      \"recall\": " << snap.recall << ",\n";
+    ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
+    ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
+    ofs << "      \"qps\": " << snap.qps << ",\n";
+    ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+    ofs << "      \"nre\": " << snap.drift.nre << ",\n";
+    ofs << "      \"npd\": " << snap.drift.npd << ",\n";
+    ofs << "      \"cm\": " << snap.drift.cm << ",\n";
+    ofs << "      \"lds\": " << snap.drift.lds << ",\n";
+    ofs << "      \"cue\": " << snap.drift.cue << ",\n";
+    ofs << "      \"nre_ratio\": " << snap.drift.nre_ratio << ",\n";
+    ofs << "      \"npd_ratio\": " << snap.drift.npd_ratio << ",\n";
+    ofs << "      \"cm_z\": " << snap.drift.cm_z << ",\n";
+    ofs << "      \"cue_ratio\": " << snap.drift.cue_ratio << ",\n";
+    ofs << "      \"soft_hit\": " << (snap.soft_hit ? "true" : "false") << ",\n";
+    ofs << "      \"hard_hit\": " << (snap.hard_hit ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_new_delta\": " << (snap.trigger_new_delta ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_seal_delta\": " << (snap.trigger_seal_delta ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_rebuild_main\": "
+        << (snap.trigger_rebuild_main ? "true" : "false") << ",\n";
+    ofs << "      \"candidate_gain\": " << snap.candidate_gain << ",\n";
+    ofs << "      \"new_delta_count\": " << snap.new_delta_count << ",\n";
+    ofs << "      \"seal_delta_count\": " << snap.seal_delta_count << ",\n";
+    ofs << "      \"rebuild_main_count\": " << snap.rebuild_main_count << "\n";
+    ofs << "    }";
+    if (i + 1 < snapshots.size()) {
+      ofs << ",";
+    }
+    ofs << "\n";
+  }
+  ofs << "  ]\n";
+  ofs << "}\n";
+
+  std::cout << "Saved metrics to " << result_path << std::endl;
   return 0;
 }

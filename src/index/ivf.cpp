@@ -214,7 +214,7 @@ class KMeansIVFIndex : public IVFIndex {
     if (ids.size() != static_cast<size_t>(Xw.rows())) {
       return Status::InvalidArgument("ids size mismatch");
     }
-    if (p.nlist == 0) {
+    if (!p.use_fixed_routing_centroids && p.nlist == 0) {
       return Status::InvalidArgument("nlist must be >0");
     }
     uint32_t dim = static_cast<uint32_t>(Xw.cols());
@@ -229,10 +229,22 @@ class KMeansIVFIndex : public IVFIndex {
         return Status::InvalidArgument("PQ nbits must be in [1,8]");
       }
     }
-    const uint32_t nlist = std::min<uint32_t>(p.nlist, static_cast<uint32_t>(Xw.rows()));
-
-    MatrixRM centroids = InitializeCentroids(Xw, nlist);
-    RunKMeans(Xw, &centroids);
+    uint32_t nlist = 0;
+    MatrixRM centroids;
+    if (p.use_fixed_routing_centroids) {
+      if (p.fixed_routing_centroids.rows() == 0 || p.fixed_routing_centroids.cols() == 0) {
+        return Status::InvalidArgument("fixed_routing_centroids is empty");
+      }
+      if (p.fixed_routing_centroids.cols() != Xw.cols()) {
+        return Status::InvalidArgument("fixed_routing_centroids dim mismatch");
+      }
+      centroids = p.fixed_routing_centroids;
+      nlist = static_cast<uint32_t>(centroids.rows());
+    } else {
+      nlist = std::min<uint32_t>(p.nlist, static_cast<uint32_t>(Xw.rows()));
+      centroids = InitializeCentroids(Xw, nlist);
+      RunKMeans(Xw, &centroids);
+    }
 
     auto data = std::make_unique<IndexData>();
     data->dim = dim;
@@ -365,7 +377,7 @@ class KMeansIVFIndex : public IVFIndex {
       data.lists[static_cast<size_t>(item.centroid)].push_back(std::move(item.entry));
       ++data.ntotal;
     }
-    LogListStats(data);
+    // LogListStats(data);
     return Status::OK();
   }
 
@@ -471,6 +483,15 @@ class KMeansIVFIndex : public IVFIndex {
     result.topk = std::move(heap);
     result.scanned_candidates = scanned;
     return result;
+  }
+
+  Result<MatrixRM> GetRoutingCentroids(const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    return it->second->routing_centroids;
   }
 
   Result<std::vector<uint8_t>> Serialize() const override { return std::vector<uint8_t>{}; }
