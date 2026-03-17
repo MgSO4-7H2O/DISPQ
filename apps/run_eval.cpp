@@ -186,29 +186,6 @@ Result<DeltaShard> BuildEmptyShard(Eigen::Ref<const MatrixRM> train_data,
   return shard;
 }
 
-MatrixRM SelectTrainingSlice(const MatrixRM& x_whitened,
-                             uint32_t seen_rows,
-                             uint32_t window_size,
-                             uint32_t fallback_rows) {
-  if (x_whitened.rows() == 0 || seen_rows == 0) {
-    return MatrixRM{};
-  }
-  const uint32_t end = std::min<uint32_t>(seen_rows, static_cast<uint32_t>(x_whitened.rows()));
-  uint32_t begin = 0;
-  if (end > window_size) {
-    begin = end - window_size;
-  }
-  uint32_t rows = end - begin;
-  if (rows == 0) {
-    rows = std::min<uint32_t>(fallback_rows, end);
-    begin = end - rows;
-  }
-  if (rows == 0) {
-    return MatrixRM{};
-  }
-  return x_whitened.middleRows(begin, rows);
-}
-
 SearchResult MergeTopK(const std::vector<SearchResult>& partial_results, uint32_t topk) {
   SearchResult out;
   if (partial_results.empty() || topk == 0) {
@@ -713,15 +690,12 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::vector<DeltaShard> closed_deltas;
-  uint32_t closed_delta_docs = 0;
   std::optional<DeltaShard> active_delta;
-  uint32_t next_shard_id = 1;
   if (config.enable_streaming && total_stream_rows > 0) {
     auto active_res = BuildEmptyShard(main_train,
                                       ivf_params,
                                       whiten_version,
-                                      next_shard_id++,
+                                      1,
                                       main_routing_centroids);
     if (!active_res.ok()) {
       std::cerr << active_res.status().ToString() << std::endl;
@@ -780,7 +754,7 @@ int main(int argc, char** argv) {
     snap.base_rows = active_rows;
     snap.main_rows = main_rows_current;
     snap.delta_rows = active_rows > main_rows_initial ? active_rows - main_rows_initial : 0;
-    snap.closed_delta_count = static_cast<uint32_t>(closed_deltas.size());
+    snap.closed_delta_count = 0;
     snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
     snap.recall = metrics.recall;
     snap.avg_search_ms = metrics.avg_search_ms;
@@ -842,7 +816,6 @@ int main(int argc, char** argv) {
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
 
-      bool rebuild_happened = false;
       while (next_insert_idx > drift_cursor &&
              (next_insert_idx - drift_cursor >= drift_window || next_insert_idx == nx)) {
         const uint32_t window_end = std::min<uint32_t>(next_insert_idx, drift_cursor + drift_window);
@@ -855,8 +828,8 @@ int main(int argc, char** argv) {
         DriftContext ctx;
         ctx.total_docs = next_insert_idx;
         ctx.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
-        ctx.closed_delta_count = static_cast<uint32_t>(closed_deltas.size());
-        ctx.closed_delta_docs = closed_delta_docs;
+        ctx.closed_delta_count = 0;
+        ctx.closed_delta_docs = 0;
 
         auto decision_res = drift_monitor.ObserveWindow(drift_batch, ctx);
         if (!decision_res.ok()) {
@@ -868,122 +841,9 @@ int main(int argc, char** argv) {
         drift_state.soft_hit = decision.soft_hit;
         drift_state.hard_hit = decision.hard_hit;
         drift_state.trigger_new_delta = decision.trigger_new_delta;
-        drift_state.trigger_seal_delta = decision.trigger_new_delta;
+        drift_state.trigger_seal_delta = decision.trigger_seal_delta;
         drift_state.trigger_rebuild_main = decision.trigger_rebuild_main;
         drift_state.candidate_gain = decision.candidate_gain;
-
-        if (decision.trigger_rebuild_main) {
-          Timer rebuild_timer;
-
-          auto new_wver_res = whitening->Fit(X.topRows(next_insert_idx));
-          if (!new_wver_res.ok()) {
-            std::cerr << new_wver_res.status().ToString() << std::endl;
-            return 1;
-          }
-          whiten_version = new_wver_res.value();
-
-          auto new_xw_res = whitening->TransformBatch(X, whiten_version);
-          if (!new_xw_res.ok()) {
-            std::cerr << new_xw_res.status().ToString() << std::endl;
-            return 1;
-          }
-          X_whitened = new_xw_res.value();
-          auto new_qw_res = whitening->TransformBatch(Q, whiten_version);
-          if (!new_qw_res.ok()) {
-            std::cerr << new_qw_res.status().ToString() << std::endl;
-            return 1;
-          }
-          Q_whitened = new_qw_res.value();
-
-          main_rows_current = next_insert_idx;
-          auto rebuilt_main = CreateIVFIndex();
-          std::vector<DocId> ids(static_cast<size_t>(main_rows_current));
-          std::iota(ids.begin(), ids.end(), 0);
-          MatrixRM rebuild_train = X_whitened.topRows(main_rows_current);
-          auto rebuilt_ver = rebuilt_main->Build(rebuild_train, ids, ivf_params, 0);
-          if (!rebuilt_ver.ok()) {
-            std::cerr << rebuilt_ver.status().ToString() << std::endl;
-            return 1;
-          }
-          VersionSet rebuilt_versions{whiten_version, rebuilt_ver.value()};
-          Status add_rebuild =
-              AddRangeToIndex(rebuilt_main, X_whitened, 0, main_rows_current, config.dim, rebuilt_versions);
-          if (!add_rebuild.ok()) {
-            std::cerr << add_rebuild.ToString() << std::endl;
-            return 1;
-          }
-          main_ivf = rebuilt_main;
-          main_versions = rebuilt_versions;
-          auto rebuilt_centroids = main_ivf->GetRoutingCentroids(main_versions);
-          if (!rebuilt_centroids.ok()) {
-            std::cerr << rebuilt_centroids.status().ToString() << std::endl;
-            return 1;
-          }
-          main_routing_centroids = rebuilt_centroids.value();
-
-          closed_deltas.clear();
-          closed_delta_docs = 0;
-          active_delta.reset();
-          if (next_insert_idx < nx) {
-            MatrixRM train = SelectTrainingSlice(
-                X_whitened, next_insert_idx, drift_window, std::max(1u, main_rows_current));
-            auto active_res = BuildEmptyShard(train,
-                                              ivf_params,
-                                              whiten_version,
-                                              next_shard_id++,
-                                              main_routing_centroids);
-            if (!active_res.ok()) {
-              std::cerr << active_res.status().ToString() << std::endl;
-              return 1;
-            }
-            active_delta = active_res.value();
-          }
-
-          Status rebuilt_drift = drift_monitor.OnMainRebuilt(X_whitened.topRows(main_rows_current));
-          if (!rebuilt_drift.ok()) {
-            std::cerr << rebuilt_drift.ToString() << std::endl;
-            return 1;
-          }
-          auto baseline_res = drift_monitor.BaselineMetrics();
-          if (baseline_res.ok()) {
-            drift_state.metrics = baseline_res.value();
-          }
-
-          rebuild_ms_total += rebuild_timer.ElapsedMillis();
-          rebuild_count++;
-          rebuild_happened = true;
-          drift_cursor = next_insert_idx;
-          break;
-        }
-
-        if (decision.trigger_new_delta) {
-          if (active_delta.has_value() && active_delta->rows > 0) {
-            closed_delta_docs += active_delta->rows;
-            closed_deltas.push_back(*active_delta);
-            seal_delta_count++;
-          }
-          new_delta_count++;
-          active_delta.reset();
-          if (next_insert_idx < nx) {
-            MatrixRM train = SelectTrainingSlice(
-                X_whitened, next_insert_idx, drift_window, std::max(1u, main_rows_current));
-            auto active_res = BuildEmptyShard(train,
-                                              ivf_params,
-                                              whiten_version,
-                                              next_shard_id++,
-                                              main_routing_centroids);
-            if (!active_res.ok()) {
-              std::cerr << active_res.status().ToString() << std::endl;
-              return 1;
-            }
-            active_delta = active_res.value();
-          }
-          Status promoted = drift_monitor.OnNewDeltaPromoted(decision.trigger_new_delta);
-          if (!promoted.ok()) {
-            std::cerr << promoted.ToString() << std::endl;
-            return 1;
-          }
-        }
 
         drift_cursor = window_end;
       }
@@ -1009,10 +869,6 @@ int main(int argc, char** argv) {
         }
         write_snapshot(next_insert_idx, mres.value(), pending_update_ms);
         pending_update_ms = 0.0;
-      }
-
-      if (rebuild_happened) {
-        continue;
       }
     }
   }
@@ -1044,8 +900,8 @@ int main(int argc, char** argv) {
   std::cout << "[DRIFT ACTIONS] new_delta=" << new_delta_count
             << ", seal_delta=" << seal_delta_count
             << ", rebuild_main=" << rebuild_count
-            << ", closed_delta_count=" << closed_deltas.size()
-            << ", closed_delta_docs=" << closed_delta_docs << std::endl;
+            << ", closed_delta_count=0"
+            << ", closed_delta_docs=0" << std::endl;
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
@@ -1094,8 +950,8 @@ int main(int argc, char** argv) {
   ofs << "    \"new_delta_count\": " << new_delta_count << ",\n";
   ofs << "    \"seal_delta_count\": " << seal_delta_count << ",\n";
   ofs << "    \"rebuild_main_count\": " << rebuild_count << ",\n";
-  ofs << "    \"closed_delta_count\": " << closed_deltas.size() << ",\n";
-  ofs << "    \"closed_delta_docs\": " << closed_delta_docs << "\n";
+  ofs << "    \"closed_delta_count\": 0,\n";
+  ofs << "    \"closed_delta_docs\": 0\n";
   ofs << "  },\n";
   ofs << "  \"snapshots\": [\n";
   for (size_t i = 0; i < snapshots.size(); ++i) {

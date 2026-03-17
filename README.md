@@ -1,21 +1,17 @@
 ## SA-WRQ: Online Streaming ANN with Drift Triggers
 
-当前实现支持在线流式插入、drift 监控与动作触发，主流程位于 `apps/run_eval.cpp`。
+当前实现支持在线流式插入与 drift 监控，主流程位于 `apps/run_eval.cpp`。
 
 ## 1. 系统能力
 
-- `Main Index`：初始用 base 前缀（`main_index_rows`）构建。
-- `Active Delta Index`：后续流式数据写入 active delta。
-- `Closed Delta Index`：active delta 轮换后转为 closed，先归档保留（暂不参与检索）。
-- delta 构建复用 `C_main`（固定 coarse centroids），仅在新窗口上更新 PQ。
-- `Main + Active` 并行检索并按 `doc_id` 去重合并 top-k。
+- `Main Index`：初始用 base 前缀（`main_index_rows`）离线构建，运行期间保持不变。
+- `Delta Index`：后续流式数据统一写入单一 delta index。
+- delta 构建复用 `C_main`（固定 coarse centroids）。
+- `Main + Delta` 并行检索并按 `doc_id` 去重合并 top-k。
 - `streaming_mode` 支持两种插入方式：
   - `streaming`：单条插入
   - `batch`：小批量插入（`stream_batch_size`）
-- drift 触发三类动作：
-  - `new delta`
-  - `seal delta`
-  - `rebuild main`
+- drift 信号持续监控并输出，不触发多 delta 轮换或 main rebuild。
 
 ## 2. Drift 指标
 
@@ -39,20 +35,20 @@
 - `cm_z = (CM - baseline_CM_mean) / baseline_CM_std`
 - `cue_ratio = CUE / baseline_CUE`
 
-baseline 由初始 main 数据建立，main rebuild 后重置 baseline。
+baseline 由初始 main 数据建立，运行期间不重置。
 
-## 3. Trigger 逻辑
+## 3. Drift 信号逻辑
 
-### 3.1 Soft Drift
+### 3.1 Soft Drift Signal
 
 - 条件：`npd_ratio > drift_soft_npd_ratio` 且 `nre_ratio < drift_hard_nre_ratio`
 - 确认机制：`drift_confirm_k` 连续命中，或 `drift_confirm_m` 窗口命中占比超过 `drift_confirm_ratio`
 - 最小生存期：`drift_min_delta_lifetime_windows`
 - 候选收益：`candidate_gain >= drift_soft_gain`  
   `gain = (NPD_old - NPD_candidate) / (NPD_old + eps)`
-- 动作：`trigger_new_delta = true`，并 seal 当前 active delta
+- 输出：`trigger_new_delta = true`（仅作为信号输出）
 
-### 3.2 Hard Drift
+### 3.2 Hard Drift Signal
 
 满足任一条件并通过确认机制后触发：
 
@@ -62,21 +58,17 @@ baseline 由初始 main 数据建立，main rebuild 后重置 baseline。
 - `closed_delta_count >= drift_max_closed_deltas`
 - `closed_delta_docs / total_docs > drift_max_closed_ratio`
 
-动作：`trigger_rebuild_main = true`
-
-### 3.3 Seal Active Delta
-
-- `trigger_new_delta = true` 时 seal，并创建新的 active delta
+- 输出：`trigger_rebuild_main = true`（仅作为信号输出）
 
 ## 4. 主流程行为
 
 `run_eval` 在线循环：
 
 1. 初始建 main（base 前缀）。
-2. 创建 active delta。
+2. 创建单一 delta index。
 3. 按 streaming/batch 插入流式数据。
 4. 每个 drift window 计算 NRE/NPD/CM/LDS/CUE。
-5. 命中 `new delta / rebuild main` 时执行对应动作并继续服务。
+5. drift 指标持续更新，但结构动作不执行，所有更新只写入同一个 delta。
 6. 结束后输出最终 JSON 指标。
 
 ## 5. 配置项
@@ -101,9 +93,9 @@ baseline 由初始 main 数据建立，main rebuild 后重置 baseline。
 - `drift_hard_nre_ratio`
 - `drift_hard_cm_z`
 - `drift_hard_lds`
-- `drift_max_closed_deltas`
-- `drift_max_closed_ratio`
-- `drift_active_delta_max_docs`（当前语义下不作为轮换触发条件，预留）
+- `drift_max_closed_deltas`（当前单 delta 语义下仅保留配置兼容）
+- `drift_max_closed_ratio`（当前单 delta 语义下仅保留配置兼容）
+- `drift_active_delta_max_docs`（当前单 delta 语义下仅保留配置兼容）
 
 ## 6. 运行方式
 
@@ -122,5 +114,5 @@ cmake --build build -j
 
 - 检索指标（recall/qps/latency/scanned）
 - drift 指标（NRE/NPD/CM/LDS/CUE 及 ratio/z-score）
-- 触发动作统计（new delta / seal delta / rebuild main）
+- drift 信号与动作计数（当前语义下动作计数保持为 0）
 - 可选快照序列（`snapshot_interval > 0` 时的阶段性 performance/drift 记录）
