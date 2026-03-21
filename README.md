@@ -1,118 +1,125 @@
-## SA-WRQ: Online Streaming ANN with Drift Triggers
+## SA-WRQ: Streaming ANN with Main + Delta
 
-当前实现支持在线流式插入与 drift 监控，主流程位于 `apps/run_eval.cpp`。
+SA-WRQ 面向流式向量检索场景，核心目标是：
 
-## 1. 系统能力
+- `main` 保持稳定，负责大规模检索
+- `delta` 持续接收 streaming 数据，负责快速适应新分布
+- `drift` 不控制 delta 更新，而是判断是否需要后台异步 `rebuild main`
 
-- `Main Index`：初始用 base 前缀（`main_index_rows`）离线构建，运行期间保持不变。
-- `Delta Index`：后续流式数据统一写入单一 delta index。
-- delta 构建复用 `C_main`（固定 coarse centroids）。
-- `Main + Delta` 并行检索并按 `doc_id` 去重合并 top-k。
-- `streaming_mode` 支持两种插入方式：
-  - `streaming`：单条插入
-  - `batch`：小批量插入（`stream_batch_size`）
-- drift 信号持续监控并输出，不触发多 delta 轮换或 main rebuild。
+系统在线稳定态始终只维护：
 
-## 2. Drift 指标
+- `1 main`
+- `1 delta`
 
-每个 drift window（`drift_window_size`）计算：
+## 核心思想
 
-- `NRE`（Residual Energy）  
-  `NRE = E[ ||z-c1||^2 / (||z||^2 + eps) ]`
-- `NPD`（PQ Distortion）  
-  `NPD = E[ ||r-r_hat||^2 / (||r||^2 + eps) ]`
-- `CM`（Centroid Margin）  
-  `CM = E[ (d2-d1)/(d1+eps) ]`
-- `LDS`（List Distribution Shift）  
-  `LDS = JS(P_t || P_0)`（log2 版本）
-- `CUE`（Code Usage Entropy）  
-  子量化器码字使用熵（归一化后求平均）
+### 1. Main 保持稳定
 
-同时输出归一化信号：
+`main` 是主索引，在一个 serving epoch 内不做在线更新。
 
-- `nre_ratio = NRE / baseline_NRE`
-- `npd_ratio = NPD / baseline_NPD`
-- `cm_z = (CM - baseline_CM_mean) / baseline_CM_std`
-- `cue_ratio = CUE / baseline_CUE`
+它负责：
 
-baseline 由初始 main 数据建立，运行期间不重置。
+- whitening
+- coarse centroids
+- PQ / residual PQ
+- 大规模、稳定的 ANN 检索
 
-## 3. Drift 信号逻辑
+`main` 不直接接收 streaming 写入。  
+当分布明显变化时，不是在线改 `main`，而是后台重建新的 `main`。
 
-### 3.1 Soft Drift Signal
+### 2. Delta 持续在线更新
 
-- 条件：`npd_ratio > drift_soft_npd_ratio` 且 `nre_ratio < drift_hard_nre_ratio`
-- 确认机制：`drift_confirm_k` 连续命中，或 `drift_confirm_m` 窗口命中占比超过 `drift_confirm_ratio`
-- 最小生存期：`drift_min_delta_lifetime_windows`
-- 候选收益：`candidate_gain >= drift_soft_gain`  
-  `gain = (NPD_old - NPD_candidate) / (NPD_old + eps)`
-- 输出：`trigger_new_delta = true`（仅作为信号输出）
+所有 streaming 数据只写入 `delta`。
 
-### 3.2 Hard Drift Signal
+`delta` 负责：
 
-满足任一条件并通过确认机制后触发：
+- 接收最新数据
+- 用独立的 `C_delta` 适应流式分布
+- 补偿 `main` 对新分布的滞后
 
-- `nre_ratio > drift_hard_nre_ratio`
-- `cm_z > drift_hard_cm_z`
-- `lds > drift_hard_lds`
-- `closed_delta_count >= drift_max_closed_deltas`
-- `closed_delta_docs / total_docs > drift_max_closed_ratio`
+为了适应 streaming 数据，`delta` 的 centroids 可以按 batch 做带遗忘的 EMA / online k-means 更新，例如：
 
-- 输出：`trigger_rebuild_main = true`（仅作为信号输出）
+```text
+N_j <- rho * N_j + n_j
+S_j <- rho * S_j + sum_j
+c_j <- S_j / N_j
+```
 
-## 4. 主流程行为
+重点不是逐条更新，而是按小批量稳定更新。
 
-`run_eval` 在线循环：
+### 3. Drift 只负责 Rebuild Main
 
-1. 初始建 main（base 前缀）。
-2. 创建单一 delta index。
-3. 按 streaming/batch 插入流式数据。
-4. 每个 drift window 计算 NRE/NPD/CM/LDS/CUE。
-5. drift 指标持续更新，但结构动作不执行，所有更新只写入同一个 delta。
-6. 结束后输出最终 JSON 指标。
+本方案里，`delta` 默认一直更新，所以 drift 的职责很单一：
 
-## 5. 配置项
+- 判断 `main` 是否已经落后于当前数据分布
 
-### 5.1 流式相关
+drift 更适合看全局信号，例如：
 
-- `enable_streaming`
-- `main_index_rows`
-- `streaming_mode`：`"streaming"` / `"batch"`
-- `stream_batch_size`
-- `snapshot_interval`（>0 时按插入间隔采样，写入最终 `online_eval.json` 的 `snapshots` 数组）
+- residual energy 是否持续升高
+- centroid margin 是否恶化
+- list distribution 是否偏移
+- 有多少比例的向量都明显漂移了
+- `delta` 是否持续变大
 
-### 5.2 Drift 相关
+当这些信号持续恶化时，触发后台 `rebuild main`。
 
-- `drift_window_size`
-- `drift_confirm_k`
-- `drift_confirm_m`
-- `drift_confirm_ratio`
-- `drift_min_delta_lifetime_windows`
-- `drift_soft_npd_ratio`
-- `drift_soft_gain`
-- `drift_hard_nre_ratio`
-- `drift_hard_cm_z`
-- `drift_hard_lds`
-- `drift_max_closed_deltas`（当前单 delta 语义下仅保留配置兼容）
-- `drift_max_closed_ratio`（当前单 delta 语义下仅保留配置兼容）
-- `drift_active_delta_max_docs`（当前单 delta 语义下仅保留配置兼容）
+## 简要流程
 
-## 6. 运行方式
+### 在线写入流程
+
+1. streaming 向量到来
+2. 用当前 whitening 变换
+3. 写入 `delta`
+4. 按 micro-batch 更新 `delta` 的 centroids
+5. 查询时并行搜索 `main + delta`，再合并结果
+
+### 异步 Rebuild Main 流程
+
+当 drift 判定需要重建时：
+
+1. 打一个 `watermark = t0`
+2. 后台用 `main + delta[:t0]` 构建新的 `main`
+3. 前台继续服务，`t0` 之后的新数据继续写当前 `delta`
+4. 后台再用 `t0` 之后的数据构建新的 `delta`
+5. 原子切换到新的 `main + delta`
+
+这样做的好处是：
+
+- 不阻塞前台服务
+- 新 `main` 能吸收已经稳定下来的新分布
+- 新 `delta` 只保留最新流数据
+
+## 方案总结
+
+可以把这套方案概括成一句话：
+
+`main` 负责稳定，`delta` 负责适应，`drift` 负责判断何时把已经稳定的新分布吸收到新的 `main` 中。
+
+也就是：
+
+- 平时只更新 `delta`
+- 必要时后台重建 `main`
+- 重建时通过 `watermark` 完成平滑切换
+
+## 当前仓库状态
+
+当前仓库已经支持：
+
+- 初始 `main` 构建
+- 单 `delta` 流式写入
+- `main + delta` 并行检索
+- drift 指标监控与输出
+
+当前仍未完整实现：
+
+- `delta` 独立 centroids 的在线自适应
+- `watermark` 驱动的异步 `rebuild main`
+- 新旧 `main + delta` 的原子切换
+
+## 运行方式
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ./build/run_eval configs/cifar.json data/cifar
 ```
-
-## 7. 输出文件
-
-- 单个结果文件（每次运行覆盖）：
-  - `result/<dataset>/online_eval.json`
-
-结果文件包含：
-
-- 检索指标（recall/qps/latency/scanned）
-- drift 指标（NRE/NPD/CM/LDS/CUE 及 ratio/z-score）
-- drift 信号与动作计数（当前语义下动作计数保持为 0）
-- 可选快照序列（`snapshot_interval > 0` 时的阶段性 performance/drift 记录）
