@@ -18,7 +18,6 @@ add_library(ann
   src/search/rerank.cpp
   src/eval/gt.cpp
   src/eval/metrics.cpp
-  src/monitor/drift.cpp
 )
 
 target_include_directories(ann PUBLIC include third_party)

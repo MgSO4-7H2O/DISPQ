@@ -22,7 +22,6 @@
 #include "common/types.h"
 #include "eval/metrics.h"
 #include "index/ivf.h"
-#include "monitor/drift.h"
 #include "search/exact_search.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
@@ -88,37 +87,16 @@ struct EvalMetrics {
   double update_per_vector_ms{0.0};
 };
 
-struct DriftState {
-  DriftMetrics metrics{};
-  bool soft_hit{false};
-  bool hard_hit{false};
-  bool trigger_new_delta{false};
-  bool trigger_seal_delta{false};
-  bool trigger_rebuild_main{false};
-  double candidate_gain{0.0};
-};
-
 struct SnapshotRecord {
   uint32_t base_rows{0};
   uint32_t main_rows{0};
   uint32_t delta_rows{0};
-  uint32_t closed_delta_count{0};
   uint32_t active_delta_docs{0};
   double recall{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
   double qps{0.0};
   double update_ms{0.0};
-  DriftMetrics drift{};
-  bool soft_hit{false};
-  bool hard_hit{false};
-  bool trigger_new_delta{false};
-  bool trigger_seal_delta{false};
-  bool trigger_rebuild_main{false};
-  double candidate_gain{0.0};
-  uint32_t new_delta_count{0};
-  uint32_t seal_delta_count{0};
-  uint32_t rebuild_main_count{0};
 };
 
 struct SearchRoute {
@@ -665,31 +643,6 @@ int main(int argc, char** argv) {
   main_routing_centroids = centroids_res.value();
   double rebuild_ms_total = init_timer.ElapsedMillis();
 
-  DriftParams drift_params;
-  drift_params.nlist = ivf_params.nlist;
-  drift_params.pq_m =
-      config.pq_enable ? config.pq_m : std::max<uint32_t>(1, std::min<uint32_t>(16, config.dim));
-  drift_params.pq_nbits = config.pq_nbits;
-  drift_params.confirm_k = config.drift_confirm_k;
-  drift_params.confirm_m = config.drift_confirm_m;
-  drift_params.confirm_ratio = config.drift_confirm_ratio;
-  drift_params.min_delta_lifetime_windows = config.drift_min_delta_lifetime_windows;
-  drift_params.soft_npd_ratio = config.drift_soft_npd_ratio;
-  drift_params.soft_gain = config.drift_soft_gain;
-  drift_params.hard_nre_ratio = config.drift_hard_nre_ratio;
-  drift_params.hard_cm_z = config.drift_hard_cm_z;
-  drift_params.hard_lds = config.drift_hard_lds;
-  drift_params.max_closed_deltas = config.drift_max_closed_deltas;
-  drift_params.max_closed_ratio = config.drift_max_closed_ratio;
-  drift_params.active_delta_max_docs = config.drift_active_delta_max_docs;
-
-  DriftMonitor drift_monitor;
-  Status drift_init = drift_monitor.Initialize(main_train, drift_params);
-  if (!drift_init.ok()) {
-    std::cerr << drift_init.ToString() << std::endl;
-    return 1;
-  }
-
   std::optional<DeltaShard> active_delta;
   if (config.enable_streaming && total_stream_rows > 0) {
     auto active_res = BuildEmptyShard(main_train,
@@ -703,16 +656,6 @@ int main(int argc, char** argv) {
     }
     active_delta = active_res.value();
   }
-
-  DriftState drift_state{};
-  auto baseline_metrics_res = drift_monitor.BaselineMetrics();
-  if (baseline_metrics_res.ok()) {
-    drift_state.metrics = baseline_metrics_res.value();
-  }
-
-  uint32_t new_delta_count = 0;
-  uint32_t seal_delta_count = 0;
-  uint32_t rebuild_count = 0;
 
   std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
   std::error_code ec;
@@ -754,30 +697,18 @@ int main(int argc, char** argv) {
     snap.base_rows = active_rows;
     snap.main_rows = main_rows_current;
     snap.delta_rows = active_rows > main_rows_initial ? active_rows - main_rows_initial : 0;
-    snap.closed_delta_count = 0;
     snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
     snap.recall = metrics.recall;
     snap.avg_search_ms = metrics.avg_search_ms;
     snap.avg_scanned = metrics.scanned_avg;
     snap.qps = metrics.qps;
     snap.update_ms = update_ms;
-    snap.drift = drift_state.metrics;
-    snap.soft_hit = drift_state.soft_hit;
-    snap.hard_hit = drift_state.hard_hit;
-    snap.trigger_new_delta = drift_state.trigger_new_delta;
-    snap.trigger_seal_delta = drift_state.trigger_seal_delta;
-    snap.trigger_rebuild_main = drift_state.trigger_rebuild_main;
-    snap.candidate_gain = drift_state.candidate_gain;
-    snap.new_delta_count = new_delta_count;
-    snap.seal_delta_count = seal_delta_count;
-    snap.rebuild_main_count = rebuild_count;
     snapshots.push_back(std::move(snap));
   };
 
   uint32_t inserted_rows = 0;
   double total_update_ms = 0.0;
   double pending_update_ms = 0.0;
-  uint32_t drift_cursor = next_insert_idx;
 
   if (collect_snapshots) {
     auto mres = evaluate_rows(next_insert_idx);
@@ -791,7 +722,6 @@ int main(int argc, char** argv) {
   if (config.enable_streaming && total_stream_rows > 0) {
     const uint32_t insert_step =
         config.streaming_mode == "streaming" ? 1u : std::max(1u, config.stream_batch_size);
-    const uint32_t drift_window = std::max(1u, config.drift_window_size);
     uint32_t next_snapshot_target = std::max(1u, config.snapshot_interval);
 
     while (next_insert_idx < nx) {
@@ -815,38 +745,6 @@ int main(int argc, char** argv) {
       inserted_rows = next_insert_idx - main_rows_initial;
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
-
-      while (next_insert_idx > drift_cursor &&
-             (next_insert_idx - drift_cursor >= drift_window || next_insert_idx == nx)) {
-        const uint32_t window_end = std::min<uint32_t>(next_insert_idx, drift_cursor + drift_window);
-        const uint32_t window_rows = window_end - drift_cursor;
-        if (window_rows == 0) {
-          break;
-        }
-
-        MatrixRM drift_batch = X_whitened.middleRows(drift_cursor, window_rows);
-        DriftContext ctx;
-        ctx.total_docs = next_insert_idx;
-        ctx.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
-        ctx.closed_delta_count = 0;
-        ctx.closed_delta_docs = 0;
-
-        auto decision_res = drift_monitor.ObserveWindow(drift_batch, ctx);
-        if (!decision_res.ok()) {
-          std::cerr << decision_res.status().ToString() << std::endl;
-          return 1;
-        }
-        const DriftDecision decision = decision_res.value();
-        drift_state.metrics = decision.metrics;
-        drift_state.soft_hit = decision.soft_hit;
-        drift_state.hard_hit = decision.hard_hit;
-        drift_state.trigger_new_delta = decision.trigger_new_delta;
-        drift_state.trigger_seal_delta = decision.trigger_seal_delta;
-        drift_state.trigger_rebuild_main = decision.trigger_rebuild_main;
-        drift_state.candidate_gain = decision.candidate_gain;
-
-        drift_cursor = window_end;
-      }
 
       bool take_snapshot = false;
       if (collect_snapshots) {
@@ -897,11 +795,6 @@ int main(int argc, char** argv) {
             << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
             << "; QPS=" << final_metrics.qps << std::endl;
-  std::cout << "[DRIFT ACTIONS] new_delta=" << new_delta_count
-            << ", seal_delta=" << seal_delta_count
-            << ", rebuild_main=" << rebuild_count
-            << ", closed_delta_count=0"
-            << ", closed_delta_docs=0" << std::endl;
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
@@ -924,8 +817,7 @@ int main(int argc, char** argv) {
   ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
   ofs << "    \"streaming_mode\": \""
       << (config.enable_streaming ? config.streaming_mode : "offline") << "\",\n";
-  ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
-  ofs << "    \"drift_window_size\": " << config.drift_window_size << "\n";
+  ofs << "    \"stream_batch_size\": " << config.stream_batch_size << "\n";
   ofs << "  },\n";
   ofs << "  \"metrics\": {\n";
   ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
@@ -936,23 +828,6 @@ int main(int argc, char** argv) {
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
   ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << "\n";
   ofs << "  },\n";
-  ofs << "  \"drift\": {\n";
-  ofs << "    \"nre\": " << drift_state.metrics.nre << ",\n";
-  ofs << "    \"npd\": " << drift_state.metrics.npd << ",\n";
-  ofs << "    \"cm\": " << drift_state.metrics.cm << ",\n";
-  ofs << "    \"lds\": " << drift_state.metrics.lds << ",\n";
-  ofs << "    \"cue\": " << drift_state.metrics.cue << ",\n";
-  ofs << "    \"nre_ratio\": " << drift_state.metrics.nre_ratio << ",\n";
-  ofs << "    \"npd_ratio\": " << drift_state.metrics.npd_ratio << ",\n";
-  ofs << "    \"cm_z\": " << drift_state.metrics.cm_z << ",\n";
-  ofs << "    \"cue_ratio\": " << drift_state.metrics.cue_ratio << ",\n";
-  ofs << "    \"candidate_gain\": " << drift_state.candidate_gain << ",\n";
-  ofs << "    \"new_delta_count\": " << new_delta_count << ",\n";
-  ofs << "    \"seal_delta_count\": " << seal_delta_count << ",\n";
-  ofs << "    \"rebuild_main_count\": " << rebuild_count << ",\n";
-  ofs << "    \"closed_delta_count\": 0,\n";
-  ofs << "    \"closed_delta_docs\": 0\n";
-  ofs << "  },\n";
   ofs << "  \"snapshots\": [\n";
   for (size_t i = 0; i < snapshots.size(); ++i) {
     const auto& snap = snapshots[i];
@@ -960,32 +835,12 @@ int main(int argc, char** argv) {
     ofs << "      \"base_rows\": " << snap.base_rows << ",\n";
     ofs << "      \"main_rows\": " << snap.main_rows << ",\n";
     ofs << "      \"delta_rows\": " << snap.delta_rows << ",\n";
-    ofs << "      \"closed_delta_count\": " << snap.closed_delta_count << ",\n";
     ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
     ofs << "      \"recall\": " << snap.recall << ",\n";
     ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
     ofs << "      \"qps\": " << snap.qps << ",\n";
-    ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
-    ofs << "      \"nre\": " << snap.drift.nre << ",\n";
-    ofs << "      \"npd\": " << snap.drift.npd << ",\n";
-    ofs << "      \"cm\": " << snap.drift.cm << ",\n";
-    ofs << "      \"lds\": " << snap.drift.lds << ",\n";
-    ofs << "      \"cue\": " << snap.drift.cue << ",\n";
-    ofs << "      \"nre_ratio\": " << snap.drift.nre_ratio << ",\n";
-    ofs << "      \"npd_ratio\": " << snap.drift.npd_ratio << ",\n";
-    ofs << "      \"cm_z\": " << snap.drift.cm_z << ",\n";
-    ofs << "      \"cue_ratio\": " << snap.drift.cue_ratio << ",\n";
-    ofs << "      \"soft_hit\": " << (snap.soft_hit ? "true" : "false") << ",\n";
-    ofs << "      \"hard_hit\": " << (snap.hard_hit ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_new_delta\": " << (snap.trigger_new_delta ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_seal_delta\": " << (snap.trigger_seal_delta ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_rebuild_main\": "
-        << (snap.trigger_rebuild_main ? "true" : "false") << ",\n";
-    ofs << "      \"candidate_gain\": " << snap.candidate_gain << ",\n";
-    ofs << "      \"new_delta_count\": " << snap.new_delta_count << ",\n";
-    ofs << "      \"seal_delta_count\": " << snap.seal_delta_count << ",\n";
-    ofs << "      \"rebuild_main_count\": " << snap.rebuild_main_count << "\n";
+    ofs << "      \"update_ms\": " << snap.update_ms << "\n";
     ofs << "    }";
     if (i + 1 < snapshots.size()) {
       ofs << ",";

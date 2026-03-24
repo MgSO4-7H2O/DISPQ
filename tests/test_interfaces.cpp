@@ -14,7 +14,6 @@
 #include "eval/metrics.h"
 #include "index/ivf.h"
 #include "index/postings.h"
-#include "monitor/drift.h"
 #include "search/hybrid_search.h"
 #include "search/rerank.h"
 #include "whitening/whitening.h"
@@ -103,12 +102,6 @@ int main() {
 
   auto gt_res = ComputeGroundTruth(X, X, 2);
   assert(gt_res.ok());
-
-  DriftMonitor monitor;
-  assert(monitor.ObserveResidual(X).ok());
-  Eigen::VectorXf margins = Eigen::VectorXf::Ones(3);
-  assert(monitor.ObserveSearchSignal(margins).ok());
-  assert(monitor.ShouldUpdateTail().ok());
 
   std::vector<Candidate> cands(1);
   cands[0].doc_id = 0;

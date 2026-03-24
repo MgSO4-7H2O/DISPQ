@@ -38,16 +38,6 @@ bool ExtractString(const std::string& text, const std::string& key, std::string*
   return false;
 }
 
-bool ExtractDouble(const std::string& text, const std::string& key, double* out) {
-  std::regex re("\"" + key + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
-  std::smatch match;
-  if (std::regex_search(text, match, re)) {
-    *out = std::stod(match[1]);
-    return true;
-  }
-  return false;
-}
-
 }  // namespace
 
 std::string Config::ToString() const {
@@ -69,20 +59,7 @@ std::string Config::ToString() const {
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "streaming_mode=" << streaming_mode << ", "
-      << "stream_batch_size=" << stream_batch_size << ", "
-      << "drift_window_size=" << drift_window_size << ", "
-      << "drift_confirm_k=" << drift_confirm_k << ", "
-      << "drift_confirm_m=" << drift_confirm_m << ", "
-      << "drift_confirm_ratio=" << drift_confirm_ratio << ", "
-      << "drift_min_delta_lifetime_windows=" << drift_min_delta_lifetime_windows << ", "
-      << "drift_soft_npd_ratio=" << drift_soft_npd_ratio << ", "
-      << "drift_soft_gain=" << drift_soft_gain << ", "
-      << "drift_hard_nre_ratio=" << drift_hard_nre_ratio << ", "
-      << "drift_hard_cm_z=" << drift_hard_cm_z << ", "
-      << "drift_hard_lds=" << drift_hard_lds << ", "
-      << "drift_max_closed_deltas=" << drift_max_closed_deltas << ", "
-      << "drift_max_closed_ratio=" << drift_max_closed_ratio << ", "
-      << "drift_active_delta_max_docs=" << drift_active_delta_max_docs << "}";
+      << "stream_batch_size=" << stream_batch_size << "}";
   return oss.str();
 }
 
@@ -113,19 +90,6 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractString(text, "streaming_mode", &cfg.streaming_mode);
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
-  ExtractUint(text, "drift_window_size", &cfg.drift_window_size);
-  ExtractUint(text, "drift_confirm_k", &cfg.drift_confirm_k);
-  ExtractUint(text, "drift_confirm_m", &cfg.drift_confirm_m);
-  ExtractDouble(text, "drift_confirm_ratio", &cfg.drift_confirm_ratio);
-  ExtractUint(text, "drift_min_delta_lifetime_windows", &cfg.drift_min_delta_lifetime_windows);
-  ExtractDouble(text, "drift_soft_npd_ratio", &cfg.drift_soft_npd_ratio);
-  ExtractDouble(text, "drift_soft_gain", &cfg.drift_soft_gain);
-  ExtractDouble(text, "drift_hard_nre_ratio", &cfg.drift_hard_nre_ratio);
-  ExtractDouble(text, "drift_hard_cm_z", &cfg.drift_hard_cm_z);
-  ExtractDouble(text, "drift_hard_lds", &cfg.drift_hard_lds);
-  ExtractUint(text, "drift_max_closed_deltas", &cfg.drift_max_closed_deltas);
-  ExtractDouble(text, "drift_max_closed_ratio", &cfg.drift_max_closed_ratio);
-  ExtractUint(text, "drift_active_delta_max_docs", &cfg.drift_active_delta_max_docs);
 
   if (cfg.streaming_mode != "streaming" && cfg.streaming_mode != "batch") {
     return Status::InvalidArgument(
@@ -133,27 +97,6 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.stream_batch_size == 0) {
     return Status::InvalidArgument("stream_batch_size must be > 0");
-  }
-  if (cfg.drift_window_size == 0) {
-    return Status::InvalidArgument("drift_window_size must be > 0");
-  }
-  if (cfg.drift_confirm_k == 0 || cfg.drift_confirm_m == 0) {
-    return Status::InvalidArgument("drift_confirm_k and drift_confirm_m must be > 0");
-  }
-  if (cfg.drift_confirm_k > cfg.drift_confirm_m) {
-    return Status::InvalidArgument("drift_confirm_k must be <= drift_confirm_m");
-  }
-  if (cfg.drift_confirm_ratio <= 0.0 || cfg.drift_confirm_ratio > 1.0) {
-    return Status::InvalidArgument("drift_confirm_ratio must be in (0,1]");
-  }
-  if (cfg.drift_soft_npd_ratio <= 0.0 || cfg.drift_hard_nre_ratio <= 0.0) {
-    return Status::InvalidArgument("drift threshold ratios must be > 0");
-  }
-  if (cfg.drift_soft_gain < 0.0) {
-    return Status::InvalidArgument("drift_soft_gain must be >= 0");
-  }
-  if (cfg.drift_max_closed_ratio < 0.0 || cfg.drift_max_closed_ratio > 1.0) {
-    return Status::InvalidArgument("drift_max_closed_ratio must be in [0,1]");
   }
 
   return cfg;

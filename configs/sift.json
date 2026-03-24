@@ -17,18 +17,5 @@
   "enable_streaming": true,
   "main_index_rows": 400000,
   "streaming_mode": "streaming",
-  "stream_batch_size": 1000,
-  "drift_window_size": 10000,
-  "drift_confirm_k": 3,
-  "drift_confirm_m": 5,
-  "drift_confirm_ratio": 0.6,
-  "drift_min_delta_lifetime_windows": 2,
-  "drift_soft_npd_ratio": 1.2,
-  "drift_soft_gain": 0.05,
-  "drift_hard_nre_ratio": 1.5,
-  "drift_hard_cm_z": 3.0,
-  "drift_hard_lds": 0.2,
-  "drift_max_closed_deltas": 3,
-  "drift_max_closed_ratio": 0.15,
-  "drift_active_delta_max_docs": 100000
+  "stream_batch_size": 1000
 }
