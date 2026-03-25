@@ -23,11 +23,11 @@
   "online_pq_qe_ratio_threshold": 1.05,
   "online_pq_ema_alpha": 0.1,
   "online_pq_eps": 0.000001,
-  "online_pq_warmup_enable": true,
+  "online_pq_warmup_enable": false,
   "online_pq_warmup_batches": 20,
-  "online_pq_partial_top_alpha": false,
-  "online_pq_alpha": 1.0,
-  "online_pq_partial_top_lambda": false,
-  "online_pq_lambda": 1.0,
+  "online_pq_partial_top_alpha": true,
+  "online_pq_alpha": 0.5,
+  "online_pq_partial_top_lambda": true,
+  "online_pq_lambda": 0.5,
   "online_pq_reencode_batch": true
 }
