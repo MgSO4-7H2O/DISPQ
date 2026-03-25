@@ -38,6 +38,17 @@ bool ExtractString(const std::string& text, const std::string& key, std::string*
   return false;
 }
 
+bool ExtractDouble(const std::string& text, const std::string& key, double* out) {
+  std::regex re("\"" + key +
+                "\"\\s*:\\s*(-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?)");
+  std::smatch match;
+  if (std::regex_search(text, match, re)) {
+    *out = std::stod(match[1]);
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string Config::ToString() const {
@@ -59,7 +70,20 @@ std::string Config::ToString() const {
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "streaming_mode=" << streaming_mode << ", "
-      << "stream_batch_size=" << stream_batch_size << "}";
+      << "stream_batch_size=" << stream_batch_size << ", "
+      << "streaming_use_stream_batch_size=" << std::boolalpha << streaming_use_stream_batch_size
+      << ", "
+      << "online_pq_enable=" << std::boolalpha << online_pq_enable << ", "
+      << "online_pq_qe_ratio_threshold=" << online_pq_qe_ratio_threshold << ", "
+      << "online_pq_ema_alpha=" << online_pq_ema_alpha << ", "
+      << "online_pq_eps=" << online_pq_eps << ", "
+      << "online_pq_warmup_enable=" << std::boolalpha << online_pq_warmup_enable << ", "
+      << "online_pq_warmup_batches=" << online_pq_warmup_batches << ", "
+      << "online_pq_partial_top_alpha=" << std::boolalpha << online_pq_partial_top_alpha << ", "
+      << "online_pq_alpha=" << online_pq_alpha << ", "
+      << "online_pq_partial_top_lambda=" << std::boolalpha << online_pq_partial_top_lambda << ", "
+      << "online_pq_lambda=" << online_pq_lambda << ", "
+      << "online_pq_reencode_batch=" << std::boolalpha << online_pq_reencode_batch << "}";
   return oss.str();
 }
 
@@ -90,6 +114,18 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractString(text, "streaming_mode", &cfg.streaming_mode);
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
+  ExtractBool(text, "streaming_use_stream_batch_size", &cfg.streaming_use_stream_batch_size);
+  ExtractBool(text, "online_pq_enable", &cfg.online_pq_enable);
+  ExtractDouble(text, "online_pq_qe_ratio_threshold", &cfg.online_pq_qe_ratio_threshold);
+  ExtractDouble(text, "online_pq_ema_alpha", &cfg.online_pq_ema_alpha);
+  ExtractDouble(text, "online_pq_eps", &cfg.online_pq_eps);
+  ExtractBool(text, "online_pq_warmup_enable", &cfg.online_pq_warmup_enable);
+  ExtractUint(text, "online_pq_warmup_batches", &cfg.online_pq_warmup_batches);
+  ExtractBool(text, "online_pq_partial_top_alpha", &cfg.online_pq_partial_top_alpha);
+  ExtractDouble(text, "online_pq_alpha", &cfg.online_pq_alpha);
+  ExtractBool(text, "online_pq_partial_top_lambda", &cfg.online_pq_partial_top_lambda);
+  ExtractDouble(text, "online_pq_lambda", &cfg.online_pq_lambda);
+  ExtractBool(text, "online_pq_reencode_batch", &cfg.online_pq_reencode_batch);
 
   if (cfg.streaming_mode != "streaming" && cfg.streaming_mode != "batch") {
     return Status::InvalidArgument(
@@ -97,6 +133,25 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.stream_batch_size == 0) {
     return Status::InvalidArgument("stream_batch_size must be > 0");
+  }
+  if (cfg.online_pq_qe_ratio_threshold <= 0.0) {
+    return Status::InvalidArgument("online_pq_qe_ratio_threshold must be > 0");
+  }
+  if (cfg.online_pq_ema_alpha <= 0.0 || cfg.online_pq_ema_alpha > 1.0) {
+    return Status::InvalidArgument("online_pq_ema_alpha must be in (0,1]");
+  }
+  if (cfg.online_pq_eps <= 0.0) {
+    return Status::InvalidArgument("online_pq_eps must be > 0");
+  }
+  if (cfg.online_pq_warmup_enable && cfg.online_pq_warmup_batches == 0) {
+    return Status::InvalidArgument(
+        "online_pq_warmup_batches must be > 0 when online_pq_warmup_enable=true");
+  }
+  if (cfg.online_pq_alpha <= 0.0 || cfg.online_pq_alpha > 1.0) {
+    return Status::InvalidArgument("online_pq_alpha must be in (0,1]");
+  }
+  if (cfg.online_pq_lambda <= 0.0 || cfg.online_pq_lambda > 1.0) {
+    return Status::InvalidArgument("online_pq_lambda must be in (0,1]");
   }
 
   return cfg;

@@ -97,12 +97,35 @@ struct SnapshotRecord {
   double avg_scanned{0.0};
   double qps{0.0};
   double update_ms{0.0};
+  double nqe_batch{0.0};
+  double qe_ratio{1.0};
+  double codebook_drift{0.0};
+  bool pq_updated{false};
+  bool in_warmup{false};
+  uint32_t warmup_batches_left{0};
 };
 
 struct SearchRoute {
   std::shared_ptr<IVFIndex> ivf;
   VersionSet versions{};
   uint8_t from_new{0};
+};
+
+struct OnlinePQRollup {
+  uint32_t batches{0};
+  uint32_t warmup_batches{0};
+  uint32_t triggered{0};
+  uint32_t updated{0};
+  uint32_t reencoded{0};
+  uint32_t updated_subspaces{0};
+  uint32_t updated_codewords{0};
+  double sum_nqe_batch{0.0};
+  double sum_qe_ratio{0.0};
+  double sum_codebook_drift{0.0};
+  double last_nqe_batch{0.0};
+  double last_qe_ratio{1.0};
+  double last_codebook_drift{0.0};
+  uint32_t last_warmup_batches_left{0};
 };
 
 Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
@@ -135,11 +158,45 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
   return ivf->Add(records);
 }
 
+Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
+    const std::shared_ptr<IVFIndex>& ivf,
+    const MatrixRM& x_whitened,
+    uint32_t begin,
+    uint32_t end,
+    uint32_t dim,
+    const VersionSet& versions,
+    const OnlinePQUpdateOptions& options) {
+  if (!ivf) {
+    return Status::InvalidArgument("AddRangeToIndexWithOnlinePQ: null ivf");
+  }
+  if (begin > end || end > static_cast<uint32_t>(x_whitened.rows())) {
+    return Status::InvalidArgument("AddRangeToIndexWithOnlinePQ: invalid range");
+  }
+  OnlinePQUpdateStats empty_stats;
+  if (begin == end) {
+    return empty_stats;
+  }
+
+  AlignedVector<VectorRecord> records;
+  records.reserve(static_cast<size_t>(end - begin));
+  for (uint32_t i = begin; i < end; ++i) {
+    VectorRecord rec;
+    rec.doc_id = i;
+    rec.dim = dim;
+    rec.versions = versions;
+    rec.ivf_id = 0;
+    rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
+    records.push_back(std::move(rec));
+  }
+  return ivf->AddWithOnlinePQ(records, options);
+}
+
 Result<DeltaShard> BuildEmptyShard(Eigen::Ref<const MatrixRM> train_data,
                                    const IVFParams& ivf_params,
                                    VersionId whiten_version,
                                    uint32_t shard_id,
-                                   Eigen::Ref<const MatrixRM> shared_centroids) {
+                                   Eigen::Ref<const MatrixRM> shared_centroids,
+                                   const std::optional<PQRuntimeState>& main_pq_state) {
   if (train_data.rows() == 0 || train_data.cols() == 0) {
     return Status::InvalidArgument("BuildEmptyShard: empty training data");
   }
@@ -152,6 +209,13 @@ Result<DeltaShard> BuildEmptyShard(Eigen::Ref<const MatrixRM> train_data,
   IVFParams delta_params = ivf_params;
   delta_params.use_fixed_routing_centroids = true;
   delta_params.fixed_routing_centroids = shared_centroids;
+  if (main_pq_state.has_value() && main_pq_state->use_pq && !main_pq_state->codebooks.empty()) {
+    delta_params.use_fixed_pq_codebooks = true;
+    delta_params.fixed_pq_codebooks = main_pq_state->codebooks;
+    delta_params.fixed_pq_counts = main_pq_state->counts;
+    delta_params.fixed_pq_baseline_nqe = main_pq_state->nqe_baseline;
+    delta_params.fixed_pq_ema_nqe = main_pq_state->nqe_ema;
+  }
   auto version_res = ivf->Build(train_data, ids, delta_params, 0);
   if (!version_res.ok()) {
     return version_res.status();
@@ -641,6 +705,18 @@ int main(int argc, char** argv) {
     return 1;
   }
   main_routing_centroids = centroids_res.value();
+
+  std::optional<PQRuntimeState> main_pq_state;
+  if (config.pq_enable && config.pq_residual) {
+    auto pq_state_res = main_ivf->GetPQRuntimeState(main_versions);
+    if (!pq_state_res.ok()) {
+      std::cerr << pq_state_res.status().ToString() << std::endl;
+      return 1;
+    }
+    if (pq_state_res.value().use_pq) {
+      main_pq_state = pq_state_res.value();
+    }
+  }
   double rebuild_ms_total = init_timer.ElapsedMillis();
 
   std::optional<DeltaShard> active_delta;
@@ -649,13 +725,30 @@ int main(int argc, char** argv) {
                                       ivf_params,
                                       whiten_version,
                                       1,
-                                      main_routing_centroids);
+                                      main_routing_centroids,
+                                      main_pq_state);
     if (!active_res.ok()) {
       std::cerr << active_res.status().ToString() << std::endl;
       return 1;
     }
     active_delta = active_res.value();
   }
+
+  OnlinePQUpdateOptions online_pq_options;
+  online_pq_options.enable = config.online_pq_enable && config.pq_enable && config.pq_residual;
+  online_pq_options.qe_ratio_threshold = config.online_pq_qe_ratio_threshold;
+  online_pq_options.ema_alpha = config.online_pq_ema_alpha;
+  online_pq_options.nqe_eps = config.online_pq_eps;
+  online_pq_options.warmup_enable = config.online_pq_warmup_enable;
+  online_pq_options.warmup_batches = config.online_pq_warmup_batches;
+  online_pq_options.partial_top_alpha = config.online_pq_partial_top_alpha;
+  online_pq_options.partial_alpha = config.online_pq_alpha;
+  online_pq_options.partial_top_lambda = config.online_pq_partial_top_lambda;
+  online_pq_options.partial_lambda = config.online_pq_lambda;
+  online_pq_options.reencode_batch_after_update = config.online_pq_reencode_batch;
+
+  OnlinePQRollup online_pq_rollup;
+  OnlinePQUpdateStats last_online_pq_stats;
 
   std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
   std::error_code ec;
@@ -689,7 +782,10 @@ int main(int argc, char** argv) {
     return m;
   };
 
-  auto write_snapshot = [&](uint32_t active_rows, const EvalMetrics& metrics, double update_ms) {
+  auto write_snapshot = [&](uint32_t active_rows,
+                            const EvalMetrics& metrics,
+                            double update_ms,
+                            const OnlinePQUpdateStats& pq_stats) {
     if (!collect_snapshots) {
       return;
     }
@@ -703,6 +799,12 @@ int main(int argc, char** argv) {
     snap.avg_scanned = metrics.scanned_avg;
     snap.qps = metrics.qps;
     snap.update_ms = update_ms;
+    snap.nqe_batch = pq_stats.nqe_batch;
+    snap.qe_ratio = pq_stats.qe_ratio;
+    snap.codebook_drift = pq_stats.codebook_drift_l2;
+    snap.pq_updated = pq_stats.updated_codebook;
+    snap.in_warmup = pq_stats.in_warmup;
+    snap.warmup_batches_left = pq_stats.warmup_batches_left;
     snapshots.push_back(std::move(snap));
   };
 
@@ -716,27 +818,63 @@ int main(int argc, char** argv) {
       std::cerr << mres.status().ToString() << std::endl;
       return 1;
     }
-    write_snapshot(next_insert_idx, mres.value(), 0.0);
+    write_snapshot(next_insert_idx, mres.value(), 0.0, last_online_pq_stats);
   }
 
   if (config.enable_streaming && total_stream_rows > 0) {
-    const uint32_t insert_step =
-        config.streaming_mode == "streaming" ? 1u : std::max(1u, config.stream_batch_size);
+    const bool use_stream_batch_size =
+        config.streaming_mode == "batch" ||
+        (config.streaming_mode == "streaming" && config.streaming_use_stream_batch_size);
+    const uint32_t insert_step = use_stream_batch_size ? std::max(1u, config.stream_batch_size) : 1u;
     uint32_t next_snapshot_target = std::max(1u, config.snapshot_interval);
 
     while (next_insert_idx < nx) {
-      const uint32_t chunk = std::min<uint32_t>(insert_step, nx - next_insert_idx);
+      uint32_t chunk = std::min<uint32_t>(insert_step, nx - next_insert_idx);
+      if (collect_snapshots && inserted_rows < total_stream_rows) {
+        const uint32_t rows_until_snapshot = next_snapshot_target - inserted_rows;
+        if (rows_until_snapshot > 0) {
+          chunk = std::min<uint32_t>(chunk, rows_until_snapshot);
+        }
+      }
       const uint32_t begin = next_insert_idx;
       const uint32_t end = begin + chunk;
 
       Timer update_timer;
       if (active_delta.has_value()) {
-        Status add_status =
-            AddRangeToIndex(active_delta->ivf, X_whitened, begin, end, config.dim, active_delta->versions);
-        if (!add_status.ok()) {
-          std::cerr << add_status.ToString() << std::endl;
+        auto add_res = AddRangeToIndexWithOnlinePQ(active_delta->ivf,
+                                                   X_whitened,
+                                                   begin,
+                                                   end,
+                                                   config.dim,
+                                                   active_delta->versions,
+                                                   online_pq_options);
+        if (!add_res.ok()) {
+          std::cerr << add_res.status().ToString() << std::endl;
           return 1;
         }
+        last_online_pq_stats = add_res.value();
+        online_pq_rollup.batches++;
+        online_pq_rollup.sum_nqe_batch += last_online_pq_stats.nqe_batch;
+        online_pq_rollup.sum_qe_ratio += last_online_pq_stats.qe_ratio;
+        online_pq_rollup.sum_codebook_drift += last_online_pq_stats.codebook_drift_l2;
+        online_pq_rollup.last_nqe_batch = last_online_pq_stats.nqe_batch;
+        online_pq_rollup.last_qe_ratio = last_online_pq_stats.qe_ratio;
+        online_pq_rollup.last_codebook_drift = last_online_pq_stats.codebook_drift_l2;
+        online_pq_rollup.last_warmup_batches_left = last_online_pq_stats.warmup_batches_left;
+        if (last_online_pq_stats.in_warmup) {
+          online_pq_rollup.warmup_batches++;
+        }
+        if (last_online_pq_stats.trigger_update) {
+          online_pq_rollup.triggered++;
+        }
+        if (last_online_pq_stats.updated_codebook) {
+          online_pq_rollup.updated++;
+        }
+        if (last_online_pq_stats.reencoded_batch) {
+          online_pq_rollup.reencoded++;
+        }
+        online_pq_rollup.updated_subspaces += last_online_pq_stats.updated_subspaces;
+        online_pq_rollup.updated_codewords += last_online_pq_stats.updated_codewords;
         active_delta->rows += chunk;
       }
       const double step_update_ms = update_timer.ElapsedMillis();
@@ -746,26 +884,21 @@ int main(int argc, char** argv) {
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
 
-      bool take_snapshot = false;
-      if (collect_snapshots) {
-        if (config.snapshot_interval == 0) {
-          take_snapshot = false;
-        } else if (inserted_rows >= next_snapshot_target) {
-          take_snapshot = true;
-          while (inserted_rows >= next_snapshot_target) {
-            next_snapshot_target += config.snapshot_interval;
-          }
-        } else if (inserted_rows == total_stream_rows) {
-          take_snapshot = true;
+      const bool hit_periodic_snapshot =
+          collect_snapshots && inserted_rows == next_snapshot_target;
+      const bool hit_final_snapshot = collect_snapshots && inserted_rows == total_stream_rows;
+      if (hit_periodic_snapshot) {
+        while (next_snapshot_target <= inserted_rows) {
+          next_snapshot_target += config.snapshot_interval;
         }
       }
-      if (take_snapshot) {
+      if (hit_periodic_snapshot || hit_final_snapshot) {
         auto mres = evaluate_rows(next_insert_idx);
         if (!mres.ok()) {
           std::cerr << mres.status().ToString() << std::endl;
           return 1;
         }
-        write_snapshot(next_insert_idx, mres.value(), pending_update_ms);
+        write_snapshot(next_insert_idx, mres.value(), pending_update_ms, last_online_pq_stats);
         pending_update_ms = 0.0;
       }
     }
@@ -780,6 +913,18 @@ int main(int argc, char** argv) {
   final_metrics.update_total_ms = total_update_ms;
   final_metrics.update_per_vector_ms =
       inserted_rows > 0 ? total_update_ms / static_cast<double>(inserted_rows) : 0.0;
+  const double online_avg_nqe =
+      online_pq_rollup.batches > 0
+          ? online_pq_rollup.sum_nqe_batch / static_cast<double>(online_pq_rollup.batches)
+          : 0.0;
+  const double online_avg_qe_ratio =
+      online_pq_rollup.batches > 0
+          ? online_pq_rollup.sum_qe_ratio / static_cast<double>(online_pq_rollup.batches)
+          : 1.0;
+  const double online_avg_drift =
+      online_pq_rollup.batches > 0
+          ? online_pq_rollup.sum_codebook_drift / static_cast<double>(online_pq_rollup.batches)
+          : 0.0;
 
   std::cout << "[ONLINE EVAL] "
             << "Recall@" << config.topk << " = " << final_metrics.recall
@@ -795,6 +940,17 @@ int main(int argc, char** argv) {
             << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
             << "; QPS=" << final_metrics.qps << std::endl;
+  std::cout << "[ONLINE PQ] enabled=" << std::boolalpha << online_pq_options.enable
+            << ", batches=" << online_pq_rollup.batches
+            << ", warmup_batches=" << online_pq_rollup.warmup_batches
+            << ", triggered=" << online_pq_rollup.triggered
+            << ", updated=" << online_pq_rollup.updated
+            << ", reencoded=" << online_pq_rollup.reencoded
+            << ", avg_nqe=" << online_avg_nqe
+            << ", warmup_left=" << online_pq_rollup.last_warmup_batches_left
+            << ", last_qe_ratio=" << online_pq_rollup.last_qe_ratio
+            << ", avg_qe_ratio=" << online_avg_qe_ratio
+            << ", avg_codebook_drift=" << online_avg_drift << std::endl;
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
@@ -817,7 +973,24 @@ int main(int argc, char** argv) {
   ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
   ofs << "    \"streaming_mode\": \""
       << (config.enable_streaming ? config.streaming_mode : "offline") << "\",\n";
-  ofs << "    \"stream_batch_size\": " << config.stream_batch_size << "\n";
+  ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
+  ofs << "    \"streaming_use_stream_batch_size\": "
+      << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_qe_ratio_threshold\": " << config.online_pq_qe_ratio_threshold << ",\n";
+  ofs << "    \"online_pq_ema_alpha\": " << config.online_pq_ema_alpha << ",\n";
+  ofs << "    \"online_pq_eps\": " << config.online_pq_eps << ",\n";
+  ofs << "    \"online_pq_warmup_enable\": "
+      << (config.online_pq_warmup_enable ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_warmup_batches\": " << config.online_pq_warmup_batches << ",\n";
+  ofs << "    \"online_pq_partial_top_alpha\": "
+      << (config.online_pq_partial_top_alpha ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_alpha\": " << config.online_pq_alpha << ",\n";
+  ofs << "    \"online_pq_partial_top_lambda\": "
+      << (config.online_pq_partial_top_lambda ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_lambda\": " << config.online_pq_lambda << ",\n";
+  ofs << "    \"online_pq_reencode_batch\": "
+      << (config.online_pq_reencode_batch ? "true" : "false") << "\n";
   ofs << "  },\n";
   ofs << "  \"metrics\": {\n";
   ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
@@ -827,6 +1000,23 @@ int main(int argc, char** argv) {
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
   ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << "\n";
+  ofs << "  },\n";
+  ofs << "  \"online_pq\": {\n";
+  ofs << "    \"enabled\": " << (online_pq_options.enable ? "true" : "false") << ",\n";
+  ofs << "    \"batches\": " << online_pq_rollup.batches << ",\n";
+  ofs << "    \"warmup_batches\": " << online_pq_rollup.warmup_batches << ",\n";
+  ofs << "    \"triggered\": " << online_pq_rollup.triggered << ",\n";
+  ofs << "    \"updated\": " << online_pq_rollup.updated << ",\n";
+  ofs << "    \"reencoded\": " << online_pq_rollup.reencoded << ",\n";
+  ofs << "    \"avg_nqe\": " << online_avg_nqe << ",\n";
+  ofs << "    \"last_nqe\": " << online_pq_rollup.last_nqe_batch << ",\n";
+  ofs << "    \"last_warmup_batches_left\": " << online_pq_rollup.last_warmup_batches_left << ",\n";
+  ofs << "    \"avg_qe_ratio\": " << online_avg_qe_ratio << ",\n";
+  ofs << "    \"last_qe_ratio\": " << online_pq_rollup.last_qe_ratio << ",\n";
+  ofs << "    \"avg_codebook_drift\": " << online_avg_drift << ",\n";
+  ofs << "    \"last_codebook_drift\": " << online_pq_rollup.last_codebook_drift << ",\n";
+  ofs << "    \"updated_subspaces\": " << online_pq_rollup.updated_subspaces << ",\n";
+  ofs << "    \"updated_codewords\": " << online_pq_rollup.updated_codewords << "\n";
   ofs << "  },\n";
   ofs << "  \"snapshots\": [\n";
   for (size_t i = 0; i < snapshots.size(); ++i) {
@@ -840,7 +1030,13 @@ int main(int argc, char** argv) {
     ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
     ofs << "      \"qps\": " << snap.qps << ",\n";
-    ofs << "      \"update_ms\": " << snap.update_ms << "\n";
+    ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+    ofs << "      \"nqe_batch\": " << snap.nqe_batch << ",\n";
+    ofs << "      \"qe_ratio\": " << snap.qe_ratio << ",\n";
+    ofs << "      \"codebook_drift\": " << snap.codebook_drift << ",\n";
+    ofs << "      \"pq_updated\": " << (snap.pq_updated ? "true" : "false") << ",\n";
+    ofs << "      \"in_warmup\": " << (snap.in_warmup ? "true" : "false") << ",\n";
+    ofs << "      \"warmup_batches_left\": " << snap.warmup_batches_left << "\n";
     ofs << "    }";
     if (i + 1 < snapshots.size()) {
       ofs << ",";

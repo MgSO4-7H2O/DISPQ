@@ -23,6 +23,56 @@ struct IVFParams {
   PQParams pq;
   bool use_fixed_routing_centroids{false};
   MatrixRM fixed_routing_centroids;
+  bool use_fixed_pq_codebooks{false};
+  std::vector<MatrixRM> fixed_pq_codebooks;
+  std::vector<std::vector<uint64_t>> fixed_pq_counts;
+  double fixed_pq_baseline_nqe{-1.0};
+  double fixed_pq_ema_nqe{-1.0};
+};
+
+struct OnlinePQUpdateOptions {
+  bool enable{false};
+  double qe_ratio_threshold{1.05};
+  double ema_alpha{0.1};
+  double nqe_eps{1e-6};
+  bool warmup_enable{false};
+  uint32_t warmup_batches{0};
+  bool partial_top_alpha{false};
+  double partial_alpha{1.0};
+  bool partial_top_lambda{false};
+  double partial_lambda{1.0};
+  bool reencode_batch_after_update{true};
+};
+
+struct OnlinePQUpdateStats {
+  bool use_online_pq{false};
+  bool trigger_update{false};
+  bool updated_codebook{false};
+  bool reencoded_batch{false};
+  bool in_warmup{false};
+  uint32_t warmup_batches_left{0};
+  uint32_t processed_vectors{0};
+  uint32_t updated_subspaces{0};
+  uint32_t updated_codewords{0};
+  double nqe_batch{0.0};
+  double nqe_ema{0.0};
+  double nqe_baseline{0.0};
+  double qe_ratio{1.0};
+  double codebook_drift_l2{0.0};
+};
+
+struct PQRuntimeState {
+  bool use_pq{false};
+  bool pq_residual{true};
+  uint32_t M{0};
+  uint32_t Ks{0};
+  uint32_t dsub{0};
+  std::vector<MatrixRM> codebooks;
+  std::vector<std::vector<uint64_t>> counts;
+  double nqe_baseline{0.0};
+  double nqe_ema{0.0};
+  double qe_ratio{1.0};
+  uint64_t ntotal{0};
 };
 
 class IVFIndex {
@@ -37,6 +87,11 @@ class IVFIndex {
   // NTS: Adds vector records to the mutable shard.
   virtual Status Add(const AlignedVector<VectorRecord>& recs) = 0;
 
+  // NTS: Adds records and optionally applies residual OnlinePQ codebook update.
+  virtual Result<OnlinePQUpdateStats> AddWithOnlinePQ(
+      const AlignedVector<VectorRecord>& recs,
+      const OnlinePQUpdateOptions& options) = 0;
+
   // TS: Searches specified versions using whitened query.
   virtual Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> qw,
                                       uint32_t topk,
@@ -45,6 +100,9 @@ class IVFIndex {
                                       uint8_t from_new) const = 0;
 
   virtual Result<MatrixRM> GetRoutingCentroids(const VersionSet& route_versions) const = 0;
+  virtual Result<PQRuntimeState> GetPQRuntimeState(const VersionSet& route_versions) const = 0;
+  virtual Result<std::vector<uint8_t>> GetDocPQCode(const VersionSet& route_versions,
+                                                    DocId doc_id) const = 0;
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;

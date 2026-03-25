@@ -25,6 +25,18 @@ struct Config {
   uint32_t main_index_rows{0};
   std::string streaming_mode{"streaming"};
   uint32_t stream_batch_size{100};
+  bool streaming_use_stream_batch_size{false};
+  bool online_pq_enable{true};
+  double online_pq_qe_ratio_threshold{1.05};
+  double online_pq_ema_alpha{0.1};
+  double online_pq_eps{1e-6};
+  bool online_pq_warmup_enable{false};
+  uint32_t online_pq_warmup_batches{0};
+  bool online_pq_partial_top_alpha{false};
+  double online_pq_alpha{1.0};
+  bool online_pq_partial_top_lambda{false};
+  double online_pq_lambda{1.0};
+  bool online_pq_reencode_batch{true};
 
   std::string ToString() const;
 };

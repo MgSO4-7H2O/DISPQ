@@ -17,5 +17,17 @@
   "enable_streaming": true,
   "main_index_rows": 30000,
   "streaming_mode": "batch",
-  "stream_batch_size": 100
+  "stream_batch_size": 100,
+  "streaming_use_stream_batch_size": true,
+  "online_pq_enable": true,
+  "online_pq_qe_ratio_threshold": 1.05,
+  "online_pq_ema_alpha": 0.1,
+  "online_pq_eps": 0.000001,
+  "online_pq_warmup_enable": true,
+  "online_pq_warmup_batches": 20,
+  "online_pq_partial_top_alpha": false,
+  "online_pq_alpha": 1.0,
+  "online_pq_partial_top_lambda": false,
+  "online_pq_lambda": 1.0,
+  "online_pq_reencode_batch": true
 }

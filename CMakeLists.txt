@@ -40,6 +40,11 @@ add_executable(test_recall_smoke tests/test_recall_smoke.cpp)
 target_link_libraries(test_recall_smoke PRIVATE ann)
 ann_set_warnings(test_recall_smoke)
 
+add_executable(test_online_pq tests/test_online_pq.cpp)
+target_link_libraries(test_online_pq PRIVATE ann)
+ann_set_warnings(test_online_pq)
+
 enable_testing()
 add_test(NAME test_interfaces COMMAND test_interfaces)
 add_test(NAME test_recall_smoke COMMAND test_recall_smoke)
+add_test(NAME test_online_pq COMMAND test_online_pq)
