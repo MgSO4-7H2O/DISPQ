@@ -85,6 +85,8 @@ struct EvalMetrics {
   double scanned_max{0.0};
   double update_total_ms{0.0};
   double update_per_vector_ms{0.0};
+  double query_eval_ms{0.0};
+  uint32_t query_count{0};
 };
 
 struct SnapshotRecord {
@@ -97,6 +99,9 @@ struct SnapshotRecord {
   double avg_scanned{0.0};
   double qps{0.0};
   double update_ms{0.0};
+  double query_eval_ms{0.0};
+  double snapshot_total_ms{0.0};
+  double snapshot_qps{0.0};
   double nqe_batch{0.0};
   double qe_ratio{1.0};
   double codebook_drift{0.0};
@@ -504,6 +509,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.scanned_p50 = scanned_p50;
   metrics.scanned_p99 = scanned_p99;
   metrics.scanned_max = scanned_max;
+  metrics.query_eval_ms = wall_elapsed_ms;
+  metrics.query_count = nq;
   return metrics;
 }
 
@@ -799,6 +806,12 @@ int main(int argc, char** argv) {
     snap.avg_scanned = metrics.scanned_avg;
     snap.qps = metrics.qps;
     snap.update_ms = update_ms;
+    snap.query_eval_ms = metrics.query_eval_ms;
+    snap.snapshot_total_ms = update_ms + metrics.query_eval_ms;
+    snap.snapshot_qps =
+        (metrics.query_count > 0 && snap.snapshot_total_ms > 0.0)
+            ? (static_cast<double>(metrics.query_count) / (snap.snapshot_total_ms / 1000.0))
+            : 0.0;
     snap.nqe_batch = pq_stats.nqe_batch;
     snap.qe_ratio = pq_stats.qe_ratio;
     snap.codebook_drift = pq_stats.codebook_drift_l2;
@@ -1031,6 +1044,9 @@ int main(int argc, char** argv) {
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
     ofs << "      \"qps\": " << snap.qps << ",\n";
     ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+    ofs << "      \"query_eval_ms\": " << snap.query_eval_ms << ",\n";
+    ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
+    ofs << "      \"snapshot_qps\": " << snap.snapshot_qps << ",\n";
     ofs << "      \"nqe_batch\": " << snap.nqe_batch << ",\n";
     ofs << "      \"qe_ratio\": " << snap.qe_ratio << ",\n";
     ofs << "      \"codebook_drift\": " << snap.codebook_drift << ",\n";
