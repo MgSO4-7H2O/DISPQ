@@ -20,7 +20,7 @@
   "stream_batch_size": 100,
   "streaming_use_stream_batch_size": true,
   "online_pq_enable": true,
-  "online_pq_qe_ratio_threshold": 1.05,
+  "online_pq_qe_ratio_threshold": 1.1,
   "online_pq_ema_alpha": 0.1,
   "online_pq_eps": 0.000001,
   "online_pq_warmup_enable": false,
