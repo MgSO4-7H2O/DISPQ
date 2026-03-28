@@ -94,6 +94,7 @@ struct SnapshotRecord {
   uint32_t main_rows{0};
   uint32_t delta_rows{0};
   uint32_t active_delta_docs{0};
+  uint32_t snapshot_rows{0};
   double recall{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
@@ -767,6 +768,7 @@ int main(int argc, char** argv) {
   const bool collect_snapshots = config.enable_streaming && total_stream_rows > 0 &&
                                  config.snapshot_interval > 0;
   std::vector<SnapshotRecord> snapshots;
+  uint32_t last_snapshot_active_rows = main_rows_initial;
 
   auto evaluate_rows = [&](uint32_t active_rows) -> Result<EvalMetrics> {
     auto res = EvaluateState(config,
@@ -801,16 +803,17 @@ int main(int argc, char** argv) {
     snap.main_rows = main_rows_current;
     snap.delta_rows = active_rows > main_rows_initial ? active_rows - main_rows_initial : 0;
     snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
+    snap.snapshot_rows = active_rows >= last_snapshot_active_rows ? active_rows - last_snapshot_active_rows : 0;
     snap.recall = metrics.recall;
     snap.avg_search_ms = metrics.avg_search_ms;
     snap.avg_scanned = metrics.scanned_avg;
     snap.qps = metrics.qps;
     snap.update_ms = update_ms;
     snap.query_eval_ms = metrics.query_eval_ms;
-    snap.snapshot_total_ms = update_ms + metrics.query_eval_ms;
+    snap.snapshot_total_ms = update_ms;
     snap.snapshot_qps =
-        (metrics.query_count > 0 && snap.snapshot_total_ms > 0.0)
-            ? (static_cast<double>(metrics.query_count) / (snap.snapshot_total_ms / 1000.0))
+        (snap.snapshot_rows > 0 && snap.snapshot_total_ms > 0.0)
+            ? (static_cast<double>(snap.snapshot_rows) / (snap.snapshot_total_ms / 1000.0))
             : 0.0;
     snap.nqe_batch = pq_stats.nqe_batch;
     snap.qe_ratio = pq_stats.qe_ratio;
@@ -819,6 +822,7 @@ int main(int argc, char** argv) {
     snap.in_warmup = pq_stats.in_warmup;
     snap.warmup_batches_left = pq_stats.warmup_batches_left;
     snapshots.push_back(std::move(snap));
+    last_snapshot_active_rows = active_rows;
   };
 
   uint32_t inserted_rows = 0;
@@ -1039,6 +1043,7 @@ int main(int argc, char** argv) {
     ofs << "      \"main_rows\": " << snap.main_rows << ",\n";
     ofs << "      \"delta_rows\": " << snap.delta_rows << ",\n";
     ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
+    ofs << "      \"snapshot_rows\": " << snap.snapshot_rows << ",\n";
     ofs << "      \"recall\": " << snap.recall << ",\n";
     ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
