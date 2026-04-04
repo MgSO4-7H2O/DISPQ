@@ -31,6 +31,8 @@ struct Candidate {
 struct SearchResult {
   std::vector<Candidate> topk;
   uint64_t scanned_candidates{0};
+  std::vector<DocId> scanned_doc_ids;
+  std::vector<float> scanned_approx_dists;
 };
 
 struct VectorRecord {

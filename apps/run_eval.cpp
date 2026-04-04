@@ -13,6 +13,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -32,6 +33,7 @@ using namespace ann;
 namespace {
 
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
+constexpr uint32_t kWorstQueryDiagCount = 10;
 
 MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
   std::mt19937 gen(seed);
@@ -106,6 +108,14 @@ struct EvalMetrics {
   double update_per_vector_ms{0.0};
   double query_eval_ms{0.0};
   uint32_t query_count{0};
+  double gt_probed_rate{0.0};
+  double recall_on_probed_gt{0.0};
+  double exact_recall_on_probed_candidates{0.0};
+  double avg_pq_rank_loss{0.0};
+  uint32_t miss_not_probed{0};
+  uint32_t miss_probed_filtered_by_pq{0};
+  uint32_t pq_rank_loss_count{0};
+  std::vector<std::string> worst_queries;
 };
 
 struct MinibatchRecord {
@@ -126,6 +136,13 @@ struct MinibatchRecord {
   bool pq_updated{false};
   bool in_warmup{false};
   uint32_t warmup_batches_left{0};
+  double gt_probed_rate{0.0};
+  double recall_on_probed_gt{0.0};
+  double exact_recall_on_probed_candidates{0.0};
+  double avg_pq_rank_loss{0.0};
+  uint32_t miss_not_probed{0};
+  uint32_t miss_probed_filtered_by_pq{0};
+  uint32_t pq_rank_loss_count{0};
 };
 
 struct SnapshotRecord {
@@ -148,6 +165,14 @@ struct SnapshotRecord {
   bool pq_updated{false};
   bool in_warmup{false};
   uint32_t warmup_batches_left{0};
+  double gt_probed_rate{0.0};
+  double recall_on_probed_gt{0.0};
+  double exact_recall_on_probed_candidates{0.0};
+  double avg_pq_rank_loss{0.0};
+  uint32_t miss_not_probed{0};
+  uint32_t miss_probed_filtered_by_pq{0};
+  uint32_t pq_rank_loss_count{0};
+  std::vector<std::string> worst_queries;
   std::vector<MinibatchRecord> minibatches;
 };
 
@@ -459,6 +484,161 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
   }
 
+  struct QueryMissDiag {
+    double recall{0.0};
+    uint32_t misses{0};
+    std::string summary;
+  };
+  uint64_t gt_total = 0;
+  uint64_t gt_hits = 0;
+  uint64_t gt_probed = 0;
+  uint64_t gt_hit_and_probed = 0;
+  uint64_t miss_not_probed = 0;
+  uint64_t miss_pq_filtered = 0;
+  double exact_recall_sum = 0.0;
+  uint32_t exact_recall_count = 0;
+  double pq_rank_loss_sum = 0.0;
+  uint64_t pq_rank_loss_count = 0;
+  std::vector<QueryMissDiag> query_diags;
+  query_diags.reserve(nq);
+
+  for (uint32_t qi = 0; qi < nq; ++qi) {
+    const auto& gt_row = ground_truth[static_cast<size_t>(qi)];
+    if (gt_row.empty()) {
+      continue;
+    }
+    const auto& pred_row = predictions[static_cast<size_t>(qi)];
+    std::unordered_set<DocId> pred_set(pred_row.begin(), pred_row.end());
+    size_t scanned_reserve = 0;
+    for (uint32_t ri = 0; ri < route_count; ++ri) {
+      scanned_reserve += route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)].scanned_doc_ids.size();
+    }
+    std::unordered_map<DocId, float> approx_by_doc;
+    approx_by_doc.reserve(scanned_reserve * 2 + 1);
+    for (uint32_t ri = 0; ri < route_count; ++ri) {
+      const SearchResult& rr = route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)];
+      const size_t n = std::min(rr.scanned_doc_ids.size(), rr.scanned_approx_dists.size());
+      for (size_t si = 0; si < n; ++si) {
+        const DocId doc = rr.scanned_doc_ids[si];
+        const float approx = rr.scanned_approx_dists[si];
+        auto it = approx_by_doc.find(doc);
+        if (it == approx_by_doc.end() || approx < it->second) {
+          approx_by_doc[doc] = approx;
+        }
+      }
+    }
+
+    std::vector<std::pair<float, DocId>> approx_ranked;
+    std::vector<std::pair<float, DocId>> exact_ranked;
+    approx_ranked.reserve(approx_by_doc.size());
+    exact_ranked.reserve(approx_by_doc.size());
+    const Eigen::VectorXf qv = queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
+    for (const auto& kv : approx_by_doc) {
+      approx_ranked.push_back({kv.second, kv.first});
+      const Eigen::VectorXf diff =
+          qv - base_whitened.row(static_cast<Eigen::Index>(kv.first)).transpose();
+      exact_ranked.push_back({diff.squaredNorm(), kv.first});
+    }
+    std::sort(approx_ranked.begin(), approx_ranked.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(exact_ranked.begin(), exact_ranked.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::unordered_map<DocId, uint32_t> approx_rank;
+    std::unordered_map<DocId, uint32_t> exact_rank;
+    approx_rank.reserve(approx_ranked.size() * 2 + 1);
+    exact_rank.reserve(exact_ranked.size() * 2 + 1);
+    for (size_t i = 0; i < approx_ranked.size(); ++i) {
+      approx_rank[approx_ranked[i].second] = static_cast<uint32_t>(i + 1);
+    }
+    for (size_t i = 0; i < exact_ranked.size(); ++i) {
+      exact_rank[exact_ranked[i].second] = static_cast<uint32_t>(i + 1);
+    }
+
+    std::unordered_set<DocId> exact_topk_set;
+    const size_t exact_topk = std::min<size_t>(params.topk, exact_ranked.size());
+    exact_topk_set.reserve(exact_topk * 2 + 1);
+    for (size_t i = 0; i < exact_topk; ++i) {
+      exact_topk_set.insert(exact_ranked[i].second);
+    }
+    uint32_t exact_hits_row = 0;
+    for (DocId doc : gt_row) {
+      if (exact_topk_set.find(doc) != exact_topk_set.end()) {
+        exact_hits_row++;
+      }
+    }
+    const double exact_recall_row = static_cast<double>(exact_hits_row) / static_cast<double>(gt_row.size());
+    exact_recall_sum += exact_recall_row;
+    exact_recall_count++;
+
+    uint32_t gt_hits_row = 0;
+    uint32_t gt_probed_row = 0;
+    uint32_t miss_not_probed_row = 0;
+    uint32_t miss_pq_filtered_row = 0;
+    uint32_t pq_rank_loss_count_row = 0;
+    uint32_t pq_rank_loss_max_row = 0;
+    double pq_rank_loss_sum_row = 0.0;
+
+    for (DocId doc : gt_row) {
+      gt_total++;
+      const bool hit = pred_set.find(doc) != pred_set.end();
+      if (hit) {
+        gt_hits++;
+        gt_hits_row++;
+      }
+      const auto ait = approx_rank.find(doc);
+      const bool probed = ait != approx_rank.end();
+      if (probed) {
+        gt_probed++;
+        gt_probed_row++;
+        if (hit) {
+          gt_hit_and_probed++;
+        }
+      }
+      if (!hit) {
+        if (!probed) {
+          miss_not_probed++;
+          miss_not_probed_row++;
+        } else {
+          miss_pq_filtered++;
+          miss_pq_filtered_row++;
+          const auto eit = exact_rank.find(doc);
+          if (eit != exact_rank.end()) {
+            const uint32_t loss =
+                (ait->second > eit->second) ? (ait->second - eit->second) : 0u;
+            pq_rank_loss_sum += static_cast<double>(loss);
+            pq_rank_loss_count++;
+            pq_rank_loss_sum_row += static_cast<double>(loss);
+            pq_rank_loss_count_row++;
+            pq_rank_loss_max_row = std::max(pq_rank_loss_max_row, loss);
+          }
+        }
+      }
+    }
+
+    const double recall_row = static_cast<double>(gt_hits_row) / static_cast<double>(gt_row.size());
+    if (miss_not_probed_row + miss_pq_filtered_row > 0) {
+      const double gt_probed_rate_row =
+          static_cast<double>(gt_probed_row) / static_cast<double>(gt_row.size());
+      const double pq_rank_loss_avg_row =
+          pq_rank_loss_count_row > 0
+              ? (pq_rank_loss_sum_row / static_cast<double>(pq_rank_loss_count_row))
+              : 0.0;
+      std::string summary = "qid=" + std::to_string(qi) + ", recall=" + std::to_string(recall_row) +
+                            ", gt_probed_rate=" + std::to_string(gt_probed_rate_row) +
+                            ", miss_not_probed=" + std::to_string(miss_not_probed_row) +
+                            ", miss_pq_filtered=" + std::to_string(miss_pq_filtered_row) +
+                            ", exact_recall_on_probed=" + std::to_string(exact_recall_row) +
+                            ", avg_pq_rank_loss=" + std::to_string(pq_rank_loss_avg_row) +
+                            ", max_pq_rank_loss=" + std::to_string(pq_rank_loss_max_row);
+      query_diags.push_back(QueryMissDiag{
+          recall_row,
+          miss_not_probed_row + miss_pq_filtered_row,
+          std::move(summary),
+      });
+    }
+  }
+
   const double wall_elapsed_ms = wall_timer.ElapsedMillis();
 
   auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
@@ -537,6 +717,32 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.scanned_max = scanned_max;
   metrics.query_eval_ms = wall_elapsed_ms;
   metrics.query_count = nq;
+  metrics.gt_probed_rate =
+      gt_total > 0 ? static_cast<double>(gt_probed) / static_cast<double>(gt_total) : 0.0;
+  metrics.recall_on_probed_gt =
+      gt_probed > 0 ? static_cast<double>(gt_hit_and_probed) / static_cast<double>(gt_probed) : 0.0;
+  metrics.exact_recall_on_probed_candidates =
+      exact_recall_count > 0 ? exact_recall_sum / static_cast<double>(exact_recall_count) : 0.0;
+  metrics.avg_pq_rank_loss =
+      pq_rank_loss_count > 0 ? pq_rank_loss_sum / static_cast<double>(pq_rank_loss_count) : 0.0;
+  metrics.miss_not_probed =
+      static_cast<uint32_t>(std::min<uint64_t>(miss_not_probed, std::numeric_limits<uint32_t>::max()));
+  metrics.miss_probed_filtered_by_pq =
+      static_cast<uint32_t>(std::min<uint64_t>(miss_pq_filtered, std::numeric_limits<uint32_t>::max()));
+  metrics.pq_rank_loss_count = static_cast<uint32_t>(
+      std::min<uint64_t>(pq_rank_loss_count, std::numeric_limits<uint32_t>::max()));
+  std::sort(query_diags.begin(), query_diags.end(),
+            [](const QueryMissDiag& a, const QueryMissDiag& b) {
+              if (a.recall != b.recall) {
+                return a.recall < b.recall;
+              }
+              return a.misses > b.misses;
+            });
+  const size_t keep = std::min<size_t>(kWorstQueryDiagCount, query_diags.size());
+  metrics.worst_queries.reserve(keep);
+  for (size_t i = 0; i < keep; ++i) {
+    metrics.worst_queries.push_back(query_diags[i].summary);
+  }
   return metrics;
 }
 
@@ -850,6 +1056,14 @@ int main(int argc, char** argv) {
     snap.pq_updated = pq_stats.updated_codebook;
     snap.in_warmup = pq_stats.in_warmup;
     snap.warmup_batches_left = pq_stats.warmup_batches_left;
+    snap.gt_probed_rate = metrics.gt_probed_rate;
+    snap.recall_on_probed_gt = metrics.recall_on_probed_gt;
+    snap.exact_recall_on_probed_candidates = metrics.exact_recall_on_probed_candidates;
+    snap.avg_pq_rank_loss = metrics.avg_pq_rank_loss;
+    snap.miss_not_probed = metrics.miss_not_probed;
+    snap.miss_probed_filtered_by_pq = metrics.miss_probed_filtered_by_pq;
+    snap.pq_rank_loss_count = metrics.pq_rank_loss_count;
+    snap.worst_queries = metrics.worst_queries;
     snap.minibatches = std::move(minibatches);
     snapshots.push_back(std::move(snap));
     last_snapshot_active_rows = active_rows;
@@ -963,6 +1177,13 @@ int main(int argc, char** argv) {
       minibatch.pq_updated = last_online_pq_stats.updated_codebook;
       minibatch.in_warmup = last_online_pq_stats.in_warmup;
       minibatch.warmup_batches_left = last_online_pq_stats.warmup_batches_left;
+      minibatch.gt_probed_rate = batch_metrics.gt_probed_rate;
+      minibatch.recall_on_probed_gt = batch_metrics.recall_on_probed_gt;
+      minibatch.exact_recall_on_probed_candidates = batch_metrics.exact_recall_on_probed_candidates;
+      minibatch.avg_pq_rank_loss = batch_metrics.avg_pq_rank_loss;
+      minibatch.miss_not_probed = batch_metrics.miss_not_probed;
+      minibatch.miss_probed_filtered_by_pq = batch_metrics.miss_probed_filtered_by_pq;
+      minibatch.pq_rank_loss_count = batch_metrics.pq_rank_loss_count;
       snapshot_minibatches.push_back(std::move(minibatch));
 
       const bool hit_periodic_snapshot =
@@ -1032,6 +1253,13 @@ int main(int argc, char** argv) {
             << ", last_qe_ratio=" << online_pq_rollup.last_qe_ratio
             << ", avg_qe_ratio=" << online_avg_qe_ratio
             << ", avg_codebook_drift=" << online_avg_drift << std::endl;
+  std::cout << "[MISS DIAG] gt_probed_rate=" << final_metrics.gt_probed_rate
+            << ", recall_on_probed_gt=" << final_metrics.recall_on_probed_gt
+            << ", exact_recall_on_probed_candidates="
+            << final_metrics.exact_recall_on_probed_candidates
+            << ", miss_not_probed=" << final_metrics.miss_not_probed
+            << ", miss_probed_filtered_by_pq=" << final_metrics.miss_probed_filtered_by_pq
+            << ", avg_pq_rank_loss=" << final_metrics.avg_pq_rank_loss << std::endl;
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
@@ -1087,7 +1315,15 @@ int main(int argc, char** argv) {
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
-  ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << "\n";
+  ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << ",\n";
+  ofs << "    \"gt_probed_rate\": " << final_metrics.gt_probed_rate << ",\n";
+  ofs << "    \"recall_on_probed_gt\": " << final_metrics.recall_on_probed_gt << ",\n";
+  ofs << "    \"exact_recall_on_probed_candidates\": "
+      << final_metrics.exact_recall_on_probed_candidates << ",\n";
+  ofs << "    \"avg_pq_rank_loss\": " << final_metrics.avg_pq_rank_loss << ",\n";
+  ofs << "    \"miss_not_probed\": " << final_metrics.miss_not_probed << ",\n";
+  ofs << "    \"miss_probed_filtered_by_pq\": " << final_metrics.miss_probed_filtered_by_pq << ",\n";
+  ofs << "    \"pq_rank_loss_count\": " << final_metrics.pq_rank_loss_count << "\n";
   ofs << "  },\n";
   ofs << "  \"pre_stream_metrics\": ";
   if (pre_stream_metrics.has_value()) {
@@ -1098,7 +1334,25 @@ int main(int argc, char** argv) {
     ofs << "    \"avg_search_ms\": " << pre_stream_metrics->avg_search_ms << ",\n";
     ofs << "    \"qps\": " << pre_stream_metrics->qps << ",\n";
     ofs << "    \"avg_scanned\": " << pre_stream_metrics->scanned_avg << ",\n";
-    ofs << "    \"query_eval_ms\": " << pre_stream_metrics->query_eval_ms << "\n";
+    ofs << "    \"query_eval_ms\": " << pre_stream_metrics->query_eval_ms << ",\n";
+    ofs << "    \"gt_probed_rate\": " << pre_stream_metrics->gt_probed_rate << ",\n";
+    ofs << "    \"recall_on_probed_gt\": " << pre_stream_metrics->recall_on_probed_gt << ",\n";
+    ofs << "    \"exact_recall_on_probed_candidates\": "
+        << pre_stream_metrics->exact_recall_on_probed_candidates << ",\n";
+    ofs << "    \"avg_pq_rank_loss\": " << pre_stream_metrics->avg_pq_rank_loss << ",\n";
+    ofs << "    \"miss_not_probed\": " << pre_stream_metrics->miss_not_probed << ",\n";
+    ofs << "    \"miss_probed_filtered_by_pq\": "
+        << pre_stream_metrics->miss_probed_filtered_by_pq << ",\n";
+    ofs << "    \"pq_rank_loss_count\": " << pre_stream_metrics->pq_rank_loss_count << ",\n";
+    ofs << "    \"worst_queries\": [\n";
+    for (size_t wi = 0; wi < pre_stream_metrics->worst_queries.size(); ++wi) {
+      ofs << "      \"" << pre_stream_metrics->worst_queries[wi] << "\"";
+      if (wi + 1 < pre_stream_metrics->worst_queries.size()) {
+        ofs << ",";
+      }
+      ofs << "\n";
+    }
+    ofs << "    ]\n";
     ofs << "  },\n";
   } else {
     ofs << "null,\n";
@@ -1143,6 +1397,23 @@ int main(int argc, char** argv) {
     ofs << "      \"pq_updated\": " << (snap.pq_updated ? "true" : "false") << ",\n";
     ofs << "      \"in_warmup\": " << (snap.in_warmup ? "true" : "false") << ",\n";
     ofs << "      \"warmup_batches_left\": " << snap.warmup_batches_left << ",\n";
+    ofs << "      \"gt_probed_rate\": " << snap.gt_probed_rate << ",\n";
+    ofs << "      \"recall_on_probed_gt\": " << snap.recall_on_probed_gt << ",\n";
+    ofs << "      \"exact_recall_on_probed_candidates\": "
+        << snap.exact_recall_on_probed_candidates << ",\n";
+    ofs << "      \"avg_pq_rank_loss\": " << snap.avg_pq_rank_loss << ",\n";
+    ofs << "      \"miss_not_probed\": " << snap.miss_not_probed << ",\n";
+    ofs << "      \"miss_probed_filtered_by_pq\": " << snap.miss_probed_filtered_by_pq << ",\n";
+    ofs << "      \"pq_rank_loss_count\": " << snap.pq_rank_loss_count << ",\n";
+    ofs << "      \"worst_queries\": [\n";
+    for (size_t wi = 0; wi < snap.worst_queries.size(); ++wi) {
+      ofs << "        \"" << snap.worst_queries[wi] << "\"";
+      if (wi + 1 < snap.worst_queries.size()) {
+        ofs << ",";
+      }
+      ofs << "\n";
+    }
+    ofs << "      ],\n";
     ofs << "      \"minibatches\": [\n";
     for (size_t j = 0; j < snap.minibatches.size(); ++j) {
       const auto& mb = snap.minibatches[j];
@@ -1163,7 +1434,15 @@ int main(int argc, char** argv) {
       ofs << "          \"codebook_drift\": " << mb.codebook_drift << ",\n";
       ofs << "          \"pq_updated\": " << (mb.pq_updated ? "true" : "false") << ",\n";
       ofs << "          \"in_warmup\": " << (mb.in_warmup ? "true" : "false") << ",\n";
-      ofs << "          \"warmup_batches_left\": " << mb.warmup_batches_left << "\n";
+      ofs << "          \"warmup_batches_left\": " << mb.warmup_batches_left << ",\n";
+      ofs << "          \"gt_probed_rate\": " << mb.gt_probed_rate << ",\n";
+      ofs << "          \"recall_on_probed_gt\": " << mb.recall_on_probed_gt << ",\n";
+      ofs << "          \"exact_recall_on_probed_candidates\": "
+          << mb.exact_recall_on_probed_candidates << ",\n";
+      ofs << "          \"avg_pq_rank_loss\": " << mb.avg_pq_rank_loss << ",\n";
+      ofs << "          \"miss_not_probed\": " << mb.miss_not_probed << ",\n";
+      ofs << "          \"miss_probed_filtered_by_pq\": " << mb.miss_probed_filtered_by_pq << ",\n";
+      ofs << "          \"pq_rank_loss_count\": " << mb.pq_rank_loss_count << "\n";
       ofs << "        }";
       if (j + 1 < snap.minibatches.size()) {
         ofs << ",";
