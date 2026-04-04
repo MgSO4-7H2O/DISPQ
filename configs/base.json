@@ -26,6 +26,7 @@
   "online_pq_eps": 0.000001,
   "online_pq_warmup_enable": true,
   "online_pq_warmup_batches": 20,
+  "online_pq_force_update_interval": 0,
   "online_pq_partial_top_alpha": false,
   "online_pq_alpha": 1.0,
   "online_pq_partial_top_lambda": false,

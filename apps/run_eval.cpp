@@ -979,6 +979,7 @@ int main(int argc, char** argv) {
   online_pq_options.nqe_eps = config.online_pq_eps;
   online_pq_options.warmup_enable = config.online_pq_warmup_enable;
   online_pq_options.warmup_batches = config.online_pq_warmup_batches;
+  online_pq_options.force_update_interval = config.online_pq_force_update_interval;
   online_pq_options.partial_top_alpha = config.online_pq_partial_top_alpha;
   online_pq_options.partial_alpha = config.online_pq_alpha;
   online_pq_options.partial_top_lambda = config.online_pq_partial_top_lambda;
@@ -1299,6 +1300,8 @@ int main(int argc, char** argv) {
   ofs << "    \"online_pq_warmup_enable\": "
       << (config.online_pq_warmup_enable ? "true" : "false") << ",\n";
   ofs << "    \"online_pq_warmup_batches\": " << config.online_pq_warmup_batches << ",\n";
+  ofs << "    \"online_pq_force_update_interval\": "
+      << config.online_pq_force_update_interval << ",\n";
   ofs << "    \"online_pq_partial_top_alpha\": "
       << (config.online_pq_partial_top_alpha ? "true" : "false") << ",\n";
   ofs << "    \"online_pq_alpha\": " << config.online_pq_alpha << ",\n";

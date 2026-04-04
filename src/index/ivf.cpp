@@ -584,7 +584,12 @@ class KMeansIVFIndex : public IVFIndex {
       stats.nqe_baseline = data.nqe_baseline;
       stats.nqe_ema = data.nqe_ema;
       stats.qe_ratio = data.nqe_ema / std::max(eps, data.nqe_baseline);
-      stats.trigger_update = options.enable && stats.qe_ratio > options.qe_ratio_threshold;
+      const bool force_periodic_update =
+          options.force_update_interval > 0 &&
+          (data.online_pq_batch_count % options.force_update_interval == 0);
+      // Optional periodic trigger: interval=0 disables forced updates.
+      stats.trigger_update =
+          options.enable && (stats.qe_ratio > options.qe_ratio_threshold || force_periodic_update);
       stats.in_warmup = false;
       stats.warmup_batches_left = 0;
     }

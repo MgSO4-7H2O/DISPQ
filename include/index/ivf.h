@@ -38,6 +38,7 @@ struct OnlinePQUpdateOptions {
   double nqe_eps{1e-6};
   bool warmup_enable{false};
   uint32_t warmup_batches{0};
+  uint32_t force_update_interval{0};
   bool partial_top_alpha{false};
   double partial_alpha{1.0};
   bool partial_top_lambda{false};

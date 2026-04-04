@@ -33,6 +33,7 @@ struct Config {
   double online_pq_eps{1e-6};
   bool online_pq_warmup_enable{false};
   uint32_t online_pq_warmup_batches{0};
+  uint32_t online_pq_force_update_interval{0};
   bool online_pq_partial_top_alpha{false};
   double online_pq_alpha{1.0};
   bool online_pq_partial_top_lambda{false};

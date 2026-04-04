@@ -80,6 +80,7 @@ std::string Config::ToString() const {
       << "online_pq_eps=" << online_pq_eps << ", "
       << "online_pq_warmup_enable=" << std::boolalpha << online_pq_warmup_enable << ", "
       << "online_pq_warmup_batches=" << online_pq_warmup_batches << ", "
+      << "online_pq_force_update_interval=" << online_pq_force_update_interval << ", "
       << "online_pq_partial_top_alpha=" << std::boolalpha << online_pq_partial_top_alpha << ", "
       << "online_pq_alpha=" << online_pq_alpha << ", "
       << "online_pq_partial_top_lambda=" << std::boolalpha << online_pq_partial_top_lambda << ", "
@@ -123,6 +124,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractDouble(text, "online_pq_eps", &cfg.online_pq_eps);
   ExtractBool(text, "online_pq_warmup_enable", &cfg.online_pq_warmup_enable);
   ExtractUint(text, "online_pq_warmup_batches", &cfg.online_pq_warmup_batches);
+  ExtractUint(text, "online_pq_force_update_interval", &cfg.online_pq_force_update_interval);
   ExtractBool(text, "online_pq_partial_top_alpha", &cfg.online_pq_partial_top_alpha);
   ExtractDouble(text, "online_pq_alpha", &cfg.online_pq_alpha);
   ExtractBool(text, "online_pq_partial_top_lambda", &cfg.online_pq_partial_top_lambda);
