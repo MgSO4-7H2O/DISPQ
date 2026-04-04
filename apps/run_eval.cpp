@@ -9,6 +9,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <limits>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,8 @@
 using namespace ann;
 
 namespace {
+
+constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 
 MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
   std::mt19937 gen(seed);
@@ -57,6 +60,22 @@ uint32_t ResolveMainRows(const Config& config, uint32_t total_rows) {
     main_rows = total_rows - 1;
   }
   return std::max<uint32_t>(1, main_rows);
+}
+
+uint32_t ResolveDeltaTrainRows(const Config& config,
+                               uint32_t available_stream_rows,
+                               uint32_t insert_step,
+                               bool use_stream_batch_size) {
+  if (!config.enable_streaming || available_stream_rows == 0) {
+    return 0;
+  }
+  // In batch insertion mode, delta_train_window is interpreted as number of batches.
+  const uint64_t row_factor = use_stream_batch_size ? static_cast<uint64_t>(insert_step) : 1ull;
+  const uint64_t requested_rows_u64 = static_cast<uint64_t>(config.delta_train_window) * row_factor;
+  const uint32_t requested_rows = requested_rows_u64 >= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+                                      ? std::numeric_limits<uint32_t>::max()
+                                      : static_cast<uint32_t>(requested_rows_u64);
+  return std::min<uint32_t>(available_stream_rows, requested_rows);
 }
 
 struct DeltaShard {
@@ -89,6 +108,26 @@ struct EvalMetrics {
   uint32_t query_count{0};
 };
 
+struct MinibatchRecord {
+  uint32_t batch_id{0};
+  uint32_t base_rows{0};
+  uint32_t stream_rows_total{0};
+  uint32_t batch_rows{0};
+  uint32_t snapshot_rows_total{0};
+  double recall{0.0};
+  double avg_search_ms{0.0};
+  double avg_scanned{0.0};
+  double qps{0.0};
+  double update_ms{0.0};
+  double query_eval_ms{0.0};
+  double nqe_batch{0.0};
+  double qe_ratio{1.0};
+  double codebook_drift{0.0};
+  bool pq_updated{false};
+  bool in_warmup{false};
+  uint32_t warmup_batches_left{0};
+};
+
 struct SnapshotRecord {
   uint32_t base_rows{0};
   uint32_t main_rows{0};
@@ -109,6 +148,7 @@ struct SnapshotRecord {
   bool pq_updated{false};
   bool in_warmup{false};
   uint32_t warmup_batches_left{0};
+  std::vector<MinibatchRecord> minibatches;
 };
 
 struct SearchRoute {
@@ -197,32 +237,17 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
   return ivf->AddWithOnlinePQ(records, options);
 }
 
-Result<DeltaShard> BuildEmptyShard(Eigen::Ref<const MatrixRM> train_data,
+Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
                                    const IVFParams& ivf_params,
                                    VersionId whiten_version,
-                                   uint32_t shard_id,
-                                   Eigen::Ref<const MatrixRM> shared_centroids,
-                                   const std::optional<PQRuntimeState>& main_pq_state) {
+                                   uint32_t shard_id) {
   if (train_data.rows() == 0 || train_data.cols() == 0) {
-    return Status::InvalidArgument("BuildEmptyShard: empty training data");
-  }
-  if (shared_centroids.rows() == 0 || shared_centroids.cols() != train_data.cols()) {
-    return Status::InvalidArgument("BuildEmptyShard: invalid shared_centroids");
+    return Status::InvalidArgument("BuildDeltaShard: empty training data");
   }
   auto ivf = CreateIVFIndex();
   std::vector<DocId> ids(static_cast<size_t>(train_data.rows()));
   std::iota(ids.begin(), ids.end(), 0);
-  IVFParams delta_params = ivf_params;
-  delta_params.use_fixed_routing_centroids = true;
-  delta_params.fixed_routing_centroids = shared_centroids;
-  if (main_pq_state.has_value() && main_pq_state->use_pq && !main_pq_state->codebooks.empty()) {
-    delta_params.use_fixed_pq_codebooks = true;
-    delta_params.fixed_pq_codebooks = main_pq_state->codebooks;
-    delta_params.fixed_pq_counts = main_pq_state->counts;
-    delta_params.fixed_pq_baseline_nqe = main_pq_state->nqe_baseline;
-    delta_params.fixed_pq_ema_nqe = main_pq_state->nqe_ema;
-  }
-  auto version_res = ivf->Build(train_data, ids, delta_params, 0);
+  auto version_res = ivf->Build(train_data, ids, ivf_params, 0);
   if (!version_res.ok()) {
     return version_res.status();
   }
@@ -641,9 +666,19 @@ int main(int argc, char** argv) {
   }
 
   const uint32_t main_rows_initial = ResolveMainRows(config, nx);
-  const uint32_t total_stream_rows = nx > main_rows_initial ? nx - main_rows_initial : 0;
+  const bool use_stream_batch_size =
+      config.streaming_mode == "batch" ||
+      (config.streaming_mode == "streaming" && config.streaming_use_stream_batch_size);
+  const uint32_t insert_step = use_stream_batch_size ? std::max(1u, config.stream_batch_size) : 1u;
+  const uint32_t rows_after_main = nx > main_rows_initial ? nx - main_rows_initial : 0;
+  const uint32_t delta_train_rows =
+      ResolveDeltaTrainRows(config, rows_after_main, insert_step, use_stream_batch_size);
+  const uint32_t stream_start_idx = main_rows_initial + delta_train_rows;
+  const uint32_t total_stream_rows = nx > stream_start_idx ? nx - stream_start_idx : 0;
   std::cout << "[INFO] main_rows=" << main_rows_initial
+            << ", delta_train_rows=" << delta_train_rows
             << ", stream_rows=" << total_stream_rows
+            << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
 
   SearchParams params;
@@ -664,12 +699,10 @@ int main(int argc, char** argv) {
   auto main_ivf = CreateIVFIndex();
   VersionId whiten_version = 0;
   VersionSet main_versions{};
-  MatrixRM main_routing_centroids;
-
   MatrixRM X_whitened;
   MatrixRM Q_whitened;
   uint32_t main_rows_current = main_rows_initial;
-  uint32_t next_insert_idx = main_rows_initial;
+  uint32_t next_insert_idx = stream_start_idx;
 
   Timer init_timer;
   auto whiten_version_res = whitening->Fit(X.topRows(main_rows_initial));
@@ -707,40 +740,31 @@ int main(int argc, char** argv) {
     std::cerr << add_main.ToString() << std::endl;
     return 1;
   }
-  auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
-  if (!centroids_res.ok()) {
-    std::cerr << centroids_res.status().ToString() << std::endl;
-    return 1;
-  }
-  main_routing_centroids = centroids_res.value();
-
-  std::optional<PQRuntimeState> main_pq_state;
-  if (config.pq_enable && config.pq_residual) {
-    auto pq_state_res = main_ivf->GetPQRuntimeState(main_versions);
-    if (!pq_state_res.ok()) {
-      std::cerr << pq_state_res.status().ToString() << std::endl;
-      return 1;
-    }
-    if (pq_state_res.value().use_pq) {
-      main_pq_state = pq_state_res.value();
-    }
-  }
-  double rebuild_ms_total = init_timer.ElapsedMillis();
-
   std::optional<DeltaShard> active_delta;
-  if (config.enable_streaming && total_stream_rows > 0) {
-    auto active_res = BuildEmptyShard(main_train,
-                                      ivf_params,
-                                      whiten_version,
-                                      1,
-                                      main_routing_centroids,
-                                      main_pq_state);
+  if (config.enable_streaming && rows_after_main > 0) {
+    // Train delta with the reserved window, then preload the same window as existing delta docs.
+    MatrixRM delta_train = X_whitened.middleRows(main_rows_initial, delta_train_rows);
+    IVFParams delta_params = ivf_params;
+    delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
+    auto active_res = BuildDeltaShard(delta_train, delta_params, whiten_version, 1);
     if (!active_res.ok()) {
       std::cerr << active_res.status().ToString() << std::endl;
       return 1;
     }
     active_delta = active_res.value();
+    const Status add_delta_seed = AddRangeToIndex(active_delta->ivf,
+                                                  X_whitened,
+                                                  main_rows_initial,
+                                                  stream_start_idx,
+                                                  config.dim,
+                                                  active_delta->versions);
+    if (!add_delta_seed.ok()) {
+      std::cerr << add_delta_seed.ToString() << std::endl;
+      return 1;
+    }
+    active_delta->rows = delta_train_rows;
   }
+  double rebuild_ms_total = init_timer.ElapsedMillis();
 
   OnlinePQUpdateOptions online_pq_options;
   online_pq_options.enable = config.online_pq_enable && config.pq_enable && config.pq_residual;
@@ -765,10 +789,14 @@ int main(int argc, char** argv) {
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
 
-  const bool collect_snapshots = config.enable_streaming && total_stream_rows > 0 &&
-                                 config.snapshot_interval > 0;
+  const bool collect_snapshots = config.enable_streaming && total_stream_rows > 0;
+  const uint32_t snapshot_span =
+      collect_snapshots ? std::max(1u, config.snapshot_interval > 0 ? config.snapshot_interval
+                                                                     : total_stream_rows)
+                        : 0;
   std::vector<SnapshotRecord> snapshots;
-  uint32_t last_snapshot_active_rows = main_rows_initial;
+  uint32_t last_snapshot_active_rows = stream_start_idx;
+  std::optional<EvalMetrics> pre_stream_metrics;
 
   auto evaluate_rows = [&](uint32_t active_rows) -> Result<EvalMetrics> {
     auto res = EvaluateState(config,
@@ -794,7 +822,8 @@ int main(int argc, char** argv) {
   auto write_snapshot = [&](uint32_t active_rows,
                             const EvalMetrics& metrics,
                             double update_ms,
-                            const OnlinePQUpdateStats& pq_stats) {
+                            const OnlinePQUpdateStats& pq_stats,
+                            std::vector<MinibatchRecord> minibatches) {
     if (!collect_snapshots) {
       return;
     }
@@ -821,6 +850,7 @@ int main(int argc, char** argv) {
     snap.pq_updated = pq_stats.updated_codebook;
     snap.in_warmup = pq_stats.in_warmup;
     snap.warmup_batches_left = pq_stats.warmup_batches_left;
+    snap.minibatches = std::move(minibatches);
     snapshots.push_back(std::move(snap));
     last_snapshot_active_rows = active_rows;
   };
@@ -829,21 +859,26 @@ int main(int argc, char** argv) {
   double total_update_ms = 0.0;
   double pending_update_ms = 0.0;
 
-  if (collect_snapshots) {
-    auto mres = evaluate_rows(next_insert_idx);
-    if (!mres.ok()) {
-      std::cerr << mres.status().ToString() << std::endl;
+  if (config.enable_streaming && rows_after_main > 0) {
+    auto pre_res = evaluate_rows(stream_start_idx);
+    if (!pre_res.ok()) {
+      std::cerr << pre_res.status().ToString() << std::endl;
       return 1;
     }
-    write_snapshot(next_insert_idx, mres.value(), 0.0, last_online_pq_stats);
+    pre_stream_metrics = pre_res.value();
+    if (collect_snapshots) {
+      write_snapshot(stream_start_idx,
+                     pre_stream_metrics.value(),
+                     0.0,
+                     last_online_pq_stats,
+                     std::vector<MinibatchRecord>{});
+    }
   }
 
   if (config.enable_streaming && total_stream_rows > 0) {
-    const bool use_stream_batch_size =
-        config.streaming_mode == "batch" ||
-        (config.streaming_mode == "streaming" && config.streaming_use_stream_batch_size);
-    const uint32_t insert_step = use_stream_batch_size ? std::max(1u, config.stream_batch_size) : 1u;
-    uint32_t next_snapshot_target = std::max(1u, config.snapshot_interval);
+    uint32_t next_snapshot_target = snapshot_span;
+    uint32_t minibatch_id = 0;
+    std::vector<MinibatchRecord> snapshot_minibatches;
 
     while (next_insert_idx < nx) {
       uint32_t chunk = std::min<uint32_t>(insert_step, nx - next_insert_idx);
@@ -897,25 +932,54 @@ int main(int argc, char** argv) {
       const double step_update_ms = update_timer.ElapsedMillis();
 
       next_insert_idx = end;
-      inserted_rows = next_insert_idx - main_rows_initial;
+      inserted_rows = next_insert_idx - stream_start_idx;
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
+
+      // Evaluate after every minibatch insert and store in snapshot/minibatch records.
+      auto mres = evaluate_rows(next_insert_idx);
+      if (!mres.ok()) {
+        std::cerr << mres.status().ToString() << std::endl;
+        return 1;
+      }
+      const EvalMetrics batch_metrics = mres.value();
+
+      MinibatchRecord minibatch;
+      minibatch.batch_id = ++minibatch_id;
+      minibatch.base_rows = next_insert_idx;
+      minibatch.stream_rows_total = inserted_rows;
+      minibatch.batch_rows = chunk;
+      minibatch.snapshot_rows_total =
+          next_insert_idx >= last_snapshot_active_rows ? next_insert_idx - last_snapshot_active_rows : 0;
+      minibatch.recall = batch_metrics.recall;
+      minibatch.avg_search_ms = batch_metrics.avg_search_ms;
+      minibatch.avg_scanned = batch_metrics.scanned_avg;
+      minibatch.qps = batch_metrics.qps;
+      minibatch.update_ms = step_update_ms;
+      minibatch.query_eval_ms = batch_metrics.query_eval_ms;
+      minibatch.nqe_batch = last_online_pq_stats.nqe_batch;
+      minibatch.qe_ratio = last_online_pq_stats.qe_ratio;
+      minibatch.codebook_drift = last_online_pq_stats.codebook_drift_l2;
+      minibatch.pq_updated = last_online_pq_stats.updated_codebook;
+      minibatch.in_warmup = last_online_pq_stats.in_warmup;
+      minibatch.warmup_batches_left = last_online_pq_stats.warmup_batches_left;
+      snapshot_minibatches.push_back(std::move(minibatch));
 
       const bool hit_periodic_snapshot =
           collect_snapshots && inserted_rows == next_snapshot_target;
       const bool hit_final_snapshot = collect_snapshots && inserted_rows == total_stream_rows;
       if (hit_periodic_snapshot) {
         while (next_snapshot_target <= inserted_rows) {
-          next_snapshot_target += config.snapshot_interval;
+          next_snapshot_target += snapshot_span;
         }
       }
       if (hit_periodic_snapshot || hit_final_snapshot) {
-        auto mres = evaluate_rows(next_insert_idx);
-        if (!mres.ok()) {
-          std::cerr << mres.status().ToString() << std::endl;
-          return 1;
-        }
-        write_snapshot(next_insert_idx, mres.value(), pending_update_ms, last_online_pq_stats);
+        write_snapshot(next_insert_idx,
+                       batch_metrics,
+                       pending_update_ms,
+                       last_online_pq_stats,
+                       std::move(snapshot_minibatches));
+        snapshot_minibatches.clear();
         pending_update_ms = 0.0;
       }
     }
@@ -987,12 +1051,19 @@ int main(int argc, char** argv) {
   ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
   ofs << "    \"main_index_rows_initial\": " << main_rows_initial << ",\n";
   ofs << "    \"main_rows_final\": " << main_rows_current << ",\n";
+  ofs << "    \"rows_after_main\": " << rows_after_main << ",\n";
+  ofs << "    \"delta_train_window\": " << config.delta_train_window << ",\n";
+  ofs << "    \"delta_train_rows\": " << delta_train_rows << ",\n";
+  ofs << "    \"delta_kmeans_iterations\": " << kDeltaKMeansIterationsDefault << ",\n";
+  ofs << "    \"stream_start_row\": " << stream_start_idx << ",\n";
   ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
   ofs << "    \"streaming_mode\": \""
       << (config.enable_streaming ? config.streaming_mode : "offline") << "\",\n";
   ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
   ofs << "    \"streaming_use_stream_batch_size\": "
       << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
+  ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
+  ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
   ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";
   ofs << "    \"online_pq_qe_ratio_threshold\": " << config.online_pq_qe_ratio_threshold << ",\n";
   ofs << "    \"online_pq_ema_alpha\": " << config.online_pq_ema_alpha << ",\n";
@@ -1018,6 +1089,20 @@ int main(int argc, char** argv) {
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
   ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << "\n";
   ofs << "  },\n";
+  ofs << "  \"pre_stream_metrics\": ";
+  if (pre_stream_metrics.has_value()) {
+    ofs << "{\n";
+    ofs << "    \"base_rows\": " << stream_start_idx << ",\n";
+    ofs << "    \"recall\": " << pre_stream_metrics->recall << ",\n";
+    ofs << "    \"avg_query_ms\": " << pre_stream_metrics->avg_query_ms << ",\n";
+    ofs << "    \"avg_search_ms\": " << pre_stream_metrics->avg_search_ms << ",\n";
+    ofs << "    \"qps\": " << pre_stream_metrics->qps << ",\n";
+    ofs << "    \"avg_scanned\": " << pre_stream_metrics->scanned_avg << ",\n";
+    ofs << "    \"query_eval_ms\": " << pre_stream_metrics->query_eval_ms << "\n";
+    ofs << "  },\n";
+  } else {
+    ofs << "null,\n";
+  }
   ofs << "  \"online_pq\": {\n";
   ofs << "    \"enabled\": " << (online_pq_options.enable ? "true" : "false") << ",\n";
   ofs << "    \"batches\": " << online_pq_rollup.batches << ",\n";
@@ -1057,7 +1142,35 @@ int main(int argc, char** argv) {
     ofs << "      \"codebook_drift\": " << snap.codebook_drift << ",\n";
     ofs << "      \"pq_updated\": " << (snap.pq_updated ? "true" : "false") << ",\n";
     ofs << "      \"in_warmup\": " << (snap.in_warmup ? "true" : "false") << ",\n";
-    ofs << "      \"warmup_batches_left\": " << snap.warmup_batches_left << "\n";
+    ofs << "      \"warmup_batches_left\": " << snap.warmup_batches_left << ",\n";
+    ofs << "      \"minibatches\": [\n";
+    for (size_t j = 0; j < snap.minibatches.size(); ++j) {
+      const auto& mb = snap.minibatches[j];
+      ofs << "        {\n";
+      ofs << "          \"batch_id\": " << mb.batch_id << ",\n";
+      ofs << "          \"base_rows\": " << mb.base_rows << ",\n";
+      ofs << "          \"stream_rows_total\": " << mb.stream_rows_total << ",\n";
+      ofs << "          \"batch_rows\": " << mb.batch_rows << ",\n";
+      ofs << "          \"snapshot_rows_total\": " << mb.snapshot_rows_total << ",\n";
+      ofs << "          \"recall\": " << mb.recall << ",\n";
+      ofs << "          \"avg_search_ms\": " << mb.avg_search_ms << ",\n";
+      ofs << "          \"avg_scanned\": " << mb.avg_scanned << ",\n";
+      ofs << "          \"qps\": " << mb.qps << ",\n";
+      ofs << "          \"update_ms\": " << mb.update_ms << ",\n";
+      ofs << "          \"query_eval_ms\": " << mb.query_eval_ms << ",\n";
+      ofs << "          \"nqe_batch\": " << mb.nqe_batch << ",\n";
+      ofs << "          \"qe_ratio\": " << mb.qe_ratio << ",\n";
+      ofs << "          \"codebook_drift\": " << mb.codebook_drift << ",\n";
+      ofs << "          \"pq_updated\": " << (mb.pq_updated ? "true" : "false") << ",\n";
+      ofs << "          \"in_warmup\": " << (mb.in_warmup ? "true" : "false") << ",\n";
+      ofs << "          \"warmup_batches_left\": " << mb.warmup_batches_left << "\n";
+      ofs << "        }";
+      if (j + 1 < snap.minibatches.size()) {
+        ofs << ",";
+      }
+      ofs << "\n";
+    }
+    ofs << "      ]\n";
     ofs << "    }";
     if (i + 1 < snapshots.size()) {
       ofs << ",";

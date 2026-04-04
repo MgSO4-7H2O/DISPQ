@@ -69,6 +69,7 @@ std::string Config::ToString() const {
       << "snapshot_interval=" << snapshot_interval << ", "
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
+      << "delta_train_window=" << delta_train_window << ", "
       << "streaming_mode=" << streaming_mode << ", "
       << "stream_batch_size=" << stream_batch_size << ", "
       << "streaming_use_stream_batch_size=" << std::boolalpha << streaming_use_stream_batch_size
@@ -112,6 +113,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
+  ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
   ExtractString(text, "streaming_mode", &cfg.streaming_mode);
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
   ExtractBool(text, "streaming_use_stream_batch_size", &cfg.streaming_use_stream_batch_size);
@@ -133,6 +135,9 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.stream_batch_size == 0) {
     return Status::InvalidArgument("stream_batch_size must be > 0");
+  }
+  if (cfg.enable_streaming && cfg.delta_train_window == 0) {
+    return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");
   }
   if (cfg.online_pq_qe_ratio_threshold <= 0.0) {
     return Status::InvalidArgument("online_pq_qe_ratio_threshold must be > 0");

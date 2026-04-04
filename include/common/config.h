@@ -23,6 +23,7 @@ struct Config {
   uint32_t snapshot_interval{0};
   bool enable_streaming{false};
   uint32_t main_index_rows{0};
+  uint32_t delta_train_window{1};
   std::string streaming_mode{"streaming"};
   uint32_t stream_batch_size{100};
   bool streaming_use_stream_batch_size{false};

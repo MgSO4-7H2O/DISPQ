@@ -20,6 +20,7 @@ struct PQParams {
 struct IVFParams {
   uint32_t nlist{1024};
   uint32_t dim{0};
+  uint32_t kmeans_iterations{20};
   PQParams pq;
   bool use_fixed_routing_centroids{false};
   MatrixRM fixed_routing_centroids;

@@ -20,7 +20,7 @@
 namespace ann {
 namespace {
 
-constexpr int kKMeansIterations = 20;
+constexpr uint32_t kDefaultKMeansIterations = 20;
 constexpr uint32_t kDefaultSeed = 42;
 constexpr double kDefaultNQEEps = 1e-6;
 
@@ -102,13 +102,14 @@ MatrixRM InitializeCentroids(Eigen::Ref<const MatrixRM> X, uint32_t nlist) {
   return centroids;
 }
 
-void RunKMeans(Eigen::Ref<const MatrixRM> X, MatrixRM* centroids) {
+void RunKMeans(Eigen::Ref<const MatrixRM> X, MatrixRM* centroids, uint32_t iterations) {
   const int64_t num_vecs = X.rows();
   const int64_t dim = X.cols();
   const int64_t k = centroids->rows();
   std::vector<int> assignments(num_vecs, 0);
 
-  for (int iter = 0; iter < kKMeansIterations; ++iter) {
+  const uint32_t kmeans_iters = (iterations == 0) ? kDefaultKMeansIterations : iterations;
+  for (uint32_t iter = 0; iter < kmeans_iters; ++iter) {
     // Assignment step.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -167,7 +168,7 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X, MatrixRM* centroids) {
       counts[static_cast<size_t>(assignments[static_cast<size_t>(i)])]++;
     }
 #endif
-    std::mt19937 gen(kDefaultSeed + static_cast<uint32_t>(iter));
+    std::mt19937 gen(kDefaultSeed + iter);
     std::uniform_int_distribution<int64_t> dist_index(0, num_vecs - 1);
     for (int64_t c = 0; c < k; ++c) {
       if (counts[static_cast<size_t>(c)] > 0) {
@@ -220,6 +221,9 @@ class KMeansIVFIndex : public IVFIndex {
         return Status::InvalidArgument("PQ nbits must be in [1,8]");
       }
     }
+    if (p.kmeans_iterations == 0) {
+      return Status::InvalidArgument("kmeans_iterations must be >0");
+    }
 
     uint32_t nlist = 0;
     MatrixRM centroids;
@@ -235,7 +239,7 @@ class KMeansIVFIndex : public IVFIndex {
     } else {
       nlist = std::min<uint32_t>(p.nlist, static_cast<uint32_t>(Xw.rows()));
       centroids = InitializeCentroids(Xw, nlist);
-      RunKMeans(Xw, &centroids);
+      RunKMeans(Xw, &centroids, p.kmeans_iterations);
     }
 
     auto data = std::make_unique<IndexData>();
@@ -298,7 +302,7 @@ class KMeansIVFIndex : public IVFIndex {
           const Eigen::Index subdim = static_cast<Eigen::Index>(data->dsub);
           MatrixRM sub = residuals.block(0, offset, residuals.rows(), subdim);
           MatrixRM codebook = InitializeCentroids(sub, data->Ks);
-          RunKMeans(sub, &codebook);
+          RunKMeans(sub, &codebook, p.kmeans_iterations);
           data->pq_codebooks[static_cast<size_t>(m)] = std::move(codebook);
         }
       }

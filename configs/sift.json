@@ -16,6 +16,7 @@
   "snapshot_interval": 5000,
   "enable_streaming": true,
   "main_index_rows": 400000,
+  "delta_train_window": 1,
   "streaming_mode": "streaming",
   "stream_batch_size": 1000,
   "streaming_use_stream_batch_size": true,
