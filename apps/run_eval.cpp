@@ -515,13 +515,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
   }
 
-  struct QueryMissDiag {
-    double recall{0.0};
-    uint32_t misses{0};
-    std::string summary;
-  };
   uint64_t gt_total = 0;
-  uint64_t gt_hits = 0;
   uint64_t gt_probed = 0;
   uint64_t gt_hit_and_probed = 0;
   uint64_t miss_not_probed = 0;
@@ -530,143 +524,168 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   uint32_t exact_recall_count = 0;
   double pq_rank_loss_sum = 0.0;
   uint64_t pq_rank_loss_count = 0;
-  std::vector<QueryMissDiag> query_diags;
-  query_diags.reserve(nq);
+  std::vector<std::string> worst_queries;
+  if (config.enable_miss_diag) {
+    struct QueryMissDiag {
+      double recall{0.0};
+      uint32_t misses{0};
+      std::string summary;
+    };
+    std::vector<QueryMissDiag> query_diags;
+    query_diags.reserve(nq);
 
-  for (uint32_t qi = 0; qi < nq; ++qi) {
-    const auto& gt_row = ground_truth[static_cast<size_t>(qi)];
-    if (gt_row.empty()) {
-      continue;
-    }
-    const auto& pred_row = predictions[static_cast<size_t>(qi)];
-    std::unordered_set<DocId> pred_set(pred_row.begin(), pred_row.end());
-    size_t scanned_reserve = 0;
-    for (uint32_t ri = 0; ri < route_count; ++ri) {
-      scanned_reserve += route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)].scanned_doc_ids.size();
-    }
-    std::unordered_map<DocId, float> approx_by_doc;
-    approx_by_doc.reserve(scanned_reserve * 2 + 1);
-    for (uint32_t ri = 0; ri < route_count; ++ri) {
-      const SearchResult& rr = route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)];
-      const size_t n = std::min(rr.scanned_doc_ids.size(), rr.scanned_approx_dists.size());
-      for (size_t si = 0; si < n; ++si) {
-        const DocId doc = rr.scanned_doc_ids[si];
-        const float approx = rr.scanned_approx_dists[si];
-        auto it = approx_by_doc.find(doc);
-        if (it == approx_by_doc.end() || approx < it->second) {
-          approx_by_doc[doc] = approx;
-        }
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+      const auto& gt_row = ground_truth[static_cast<size_t>(qi)];
+      if (gt_row.empty()) {
+        continue;
       }
-    }
-
-    std::vector<std::pair<float, DocId>> approx_ranked;
-    std::vector<std::pair<float, DocId>> exact_ranked;
-    approx_ranked.reserve(approx_by_doc.size());
-    exact_ranked.reserve(approx_by_doc.size());
-    const Eigen::VectorXf qv = queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
-    for (const auto& kv : approx_by_doc) {
-      approx_ranked.push_back({kv.second, kv.first});
-      const Eigen::VectorXf diff =
-          qv - base_whitened.row(static_cast<Eigen::Index>(kv.first)).transpose();
-      exact_ranked.push_back({diff.squaredNorm(), kv.first});
-    }
-    std::sort(approx_ranked.begin(), approx_ranked.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-    std::sort(exact_ranked.begin(), exact_ranked.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-
-    std::unordered_map<DocId, uint32_t> approx_rank;
-    std::unordered_map<DocId, uint32_t> exact_rank;
-    approx_rank.reserve(approx_ranked.size() * 2 + 1);
-    exact_rank.reserve(exact_ranked.size() * 2 + 1);
-    for (size_t i = 0; i < approx_ranked.size(); ++i) {
-      approx_rank[approx_ranked[i].second] = static_cast<uint32_t>(i + 1);
-    }
-    for (size_t i = 0; i < exact_ranked.size(); ++i) {
-      exact_rank[exact_ranked[i].second] = static_cast<uint32_t>(i + 1);
-    }
-
-    std::unordered_set<DocId> exact_topk_set;
-    const size_t exact_topk = std::min<size_t>(params.topk, exact_ranked.size());
-    exact_topk_set.reserve(exact_topk * 2 + 1);
-    for (size_t i = 0; i < exact_topk; ++i) {
-      exact_topk_set.insert(exact_ranked[i].second);
-    }
-    uint32_t exact_hits_row = 0;
-    for (DocId doc : gt_row) {
-      if (exact_topk_set.find(doc) != exact_topk_set.end()) {
-        exact_hits_row++;
+      const auto& pred_row = predictions[static_cast<size_t>(qi)];
+      std::unordered_set<DocId> pred_set(pred_row.begin(), pred_row.end());
+      size_t scanned_reserve = 0;
+      for (uint32_t ri = 0; ri < route_count; ++ri) {
+        scanned_reserve +=
+            route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)].scanned_doc_ids.size();
       }
-    }
-    const double exact_recall_row = static_cast<double>(exact_hits_row) / static_cast<double>(gt_row.size());
-    exact_recall_sum += exact_recall_row;
-    exact_recall_count++;
-
-    uint32_t gt_hits_row = 0;
-    uint32_t gt_probed_row = 0;
-    uint32_t miss_not_probed_row = 0;
-    uint32_t miss_pq_filtered_row = 0;
-    uint32_t pq_rank_loss_count_row = 0;
-    uint32_t pq_rank_loss_max_row = 0;
-    double pq_rank_loss_sum_row = 0.0;
-
-    for (DocId doc : gt_row) {
-      gt_total++;
-      const bool hit = pred_set.find(doc) != pred_set.end();
-      if (hit) {
-        gt_hits++;
-        gt_hits_row++;
-      }
-      const auto ait = approx_rank.find(doc);
-      const bool probed = ait != approx_rank.end();
-      if (probed) {
-        gt_probed++;
-        gt_probed_row++;
-        if (hit) {
-          gt_hit_and_probed++;
-        }
-      }
-      if (!hit) {
-        if (!probed) {
-          miss_not_probed++;
-          miss_not_probed_row++;
-        } else {
-          miss_pq_filtered++;
-          miss_pq_filtered_row++;
-          const auto eit = exact_rank.find(doc);
-          if (eit != exact_rank.end()) {
-            const uint32_t loss =
-                (ait->second > eit->second) ? (ait->second - eit->second) : 0u;
-            pq_rank_loss_sum += static_cast<double>(loss);
-            pq_rank_loss_count++;
-            pq_rank_loss_sum_row += static_cast<double>(loss);
-            pq_rank_loss_count_row++;
-            pq_rank_loss_max_row = std::max(pq_rank_loss_max_row, loss);
+      std::unordered_map<DocId, float> approx_by_doc;
+      approx_by_doc.reserve(scanned_reserve * 2 + 1);
+      for (uint32_t ri = 0; ri < route_count; ++ri) {
+        const SearchResult& rr = route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)];
+        const size_t n = std::min(rr.scanned_doc_ids.size(), rr.scanned_approx_dists.size());
+        for (size_t si = 0; si < n; ++si) {
+          const DocId doc = rr.scanned_doc_ids[si];
+          const float approx = rr.scanned_approx_dists[si];
+          auto it = approx_by_doc.find(doc);
+          if (it == approx_by_doc.end() || approx < it->second) {
+            approx_by_doc[doc] = approx;
           }
         }
       }
+
+      std::vector<std::pair<float, DocId>> approx_ranked;
+      std::vector<std::pair<float, DocId>> exact_ranked;
+      approx_ranked.reserve(approx_by_doc.size());
+      exact_ranked.reserve(approx_by_doc.size());
+      const Eigen::VectorXf qv =
+          queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
+      for (const auto& kv : approx_by_doc) {
+        approx_ranked.push_back({kv.second, kv.first});
+        const Eigen::VectorXf diff =
+            qv - base_whitened.row(static_cast<Eigen::Index>(kv.first)).transpose();
+        exact_ranked.push_back({diff.squaredNorm(), kv.first});
+      }
+      std::sort(approx_ranked.begin(), approx_ranked.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+      std::sort(exact_ranked.begin(), exact_ranked.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+
+      std::unordered_map<DocId, uint32_t> approx_rank;
+      std::unordered_map<DocId, uint32_t> exact_rank;
+      approx_rank.reserve(approx_ranked.size() * 2 + 1);
+      exact_rank.reserve(exact_ranked.size() * 2 + 1);
+      for (size_t i = 0; i < approx_ranked.size(); ++i) {
+        approx_rank[approx_ranked[i].second] = static_cast<uint32_t>(i + 1);
+      }
+      for (size_t i = 0; i < exact_ranked.size(); ++i) {
+        exact_rank[exact_ranked[i].second] = static_cast<uint32_t>(i + 1);
+      }
+
+      std::unordered_set<DocId> exact_topk_set;
+      const size_t exact_topk = std::min<size_t>(params.topk, exact_ranked.size());
+      exact_topk_set.reserve(exact_topk * 2 + 1);
+      for (size_t i = 0; i < exact_topk; ++i) {
+        exact_topk_set.insert(exact_ranked[i].second);
+      }
+      uint32_t exact_hits_row = 0;
+      for (DocId doc : gt_row) {
+        if (exact_topk_set.find(doc) != exact_topk_set.end()) {
+          exact_hits_row++;
+        }
+      }
+      const double exact_recall_row =
+          static_cast<double>(exact_hits_row) / static_cast<double>(gt_row.size());
+      exact_recall_sum += exact_recall_row;
+      exact_recall_count++;
+
+      uint32_t gt_hits_row = 0;
+      uint32_t gt_probed_row = 0;
+      uint32_t miss_not_probed_row = 0;
+      uint32_t miss_pq_filtered_row = 0;
+      uint32_t pq_rank_loss_count_row = 0;
+      uint32_t pq_rank_loss_max_row = 0;
+      double pq_rank_loss_sum_row = 0.0;
+
+      for (DocId doc : gt_row) {
+        gt_total++;
+        const bool hit = pred_set.find(doc) != pred_set.end();
+        if (hit) {
+          gt_hits_row++;
+        }
+        const auto ait = approx_rank.find(doc);
+        const bool probed = ait != approx_rank.end();
+        if (probed) {
+          gt_probed++;
+          gt_probed_row++;
+          if (hit) {
+            gt_hit_and_probed++;
+          }
+        }
+        if (!hit) {
+          if (!probed) {
+            miss_not_probed++;
+            miss_not_probed_row++;
+          } else {
+            miss_pq_filtered++;
+            miss_pq_filtered_row++;
+            const auto eit = exact_rank.find(doc);
+            if (eit != exact_rank.end()) {
+              const uint32_t loss =
+                  (ait->second > eit->second) ? (ait->second - eit->second) : 0u;
+              pq_rank_loss_sum += static_cast<double>(loss);
+              pq_rank_loss_count++;
+              pq_rank_loss_sum_row += static_cast<double>(loss);
+              pq_rank_loss_count_row++;
+              pq_rank_loss_max_row = std::max(pq_rank_loss_max_row, loss);
+            }
+          }
+        }
+      }
+
+      const double recall_row =
+          static_cast<double>(gt_hits_row) / static_cast<double>(gt_row.size());
+      if (miss_not_probed_row + miss_pq_filtered_row > 0) {
+        const double gt_probed_rate_row =
+            static_cast<double>(gt_probed_row) / static_cast<double>(gt_row.size());
+        const double pq_rank_loss_avg_row =
+            pq_rank_loss_count_row > 0
+                ? (pq_rank_loss_sum_row / static_cast<double>(pq_rank_loss_count_row))
+                : 0.0;
+        std::string summary =
+            "qid=" + std::to_string(qi) + ", recall=" + std::to_string(recall_row) +
+            ", gt_probed_rate=" + std::to_string(gt_probed_rate_row) +
+            ", miss_not_probed=" + std::to_string(miss_not_probed_row) +
+            ", miss_pq_filtered=" + std::to_string(miss_pq_filtered_row) +
+            ", exact_recall_on_probed=" + std::to_string(exact_recall_row) +
+            ", avg_pq_rank_loss=" + std::to_string(pq_rank_loss_avg_row) +
+            ", max_pq_rank_loss=" + std::to_string(pq_rank_loss_max_row);
+        query_diags.push_back(QueryMissDiag{
+            recall_row,
+            miss_not_probed_row + miss_pq_filtered_row,
+            std::move(summary),
+        });
+      }
     }
 
-    const double recall_row = static_cast<double>(gt_hits_row) / static_cast<double>(gt_row.size());
-    if (miss_not_probed_row + miss_pq_filtered_row > 0) {
-      const double gt_probed_rate_row =
-          static_cast<double>(gt_probed_row) / static_cast<double>(gt_row.size());
-      const double pq_rank_loss_avg_row =
-          pq_rank_loss_count_row > 0
-              ? (pq_rank_loss_sum_row / static_cast<double>(pq_rank_loss_count_row))
-              : 0.0;
-      std::string summary = "qid=" + std::to_string(qi) + ", recall=" + std::to_string(recall_row) +
-                            ", gt_probed_rate=" + std::to_string(gt_probed_rate_row) +
-                            ", miss_not_probed=" + std::to_string(miss_not_probed_row) +
-                            ", miss_pq_filtered=" + std::to_string(miss_pq_filtered_row) +
-                            ", exact_recall_on_probed=" + std::to_string(exact_recall_row) +
-                            ", avg_pq_rank_loss=" + std::to_string(pq_rank_loss_avg_row) +
-                            ", max_pq_rank_loss=" + std::to_string(pq_rank_loss_max_row);
-      query_diags.push_back(QueryMissDiag{
-          recall_row,
-          miss_not_probed_row + miss_pq_filtered_row,
-          std::move(summary),
-      });
+    std::sort(query_diags.begin(), query_diags.end(),
+              [](const QueryMissDiag& a, const QueryMissDiag& b) {
+                if (a.recall != b.recall) {
+                  return a.recall < b.recall;
+                }
+                return a.misses > b.misses;
+              });
+    const size_t keep = std::min<size_t>(kWorstQueryDiagCount, query_diags.size());
+    worst_queries.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) {
+      worst_queries.push_back(query_diags[i].summary);
     }
   }
 
@@ -748,31 +767,23 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.scanned_max = scanned_max;
   metrics.query_eval_ms = wall_elapsed_ms;
   metrics.query_count = nq;
-  metrics.gt_probed_rate =
-      gt_total > 0 ? static_cast<double>(gt_probed) / static_cast<double>(gt_total) : 0.0;
-  metrics.recall_on_probed_gt =
-      gt_probed > 0 ? static_cast<double>(gt_hit_and_probed) / static_cast<double>(gt_probed) : 0.0;
-  metrics.exact_recall_on_probed_candidates =
-      exact_recall_count > 0 ? exact_recall_sum / static_cast<double>(exact_recall_count) : 0.0;
-  metrics.avg_pq_rank_loss =
-      pq_rank_loss_count > 0 ? pq_rank_loss_sum / static_cast<double>(pq_rank_loss_count) : 0.0;
-  metrics.miss_not_probed =
-      static_cast<uint32_t>(std::min<uint64_t>(miss_not_probed, std::numeric_limits<uint32_t>::max()));
-  metrics.miss_probed_filtered_by_pq =
-      static_cast<uint32_t>(std::min<uint64_t>(miss_pq_filtered, std::numeric_limits<uint32_t>::max()));
-  metrics.pq_rank_loss_count = static_cast<uint32_t>(
-      std::min<uint64_t>(pq_rank_loss_count, std::numeric_limits<uint32_t>::max()));
-  std::sort(query_diags.begin(), query_diags.end(),
-            [](const QueryMissDiag& a, const QueryMissDiag& b) {
-              if (a.recall != b.recall) {
-                return a.recall < b.recall;
-              }
-              return a.misses > b.misses;
-            });
-  const size_t keep = std::min<size_t>(kWorstQueryDiagCount, query_diags.size());
-  metrics.worst_queries.reserve(keep);
-  for (size_t i = 0; i < keep; ++i) {
-    metrics.worst_queries.push_back(query_diags[i].summary);
+  if (config.enable_miss_diag) {
+    metrics.gt_probed_rate =
+        gt_total > 0 ? static_cast<double>(gt_probed) / static_cast<double>(gt_total) : 0.0;
+    metrics.recall_on_probed_gt =
+        gt_probed > 0 ? static_cast<double>(gt_hit_and_probed) / static_cast<double>(gt_probed)
+                      : 0.0;
+    metrics.exact_recall_on_probed_candidates =
+        exact_recall_count > 0 ? exact_recall_sum / static_cast<double>(exact_recall_count) : 0.0;
+    metrics.avg_pq_rank_loss =
+        pq_rank_loss_count > 0 ? pq_rank_loss_sum / static_cast<double>(pq_rank_loss_count) : 0.0;
+    metrics.miss_not_probed = static_cast<uint32_t>(
+        std::min<uint64_t>(miss_not_probed, std::numeric_limits<uint32_t>::max()));
+    metrics.miss_probed_filtered_by_pq = static_cast<uint32_t>(
+        std::min<uint64_t>(miss_pq_filtered, std::numeric_limits<uint32_t>::max()));
+    metrics.pq_rank_loss_count = static_cast<uint32_t>(
+        std::min<uint64_t>(pq_rank_loss_count, std::numeric_limits<uint32_t>::max()));
+    metrics.worst_queries = std::move(worst_queries);
   }
   return metrics;
 }
@@ -1349,13 +1360,17 @@ int main(int argc, char** argv) {
             << ", last_qe_ratio=" << online_pq_rollup.last_qe_ratio
             << ", avg_qe_ratio=" << online_avg_qe_ratio
             << ", avg_codebook_drift=" << online_avg_drift << std::endl;
-  std::cout << "[MISS DIAG] gt_probed_rate=" << final_metrics.gt_probed_rate
-            << ", recall_on_probed_gt=" << final_metrics.recall_on_probed_gt
-            << ", exact_recall_on_probed_candidates="
-            << final_metrics.exact_recall_on_probed_candidates
-            << ", miss_not_probed=" << final_metrics.miss_not_probed
-            << ", miss_probed_filtered_by_pq=" << final_metrics.miss_probed_filtered_by_pq
-            << ", avg_pq_rank_loss=" << final_metrics.avg_pq_rank_loss << std::endl;
+  if (config.enable_miss_diag) {
+    std::cout << "[MISS DIAG] gt_probed_rate=" << final_metrics.gt_probed_rate
+              << ", recall_on_probed_gt=" << final_metrics.recall_on_probed_gt
+              << ", exact_recall_on_probed_candidates="
+              << final_metrics.exact_recall_on_probed_candidates
+              << ", miss_not_probed=" << final_metrics.miss_not_probed
+              << ", miss_probed_filtered_by_pq=" << final_metrics.miss_probed_filtered_by_pq
+              << ", avg_pq_rank_loss=" << final_metrics.avg_pq_rank_loss << std::endl;
+  } else {
+    std::cout << "[MISS DIAG] disabled by config(enable_miss_diag=false)" << std::endl;
+  }
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
@@ -1386,6 +1401,7 @@ int main(int argc, char** argv) {
   ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
   ofs << "    \"streaming_use_stream_batch_size\": "
       << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
+  ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
   ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
   ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
   ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";

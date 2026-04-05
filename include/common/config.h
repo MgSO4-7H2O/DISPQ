@@ -21,6 +21,7 @@ struct Config {
   bool pq_residual{true};
   uint32_t max_queries{0};
   uint32_t snapshot_interval{0};
+  bool enable_miss_diag{true};
   bool enable_streaming{false};
   uint32_t main_index_rows{0};
   uint32_t delta_train_window{1};

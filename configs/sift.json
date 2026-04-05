@@ -12,6 +12,7 @@
   "pq_residual": true,
   "max_queries": 1000,
   "snapshot_interval": 5000,
+  "enable_miss_diag": true,
   "enable_streaming": true,
   "main_index_rows": 400000,
   "delta_train_window": 1,

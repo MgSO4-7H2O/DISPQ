@@ -67,6 +67,7 @@ std::string Config::ToString() const {
       << "pq_residual=" << std::boolalpha << pq_residual << ", "
       << "max_queries=" << max_queries << ", "
       << "snapshot_interval=" << snapshot_interval << ", "
+      << "enable_miss_diag=" << std::boolalpha << enable_miss_diag << ", "
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
@@ -116,6 +117,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractBool(text, "pq_residual", &cfg.pq_residual);
   ExtractUint(text, "max_queries", &cfg.max_queries);
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
+  ExtractBool(text, "enable_miss_diag", &cfg.enable_miss_diag);
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
