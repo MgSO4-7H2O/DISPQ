@@ -1,6 +1,4 @@
 {
-  "rvq_layers": 2,
-  "rvq_codewords": 256,
   "ivf_nlist": 64,
   "topk": 10,
   "nprobe": 8,
@@ -21,11 +19,6 @@
   "stream_batch_size": 10,
   "streaming_use_stream_batch_size": true,
   "online_pq_enable": true,
-  "online_pq_qe_ratio_threshold": 1.05,
-  "online_pq_ema_alpha": 0.1,
-  "online_pq_eps": 0.000001,
-  "online_pq_warmup_enable": true,
-  "online_pq_warmup_batches": 20,
   "online_pq_force_update_interval": 0,
   "online_pq_partial_top_alpha": false,
   "online_pq_alpha": 1.0,

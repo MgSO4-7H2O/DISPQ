@@ -141,9 +141,6 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   if (cfg.enable_streaming && cfg.delta_train_window == 0) {
     return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");
   }
-  if (cfg.online_pq_qe_ratio_threshold <= 0.0) {
-    return Status::InvalidArgument("online_pq_qe_ratio_threshold must be > 0");
-  }
   if (cfg.online_pq_ema_alpha <= 0.0 || cfg.online_pq_ema_alpha > 1.0) {
     return Status::InvalidArgument("online_pq_ema_alpha must be in (0,1]");
   }

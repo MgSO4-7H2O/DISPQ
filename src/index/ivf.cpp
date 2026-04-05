@@ -414,9 +414,6 @@ class KMeansIVFIndex : public IVFIndex {
   Result<OnlinePQUpdateStats> AddWithOnlinePQ(
       const AlignedVector<VectorRecord>& recs,
       const OnlinePQUpdateOptions& options) override {
-    if (options.qe_ratio_threshold <= 0.0) {
-      return Status::InvalidArgument("qe_ratio_threshold must be > 0");
-    }
     if (options.ema_alpha <= 0.0 || options.ema_alpha > 1.0) {
       return Status::InvalidArgument("ema_alpha must be in (0,1]");
     }
@@ -587,9 +584,8 @@ class KMeansIVFIndex : public IVFIndex {
       const bool force_periodic_update =
           options.force_update_interval > 0 &&
           (data.online_pq_batch_count % options.force_update_interval == 0);
-      // Optional periodic trigger: interval=0 disables forced updates.
-      stats.trigger_update =
-          options.enable && (stats.qe_ratio > options.qe_ratio_threshold || force_periodic_update);
+      // Keep qe_ratio for diagnostics, but update is only controlled by force interval.
+      stats.trigger_update = options.enable && force_periodic_update;
       stats.in_warmup = false;
       stats.warmup_batches_left = 0;
     }

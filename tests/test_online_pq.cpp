@@ -90,7 +90,7 @@ int main() {
 
   OnlinePQUpdateOptions no_update_opt;
   no_update_opt.enable = true;
-  no_update_opt.qe_ratio_threshold = 1e9;  // never trigger
+  no_update_opt.force_update_interval = 0;  // disabled
   no_update_opt.ema_alpha = 0.1;
   no_update_opt.nqe_eps = 1e-6;
   auto no_update_res = ivf_online->AddWithOnlinePQ(records_online, no_update_opt);
@@ -159,7 +159,7 @@ int main() {
   auto update_records = MakeRecords(update_batch, 30000, kDim, delta_versions);
   OnlinePQUpdateOptions update_opt;
   update_opt.enable = true;
-  update_opt.qe_ratio_threshold = 0.0 + 1e-9;  // always trigger
+  update_opt.force_update_interval = 1;  // trigger every batch
   update_opt.ema_alpha = 1.0;
   update_opt.nqe_eps = 1e-6;
   update_opt.reencode_batch_after_update = true;
@@ -244,7 +244,7 @@ int main() {
   auto guided_recs = MakeRecords(codeword_guided_batch, 91000, kDim, old_versions);
   OnlinePQUpdateOptions guided_opt;
   guided_opt.enable = true;
-  guided_opt.qe_ratio_threshold = 1e-9;
+  guided_opt.force_update_interval = 1;  // trigger every batch
   guided_opt.ema_alpha = 1.0;
   guided_opt.nqe_eps = 1e-6;
   guided_opt.reencode_batch_after_update = true;
