@@ -1157,6 +1157,7 @@ int main(int argc, char** argv) {
   }
 
   if (config.enable_streaming && total_stream_rows > 0) {
+    const bool eval_after_each_minibatch = config.enable_miss_diag;
     uint32_t next_snapshot_target = snapshot_span;
     uint32_t minibatch_id = 0;
     std::vector<MinibatchRecord> snapshot_minibatches;
@@ -1256,41 +1257,44 @@ int main(int argc, char** argv) {
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
 
-      // Evaluate after every minibatch insert and store in snapshot/minibatch records.
-      auto mres = evaluate_rows(next_insert_idx);
-      if (!mres.ok()) {
-        std::cerr << mres.status().ToString() << std::endl;
-        return 1;
-      }
-      const EvalMetrics batch_metrics = mres.value();
+      std::optional<EvalMetrics> batch_metrics;
+      if (eval_after_each_minibatch) {
+        auto mres = evaluate_rows(next_insert_idx);
+        if (!mres.ok()) {
+          std::cerr << mres.status().ToString() << std::endl;
+          return 1;
+        }
+        batch_metrics = mres.value();
 
-      MinibatchRecord minibatch;
-      minibatch.batch_id = ++minibatch_id;
-      minibatch.base_rows = next_insert_idx;
-      minibatch.stream_rows_total = inserted_rows;
-      minibatch.batch_rows = chunk;
-      minibatch.snapshot_rows_total =
-          next_insert_idx >= last_snapshot_active_rows ? next_insert_idx - last_snapshot_active_rows : 0;
-      minibatch.recall = batch_metrics.recall;
-      minibatch.avg_search_ms = batch_metrics.avg_search_ms;
-      minibatch.avg_scanned = batch_metrics.scanned_avg;
-      minibatch.qps = batch_metrics.qps;
-      minibatch.update_ms = step_update_ms;
-      minibatch.query_eval_ms = batch_metrics.query_eval_ms;
-      minibatch.nqe_batch = last_online_pq_stats.nqe_batch;
-      minibatch.qe_ratio = last_online_pq_stats.qe_ratio;
-      minibatch.codebook_drift = last_online_pq_stats.codebook_drift_l2;
-      minibatch.pq_updated = last_online_pq_stats.updated_codebook;
-      minibatch.in_warmup = last_online_pq_stats.in_warmup;
-      minibatch.warmup_batches_left = last_online_pq_stats.warmup_batches_left;
-      minibatch.gt_probed_rate = batch_metrics.gt_probed_rate;
-      minibatch.recall_on_probed_gt = batch_metrics.recall_on_probed_gt;
-      minibatch.exact_recall_on_probed_candidates = batch_metrics.exact_recall_on_probed_candidates;
-      minibatch.avg_pq_rank_loss = batch_metrics.avg_pq_rank_loss;
-      minibatch.miss_not_probed = batch_metrics.miss_not_probed;
-      minibatch.miss_probed_filtered_by_pq = batch_metrics.miss_probed_filtered_by_pq;
-      minibatch.pq_rank_loss_count = batch_metrics.pq_rank_loss_count;
-      snapshot_minibatches.push_back(std::move(minibatch));
+        MinibatchRecord minibatch;
+        minibatch.batch_id = ++minibatch_id;
+        minibatch.base_rows = next_insert_idx;
+        minibatch.stream_rows_total = inserted_rows;
+        minibatch.batch_rows = chunk;
+        minibatch.snapshot_rows_total =
+            next_insert_idx >= last_snapshot_active_rows ? next_insert_idx - last_snapshot_active_rows : 0;
+        minibatch.recall = batch_metrics->recall;
+        minibatch.avg_search_ms = batch_metrics->avg_search_ms;
+        minibatch.avg_scanned = batch_metrics->scanned_avg;
+        minibatch.qps = batch_metrics->qps;
+        minibatch.update_ms = step_update_ms;
+        minibatch.query_eval_ms = batch_metrics->query_eval_ms;
+        minibatch.nqe_batch = last_online_pq_stats.nqe_batch;
+        minibatch.qe_ratio = last_online_pq_stats.qe_ratio;
+        minibatch.codebook_drift = last_online_pq_stats.codebook_drift_l2;
+        minibatch.pq_updated = last_online_pq_stats.updated_codebook;
+        minibatch.in_warmup = last_online_pq_stats.in_warmup;
+        minibatch.warmup_batches_left = last_online_pq_stats.warmup_batches_left;
+        minibatch.gt_probed_rate = batch_metrics->gt_probed_rate;
+        minibatch.recall_on_probed_gt = batch_metrics->recall_on_probed_gt;
+        minibatch.exact_recall_on_probed_candidates =
+            batch_metrics->exact_recall_on_probed_candidates;
+        minibatch.avg_pq_rank_loss = batch_metrics->avg_pq_rank_loss;
+        minibatch.miss_not_probed = batch_metrics->miss_not_probed;
+        minibatch.miss_probed_filtered_by_pq = batch_metrics->miss_probed_filtered_by_pq;
+        minibatch.pq_rank_loss_count = batch_metrics->pq_rank_loss_count;
+        snapshot_minibatches.push_back(std::move(minibatch));
+      }
 
       const bool hit_periodic_snapshot =
           collect_snapshots && inserted_rows == next_snapshot_target;
@@ -1301,11 +1305,23 @@ int main(int argc, char** argv) {
         }
       }
       if (hit_periodic_snapshot || hit_final_snapshot) {
+        EvalMetrics snapshot_metrics;
+        if (batch_metrics.has_value()) {
+          snapshot_metrics = batch_metrics.value();
+        } else {
+          auto sres = evaluate_rows(next_insert_idx);
+          if (!sres.ok()) {
+            std::cerr << sres.status().ToString() << std::endl;
+            return 1;
+          }
+          snapshot_metrics = sres.value();
+        }
         write_snapshot(next_insert_idx,
-                       batch_metrics,
+                       snapshot_metrics,
                        pending_update_ms,
                        last_online_pq_stats,
-                       std::move(snapshot_minibatches));
+                       eval_after_each_minibatch ? std::move(snapshot_minibatches)
+                                                 : std::vector<MinibatchRecord>{});
         snapshot_minibatches.clear();
         pending_update_ms = 0.0;
       }
