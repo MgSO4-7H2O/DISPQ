@@ -315,7 +315,12 @@ Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
   return shard;
 }
 
-SearchResult MergeTopK(const std::vector<SearchResult>& partial_results, uint32_t topk) {
+Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
+                               uint32_t topk,
+                               bool exact_rerank_enable,
+                               uint32_t rerank_candidates_per_route,
+                               Eigen::Ref<const Eigen::VectorXf> query_whitened,
+                               const MatrixRM& base_whitened) {
   SearchResult out;
   if (partial_results.empty() || topk == 0) {
     return out;
@@ -324,7 +329,12 @@ SearchResult MergeTopK(const std::vector<SearchResult>& partial_results, uint32_
   uint64_t scanned = 0;
   for (const auto& part : partial_results) {
     scanned += part.scanned_candidates;
-    for (const auto& cand : part.topk) {
+    size_t route_take = part.topk.size();
+    if (exact_rerank_enable) {
+      route_take = std::min(route_take, static_cast<size_t>(rerank_candidates_per_route));
+    }
+    for (size_t i = 0; i < route_take; ++i) {
+      const auto& cand = part.topk[i];
       auto it = best_by_doc.find(cand.doc_id);
       if (it == best_by_doc.end() || cand.approx_dist < it->second.approx_dist) {
         best_by_doc[cand.doc_id] = cand;
@@ -337,17 +347,51 @@ SearchResult MergeTopK(const std::vector<SearchResult>& partial_results, uint32_
   for (const auto& kv : best_by_doc) {
     merged.push_back(kv.second);
   }
-  if (merged.size() > topk) {
-    std::nth_element(merged.begin(),
-                     merged.begin() + static_cast<int64_t>(topk),
-                     merged.end(),
-                     [](const Candidate& a, const Candidate& b) {
-                       return a.approx_dist < b.approx_dist;
-                     });
-    merged.resize(topk);
+
+  auto approx_less = [](const Candidate& a, const Candidate& b) {
+    if (a.approx_dist != b.approx_dist) {
+      return a.approx_dist < b.approx_dist;
+    }
+    return a.doc_id < b.doc_id;
+  };
+  auto rerank_less = [](const Candidate& a, const Candidate& b) {
+    if (a.rerank_dist != b.rerank_dist) {
+      return a.rerank_dist < b.rerank_dist;
+    }
+    if (a.approx_dist != b.approx_dist) {
+      return a.approx_dist < b.approx_dist;
+    }
+    return a.doc_id < b.doc_id;
+  };
+
+  if (exact_rerank_enable) {
+    for (auto& cand : merged) {
+      if (cand.doc_id >= static_cast<DocId>(base_whitened.rows())) {
+        return Status::InvalidArgument("MergeTopK: doc id out of range for exact rerank");
+      }
+      const Eigen::VectorXf diff =
+          query_whitened - base_whitened.row(static_cast<Eigen::Index>(cand.doc_id)).transpose();
+      cand.rerank_dist = diff.squaredNorm();
+    }
+    if (merged.size() > topk) {
+      std::nth_element(merged.begin(),
+                       merged.begin() + static_cast<int64_t>(topk),
+                       merged.end(),
+                       rerank_less);
+      merged.resize(topk);
+    }
+    std::sort(merged.begin(), merged.end(), rerank_less);
+  } else {
+    if (merged.size() > topk) {
+      std::nth_element(merged.begin(),
+                       merged.begin() + static_cast<int64_t>(topk),
+                       merged.end(),
+                       approx_less);
+      merged.resize(topk);
+    }
+    std::sort(merged.begin(), merged.end(), approx_less);
   }
-  std::sort(merged.begin(), merged.end(),
-            [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
+
   out.topk = std::move(merged);
   out.scanned_candidates = scanned;
   return out;
@@ -419,6 +463,11 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 
   const uint32_t nq = static_cast<uint32_t>(queries_raw.rows());
   const uint32_t route_count = static_cast<uint32_t>(routes.size());
+  const bool enable_exact_rerank = config.exact_rerank_enable;
+  const uint32_t route_topk =
+      enable_exact_rerank
+          ? std::max(params.topk, config.exact_rerank_candidates_per_route)
+          : params.topk;
   std::vector<std::vector<DocId>> predictions(nq);
   std::vector<double> whitening_ms(nq, 0.0);
   std::vector<double> search_ms(nq, 0.0);
@@ -475,7 +524,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       Timer stimer;
       auto sres = routes[static_cast<size_t>(ri)].ivf->Search(
           q,
-          params.topk,
+          route_topk,
           params.nprobe,
           routes[static_cast<size_t>(ri)].versions,
           routes[static_cast<size_t>(ri)].from_new);
@@ -497,13 +546,26 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   }
 
   for (uint32_t qi = 0; qi < nq; ++qi) {
-    SearchResult merged = MergeTopK(route_results[static_cast<size_t>(qi)], params.topk);
+    Eigen::VectorXf q = queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
+    Timer merge_timer;
+    auto merged_res = MergeTopK(route_results[static_cast<size_t>(qi)],
+                                params.topk,
+                                enable_exact_rerank,
+                                config.exact_rerank_candidates_per_route,
+                                q,
+                                base_whitened);
+    if (!merged_res.ok()) {
+      return merged_res.status();
+    }
+    SearchResult merged = merged_res.value();
+    const double merge_elapsed = merge_timer.ElapsedMillis();
     double q_search_ms = 0.0;
     for (uint32_t ri = 0; ri < route_count; ++ri) {
       q_search_ms = std::max(
           q_search_ms,
           route_search_ms[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)]);
     }
+    q_search_ms += merge_elapsed;
     std::vector<DocId> row;
     row.reserve(merged.topk.size());
     for (const auto& cand : merged.topk) {
@@ -1352,7 +1414,10 @@ int main(int argc, char** argv) {
 
   std::cout << "[ONLINE EVAL] "
             << "Recall@" << config.topk << " = " << final_metrics.recall
-            << " (nprobe=" << params.nprobe << ")" << std::endl;
+            << " (nprobe=" << params.nprobe
+            << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
+            << ", rerank_candidates_per_route=" << config.exact_rerank_candidates_per_route
+            << ")" << std::endl;
   std::cout << "Avg query=" << final_metrics.avg_query_ms << "ms; "
             << "Search p50=" << final_metrics.search_p50 << "ms, p99=" << final_metrics.search_p99
             << "ms; "
@@ -1418,6 +1483,10 @@ int main(int argc, char** argv) {
   ofs << "    \"streaming_use_stream_batch_size\": "
       << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
   ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
+  ofs << "    \"exact_rerank_enable\": " << (config.exact_rerank_enable ? "true" : "false")
+      << ",\n";
+  ofs << "    \"exact_rerank_candidates_per_route\": "
+      << config.exact_rerank_candidates_per_route << ",\n";
   ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
   ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
   ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";

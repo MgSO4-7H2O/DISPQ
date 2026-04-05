@@ -68,6 +68,8 @@ std::string Config::ToString() const {
       << "max_queries=" << max_queries << ", "
       << "snapshot_interval=" << snapshot_interval << ", "
       << "enable_miss_diag=" << std::boolalpha << enable_miss_diag << ", "
+      << "exact_rerank_enable=" << std::boolalpha << exact_rerank_enable << ", "
+      << "exact_rerank_candidates_per_route=" << exact_rerank_candidates_per_route << ", "
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
@@ -118,6 +120,10 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "max_queries", &cfg.max_queries);
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
   ExtractBool(text, "enable_miss_diag", &cfg.enable_miss_diag);
+  ExtractBool(text, "exact_rerank_enable", &cfg.exact_rerank_enable);
+  ExtractUint(text,
+              "exact_rerank_candidates_per_route",
+              &cfg.exact_rerank_candidates_per_route);
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
@@ -148,6 +154,14 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.stream_batch_size == 0) {
     return Status::InvalidArgument("stream_batch_size must be > 0");
+  }
+  if (cfg.exact_rerank_enable && cfg.exact_rerank_candidates_per_route == 0) {
+    return Status::InvalidArgument(
+        "exact_rerank_candidates_per_route must be > 0 when exact_rerank_enable=true");
+  }
+  if (cfg.exact_rerank_enable && cfg.exact_rerank_candidates_per_route < cfg.topk) {
+    return Status::InvalidArgument(
+        "exact_rerank_candidates_per_route must be >= topk when exact_rerank_enable=true");
   }
   if (cfg.enable_streaming && cfg.delta_train_window == 0) {
     return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");

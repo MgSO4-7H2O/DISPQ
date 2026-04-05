@@ -13,6 +13,8 @@
   "max_queries": 1000,
   "snapshot_interval": 5000,
   "enable_miss_diag": true,
+  "exact_rerank_enable": false,
+  "exact_rerank_candidates_per_route": 0,
   "enable_streaming": true,
   "main_index_rows": 400000,
   "delta_train_window": 1,
