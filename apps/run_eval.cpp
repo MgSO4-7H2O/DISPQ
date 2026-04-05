@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <deque>
 
 #include <Eigen/Dense>
 
@@ -260,6 +261,36 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
     records.push_back(std::move(rec));
   }
   return ivf->AddWithOnlinePQ(records, options);
+}
+
+Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQSlidingWindow(
+    const std::shared_ptr<IVFIndex>& ivf,
+    const MatrixRM& x_whitened,
+    uint32_t begin,
+    uint32_t end,
+    uint32_t dim,
+    const VersionSet& versions,
+    const std::vector<DocId>& delete_doc_ids,
+    const OnlinePQUpdateOptions& options) {
+  if (!ivf) {
+    return Status::InvalidArgument("AddRangeToIndexWithOnlinePQSlidingWindow: null ivf");
+  }
+  if (begin > end || end > static_cast<uint32_t>(x_whitened.rows())) {
+    return Status::InvalidArgument("AddRangeToIndexWithOnlinePQSlidingWindow: invalid range");
+  }
+
+  AlignedVector<VectorRecord> records;
+  records.reserve(static_cast<size_t>(end - begin));
+  for (uint32_t i = begin; i < end; ++i) {
+    VectorRecord rec;
+    rec.doc_id = i;
+    rec.dim = dim;
+    rec.versions = versions;
+    rec.ivf_id = 0;
+    rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
+    records.push_back(std::move(rec));
+  }
+  return ivf->AddWithOnlinePQSlidingWindow(records, delete_doc_ids, options);
 }
 
 Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
@@ -986,6 +1017,30 @@ int main(int argc, char** argv) {
   online_pq_options.partial_lambda = config.online_pq_lambda;
   online_pq_options.reencode_batch_after_update = config.online_pq_reencode_batch;
 
+  const bool use_sliding_window = (config.online_pq_update_scheme == "sliding_window");
+  uint32_t sliding_window_rows = 0;
+  if (use_sliding_window) {
+    const uint64_t row_factor =
+        config.online_pq_sliding_window_use_batches ? static_cast<uint64_t>(insert_step) : 1ull;
+    const uint64_t window_rows_u64 =
+        static_cast<uint64_t>(config.online_pq_sliding_window_size) * row_factor;
+    sliding_window_rows =
+        window_rows_u64 >= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+            ? std::numeric_limits<uint32_t>::max()
+            : static_cast<uint32_t>(window_rows_u64);
+    if (sliding_window_rows == 0) {
+      std::cerr << "sliding_window_rows resolved to 0" << std::endl;
+      return 1;
+    }
+  }
+
+  std::deque<DocId> sliding_window_doc_ids;
+  if (active_delta.has_value() && delta_train_rows > 0) {
+    for (uint32_t i = main_rows_initial; i < stream_start_idx; ++i) {
+      sliding_window_doc_ids.push_back(i);
+    }
+  }
+
   OnlinePQRollup online_pq_rollup;
   OnlinePQUpdateStats last_online_pq_stats;
 
@@ -1108,13 +1163,41 @@ int main(int argc, char** argv) {
 
       Timer update_timer;
       if (active_delta.has_value()) {
-        auto add_res = AddRangeToIndexWithOnlinePQ(active_delta->ivf,
-                                                   X_whitened,
-                                                   begin,
-                                                   end,
-                                                   config.dim,
-                                                   active_delta->versions,
-                                                   online_pq_options);
+        std::vector<DocId> delete_doc_ids;
+        if (use_sliding_window) {
+          const uint32_t current_rows = active_delta->rows;
+          uint32_t need_delete = 0;
+          if (current_rows + chunk > sliding_window_rows) {
+            need_delete = current_rows + chunk - sliding_window_rows;
+          }
+          if (need_delete > static_cast<uint32_t>(sliding_window_doc_ids.size())) {
+            need_delete = static_cast<uint32_t>(sliding_window_doc_ids.size());
+          }
+          delete_doc_ids.reserve(need_delete);
+          for (uint32_t i = 0; i < need_delete; ++i) {
+            delete_doc_ids.push_back(sliding_window_doc_ids[static_cast<size_t>(i)]);
+          }
+        }
+
+        Result<OnlinePQUpdateStats> add_res = OnlinePQUpdateStats{};
+        if (use_sliding_window) {
+          add_res = AddRangeToIndexWithOnlinePQSlidingWindow(active_delta->ivf,
+                                                             X_whitened,
+                                                             begin,
+                                                             end,
+                                                             config.dim,
+                                                             active_delta->versions,
+                                                             delete_doc_ids,
+                                                             online_pq_options);
+        } else {
+          add_res = AddRangeToIndexWithOnlinePQ(active_delta->ivf,
+                                                X_whitened,
+                                                begin,
+                                                end,
+                                                config.dim,
+                                                active_delta->versions,
+                                                online_pq_options);
+        }
         if (!add_res.ok()) {
           std::cerr << add_res.status().ToString() << std::endl;
           return 1;
@@ -1142,7 +1225,18 @@ int main(int argc, char** argv) {
         }
         online_pq_rollup.updated_subspaces += last_online_pq_stats.updated_subspaces;
         online_pq_rollup.updated_codewords += last_online_pq_stats.updated_codewords;
-        active_delta->rows += chunk;
+        if (use_sliding_window) {
+          const uint32_t deleted_rows = static_cast<uint32_t>(delete_doc_ids.size());
+          for (uint32_t i = 0; i < deleted_rows; ++i) {
+            sliding_window_doc_ids.pop_front();
+          }
+          for (uint32_t i = begin; i < end; ++i) {
+            sliding_window_doc_ids.push_back(i);
+          }
+          active_delta->rows = active_delta->rows + chunk - deleted_rows;
+        } else {
+          active_delta->rows += chunk;
+        }
       }
       const double step_update_ms = update_timer.ElapsedMillis();
 
@@ -1244,6 +1338,7 @@ int main(int argc, char** argv) {
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
             << "; QPS=" << final_metrics.qps << std::endl;
   std::cout << "[ONLINE PQ] enabled=" << std::boolalpha << online_pq_options.enable
+            << ", mode=" << config.online_pq_update_scheme
             << ", batches=" << online_pq_rollup.batches
             << ", warmup_batches=" << online_pq_rollup.warmup_batches
             << ", triggered=" << online_pq_rollup.triggered
@@ -1294,6 +1389,11 @@ int main(int argc, char** argv) {
   ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
   ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
   ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_update_scheme\": \"" << config.online_pq_update_scheme << "\",\n";
+  ofs << "    \"online_pq_sliding_window_size\": " << config.online_pq_sliding_window_size << ",\n";
+  ofs << "    \"online_pq_sliding_window_use_batches\": "
+      << (config.online_pq_sliding_window_use_batches ? "true" : "false") << ",\n";
+  ofs << "    \"online_pq_sliding_window_rows\": " << sliding_window_rows << ",\n";
   ofs << "    \"online_pq_qe_ratio_threshold\": " << config.online_pq_qe_ratio_threshold << ",\n";
   ofs << "    \"online_pq_ema_alpha\": " << config.online_pq_ema_alpha << ",\n";
   ofs << "    \"online_pq_eps\": " << config.online_pq_eps << ",\n";

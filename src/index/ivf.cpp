@@ -54,6 +54,7 @@ struct IndexData {
   uint32_t warmup_seen_batches{0};
   std::vector<AlignedVector<ListEntry>> lists;
   std::unordered_set<DocId> doc_ids;
+  std::unordered_map<DocId, uint32_t> doc_to_list;
   uint64_t ntotal{0};
 };
 
@@ -195,6 +196,8 @@ uint32_t ClampTopCount(double ratio, uint32_t total) {
 }
 
 class KMeansIVFIndex : public IVFIndex {
+  struct RemovedDoc;
+
  public:
   Result<VersionId> Build(Eigen::Ref<const MatrixRM> Xw,
                           const std::vector<DocId>& ids,
@@ -264,6 +267,7 @@ class KMeansIVFIndex : public IVFIndex {
     data->lists.clear();
     data->lists.resize(nlist);
     data->doc_ids.clear();
+    data->doc_to_list.clear();
     data->ntotal = 0;
 
     if (data->use_pq) {
@@ -385,6 +389,7 @@ class KMeansIVFIndex : public IVFIndex {
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
+      entry.vector = rec.x;
       if (data.use_pq) {
         entry.pq_code.resize(data.M);
         Eigen::VectorXf residual = rec.x;
@@ -414,6 +419,13 @@ class KMeansIVFIndex : public IVFIndex {
   Result<OnlinePQUpdateStats> AddWithOnlinePQ(
       const AlignedVector<VectorRecord>& recs,
       const OnlinePQUpdateOptions& options) override {
+    return AddWithOnlinePQSlidingWindow(recs, std::vector<DocId>{}, options);
+  }
+
+  Result<OnlinePQUpdateStats> AddWithOnlinePQSlidingWindow(
+      const AlignedVector<VectorRecord>& recs,
+      const std::vector<DocId>& delete_doc_ids,
+      const OnlinePQUpdateOptions& options) override {
     if (options.ema_alpha <= 0.0 || options.ema_alpha > 1.0) {
       return Status::InvalidArgument("ema_alpha must be in (0,1]");
     }
@@ -434,6 +446,7 @@ class KMeansIVFIndex : public IVFIndex {
 
     OnlinePQUpdateStats stats;
     stats.processed_vectors = static_cast<uint32_t>(recs.size());
+    stats.deleted_vectors = static_cast<uint32_t>(delete_doc_ids.size());
 
     std::unique_lock lock(mu_);
     if (latest_version_ == 0) {
@@ -448,7 +461,11 @@ class KMeansIVFIndex : public IVFIndex {
     if (!validate.ok()) {
       return validate;
     }
-    if (recs.empty()) {
+    Status validate_deletes = ValidateDeleteIdsLocked(data, delete_doc_ids);
+    if (!validate_deletes.ok()) {
+      return validate_deletes;
+    }
+    if (recs.empty() && delete_doc_ids.empty()) {
       stats.use_online_pq = data.use_pq && data.pq_residual;
       stats.nqe_baseline = data.nqe_baseline;
       stats.nqe_ema = data.nqe_ema;
@@ -460,6 +477,12 @@ class KMeansIVFIndex : public IVFIndex {
                             data.dsub > 0 && data.pq_codebooks.size() == data.M &&
                             data.pq_counts.size() == data.M;
     if (!can_online) {
+      if (!delete_doc_ids.empty()) {
+        Status remove_status = RemoveDocsLocked(&data, delete_doc_ids, nullptr);
+        if (!remove_status.ok()) {
+          return remove_status;
+        }
+      }
       std::vector<int> centroids(recs.size(), 0);
       AlignedVector<ListEntry> entries(recs.size());
       for (size_t i = 0; i < recs.size(); ++i) {
@@ -469,6 +492,7 @@ class KMeansIVFIndex : public IVFIndex {
         entry.doc_id = rec.doc_id;
         entry.versions = rec.versions;
         entry.versions.index_version = data.version;
+        entry.vector = rec.x;
         if (data.use_pq) {
           entry.pq_code.resize(data.M);
           Eigen::VectorXf residual = rec.x;
@@ -516,6 +540,45 @@ class KMeansIVFIndex : public IVFIndex {
     }
     std::vector<double> sub_err_sum(data.M, 0.0);
     std::vector<double> sub_energy_sum(data.M, 0.0);
+    std::vector<std::vector<uint32_t>> delete_cnt(
+        data.M, std::vector<uint32_t>(data.Ks, 0));
+    std::vector<MatrixRM> delete_sum_vec;
+    delete_sum_vec.reserve(data.M);
+    for (uint32_t m = 0; m < data.M; ++m) {
+      delete_sum_vec.emplace_back(MatrixRM::Zero(data.Ks, data.dsub));
+    }
+
+    std::vector<RemovedDoc> removed_docs;
+    if (!delete_doc_ids.empty()) {
+      Status remove_status = RemoveDocsLocked(&data, delete_doc_ids, &removed_docs);
+      if (!remove_status.ok()) {
+        return remove_status;
+      }
+      for (const auto& removed : removed_docs) {
+        if (removed.entry.pq_code.size() != data.M ||
+            static_cast<uint32_t>(removed.entry.vector.size()) != data.dim) {
+          continue;
+        }
+        Eigen::VectorXf residual = removed.entry.vector;
+        if (data.pq_residual) {
+          residual -= data.routing_centroids
+                          .row(static_cast<Eigen::Index>(removed.list_id))
+                          .transpose();
+        }
+        for (uint32_t m = 0; m < data.M; ++m) {
+          const uint32_t k = static_cast<uint32_t>(removed.entry.pq_code[static_cast<size_t>(m)]);
+          if (k >= data.Ks) {
+            continue;
+          }
+          delete_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)]++;
+          Eigen::Map<const Eigen::VectorXf> sub(
+              residual.data() + static_cast<Eigen::Index>(m * data.dsub),
+              static_cast<Eigen::Index>(data.dsub));
+          delete_sum_vec[static_cast<size_t>(m)].row(static_cast<Eigen::Index>(k)) +=
+              sub.transpose();
+        }
+      }
+    }
 
     double nqe_sum = 0.0;
     for (size_t i = 0; i < recs.size(); ++i) {
@@ -555,7 +618,7 @@ class KMeansIVFIndex : public IVFIndex {
       nqe_sum += err2 / (r2 + eps);
     }
 
-    stats.nqe_batch = nqe_sum / static_cast<double>(n);
+    stats.nqe_batch = (n > 0) ? (nqe_sum / static_cast<double>(n)) : data.nqe_ema;
     data.online_pq_batch_count++;
     if (options.warmup_enable && data.online_pq_batch_count <= options.warmup_batches) {
       data.warmup_nqe_sum += stats.nqe_batch;
@@ -625,13 +688,20 @@ class KMeansIVFIndex : public IVFIndex {
             continue;
           }
           for (uint32_t k = 0; k < data.Ks; ++k) {
-            if (batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)] == 0) {
+            const uint32_t ins = batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)];
+            const uint32_t del = delete_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)];
+            if (ins == 0 && del == 0) {
               continue;
             }
-            const double score =
+            const double score_add =
                 sum_err[static_cast<size_t>(m)]
                     .row(static_cast<Eigen::Index>(k))
                     .squaredNorm();
+            const double score_del =
+                delete_sum_vec[static_cast<size_t>(m)]
+                    .row(static_cast<Eigen::Index>(k))
+                    .squaredNorm();
+            const double score = score_add + score_del;
             scored.push_back(CodewordScore{score, m, k});
           }
         }
@@ -654,7 +724,8 @@ class KMeansIVFIndex : public IVFIndex {
             continue;
           }
           for (uint32_t k = 0; k < data.Ks; ++k) {
-            if (batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)] > 0) {
+            if (batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)] > 0 ||
+                delete_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)] > 0) {
               codeword_selected[static_cast<size_t>(m)][static_cast<size_t>(k)] = 1;
             }
           }
@@ -671,25 +742,39 @@ class KMeansIVFIndex : public IVFIndex {
           if (codeword_selected[static_cast<size_t>(m)][static_cast<size_t>(k)] == 0) {
             continue;
           }
-          const uint32_t cnt = batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)];
-          if (cnt == 0) {
+          const uint32_t ins = batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)];
+          const uint32_t del = delete_cnt[static_cast<size_t>(m)][static_cast<size_t>(k)];
+          if (ins == 0 && del == 0) {
             continue;
           }
 
           const uint64_t old_n = data.pq_counts[static_cast<size_t>(m)][static_cast<size_t>(k)];
-          const uint64_t new_n = old_n + static_cast<uint64_t>(cnt);
+          const int64_t new_n_i64 =
+              static_cast<int64_t>(old_n) + static_cast<int64_t>(ins) - static_cast<int64_t>(del);
+          const uint64_t new_n = (new_n_i64 <= 0) ? 0ull : static_cast<uint64_t>(new_n_i64);
           const Eigen::VectorXf z_old =
               data.pq_codebooks[static_cast<size_t>(m)]
                   .row(static_cast<Eigen::Index>(k))
                   .transpose();
-          const Eigen::VectorXf mu_batch =
-              sum_vec[static_cast<size_t>(m)]
-                  .row(static_cast<Eigen::Index>(k))
-                  .transpose() /
-              static_cast<float>(cnt);
+          Eigen::VectorXf numerator = static_cast<float>(old_n) * z_old;
+          if (ins > 0) {
+            const Eigen::VectorXf mu_add =
+                sum_vec[static_cast<size_t>(m)]
+                    .row(static_cast<Eigen::Index>(k))
+                    .transpose() /
+                static_cast<float>(ins);
+            numerator += static_cast<float>(ins) * mu_add;
+          }
+          if (del > 0) {
+            const Eigen::VectorXf mu_del =
+                delete_sum_vec[static_cast<size_t>(m)]
+                    .row(static_cast<Eigen::Index>(k))
+                    .transpose() /
+                static_cast<float>(del);
+            numerator -= static_cast<float>(del) * mu_del;
+          }
           const Eigen::VectorXf z_new =
-              (static_cast<float>(old_n) * z_old + static_cast<float>(cnt) * mu_batch) /
-              static_cast<float>(new_n);
+              (new_n > 0) ? (numerator / static_cast<float>(new_n)) : z_old;
           const Eigen::VectorXf diff = z_new - z_old;
           drift_sq += static_cast<double>(diff.squaredNorm());
           data.pq_codebooks[static_cast<size_t>(m)].row(static_cast<Eigen::Index>(k)) =
@@ -728,6 +813,7 @@ class KMeansIVFIndex : public IVFIndex {
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
+      entry.vector = rec.x;
       entry.pq_code = std::move(codes_for_insert[static_cast<size_t>(i)]);
       entries[i] = std::move(entry);
     }
@@ -907,6 +993,12 @@ class KMeansIVFIndex : public IVFIndex {
   Status Deserialize(const std::vector<uint8_t>&) override { return Status::OK(); }
 
  private:
+  struct RemovedDoc {
+    DocId doc_id{0};
+    uint32_t list_id{0};
+    ListEntry entry;
+  };
+
   Status ValidateRecordsForInsertLocked(const IndexData& data,
                                         const AlignedVector<VectorRecord>& recs) const {
     std::unordered_set<DocId> batch_ids;
@@ -925,12 +1017,80 @@ class KMeansIVFIndex : public IVFIndex {
     return Status::OK();
   }
 
+  Status ValidateDeleteIdsLocked(const IndexData& data,
+                                 const std::vector<DocId>& doc_ids) const {
+    std::unordered_set<DocId> seen;
+    seen.reserve(doc_ids.size());
+    for (DocId doc_id : doc_ids) {
+      if (!seen.insert(doc_id).second) {
+        return Status::InvalidArgument("duplicate delete doc_id in batch");
+      }
+      if (data.doc_ids.find(doc_id) == data.doc_ids.end()) {
+        return Status::NotFound("delete doc_id not found in IVF");
+      }
+    }
+    return Status::OK();
+  }
+
+  Status RemoveDocsLocked(IndexData* data,
+                          const std::vector<DocId>& doc_ids,
+                          std::vector<RemovedDoc>* removed) {
+    if (data == nullptr) {
+      return Status::InvalidArgument("RemoveDocsLocked: null data");
+    }
+    if (removed != nullptr) {
+      removed->clear();
+      removed->reserve(doc_ids.size());
+    }
+    for (DocId doc_id : doc_ids) {
+      auto map_it = data->doc_to_list.find(doc_id);
+      if (map_it == data->doc_to_list.end()) {
+        return Status::NotFound("delete doc_id list mapping not found");
+      }
+      const uint32_t list_id = map_it->second;
+      if (list_id >= data->lists.size()) {
+        return Status::InvalidArgument("delete list_id out of range");
+      }
+      auto& list = data->lists[static_cast<size_t>(list_id)];
+      size_t pos = list.size();
+      for (size_t i = 0; i < list.size(); ++i) {
+        if (list[i].doc_id == doc_id) {
+          pos = i;
+          break;
+        }
+      }
+      if (pos == list.size()) {
+        return Status::NotFound("delete doc_id not found in list");
+      }
+      if (removed != nullptr) {
+        RemovedDoc r;
+        r.doc_id = doc_id;
+        r.list_id = list_id;
+        r.entry = std::move(list[pos]);
+        removed->push_back(std::move(r));
+      }
+      if (pos != list.size() - 1) {
+        list[pos] = std::move(list.back());
+        data->doc_to_list[list[pos].doc_id] = list_id;
+      }
+      list.pop_back();
+      data->doc_ids.erase(doc_id);
+      data->doc_to_list.erase(doc_id);
+      if (data->ntotal > 0) {
+        --data->ntotal;
+      }
+    }
+    return Status::OK();
+  }
+
   void CommitPendingLocked(IndexData* data,
                            const std::vector<int>& centroids,
                            AlignedVector<ListEntry>* entries) {
     for (size_t i = 0; i < entries->size(); ++i) {
       data->doc_ids.insert((*entries)[i].doc_id);
-      data->lists[static_cast<size_t>(centroids[i])].push_back(std::move((*entries)[i]));
+      const uint32_t list_id = static_cast<uint32_t>(centroids[i]);
+      data->lists[static_cast<size_t>(list_id)].push_back(std::move((*entries)[i]));
+      data->doc_to_list[data->lists[static_cast<size_t>(list_id)].back().doc_id] = list_id;
       ++data->ntotal;
     }
   }

@@ -54,6 +54,7 @@ struct OnlinePQUpdateStats {
   bool in_warmup{false};
   uint32_t warmup_batches_left{0};
   uint32_t processed_vectors{0};
+  uint32_t deleted_vectors{0};
   uint32_t updated_subspaces{0};
   uint32_t updated_codewords{0};
   double nqe_batch{0.0};
@@ -92,6 +93,12 @@ class IVFIndex {
   // NTS: Adds records and optionally applies residual OnlinePQ codebook update.
   virtual Result<OnlinePQUpdateStats> AddWithOnlinePQ(
       const AlignedVector<VectorRecord>& recs,
+      const OnlinePQUpdateOptions& options) = 0;
+
+  // NTS: Sliding-window OnlinePQ step with insertion and deletion in one update.
+  virtual Result<OnlinePQUpdateStats> AddWithOnlinePQSlidingWindow(
+      const AlignedVector<VectorRecord>& recs,
+      const std::vector<DocId>& delete_doc_ids,
       const OnlinePQUpdateOptions& options) = 0;
 
   // TS: Searches specified versions using whitened query.

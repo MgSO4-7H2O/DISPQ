@@ -282,5 +282,39 @@ int main() {
   assert(std::isfinite(dist_after));
   assert(std::fabs(dist_after - dist_before) > 1e-6);  // distance table uses updated codebook
 
+  // 5) Sliding-window step supports insert + delete in one online update.
+  auto sliding_ivf = CreateIVFIndex();
+  auto sliding_ver = sliding_ivf->Build(small_train, small_ids, small_params, 400);
+  assert(sliding_ver.ok());
+  VersionSet sliding_versions{0, sliding_ver.value()};
+
+  MatrixRM init_docs = small_train.topRows(8);
+  auto init_recs = MakeRecords(init_docs, 100000, kDim, sliding_versions);
+  assert(sliding_ivf->Add(init_recs).ok());
+  auto state_before_slide = sliding_ivf->GetPQRuntimeState(sliding_versions);
+  assert(state_before_slide.ok());
+  assert(state_before_slide.value().ntotal == 8);
+
+  MatrixRM ins_docs = MatrixRM::Random(4, kDim);
+  auto ins_recs = MakeRecords(ins_docs, 200000, kDim, sliding_versions);
+  std::vector<DocId> delete_ids{100000, 100001, 100002, 100003};
+  OnlinePQUpdateOptions slide_opt;
+  slide_opt.enable = true;
+  slide_opt.force_update_interval = 1;
+  slide_opt.ema_alpha = 1.0;
+  slide_opt.nqe_eps = 1e-6;
+  auto slide_res =
+      sliding_ivf->AddWithOnlinePQSlidingWindow(ins_recs, delete_ids, slide_opt);
+  assert(slide_res.ok());
+  assert(slide_res.value().deleted_vectors == delete_ids.size());
+
+  auto state_after_slide = sliding_ivf->GetPQRuntimeState(sliding_versions);
+  assert(state_after_slide.ok());
+  assert(state_after_slide.value().ntotal == 8);
+  auto deleted_code = sliding_ivf->GetDocPQCode(sliding_versions, 100000);
+  assert(!deleted_code.ok());
+  auto inserted_code = sliding_ivf->GetDocPQCode(sliding_versions, 200000);
+  assert(inserted_code.ok());
+
   return 0;
 }

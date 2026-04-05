@@ -28,6 +28,9 @@ struct Config {
   uint32_t stream_batch_size{100};
   bool streaming_use_stream_batch_size{false};
   bool online_pq_enable{true};
+  std::string online_pq_update_scheme{"minibatch"};
+  uint32_t online_pq_sliding_window_size{0};
+  bool online_pq_sliding_window_use_batches{true};
   double online_pq_qe_ratio_threshold{1.05};
   double online_pq_ema_alpha{0.1};
   double online_pq_eps{1e-6};

@@ -75,6 +75,10 @@ std::string Config::ToString() const {
       << "streaming_use_stream_batch_size=" << std::boolalpha << streaming_use_stream_batch_size
       << ", "
       << "online_pq_enable=" << std::boolalpha << online_pq_enable << ", "
+      << "online_pq_update_scheme=" << online_pq_update_scheme << ", "
+      << "online_pq_sliding_window_size=" << online_pq_sliding_window_size << ", "
+      << "online_pq_sliding_window_use_batches=" << std::boolalpha
+      << online_pq_sliding_window_use_batches << ", "
       << "online_pq_qe_ratio_threshold=" << online_pq_qe_ratio_threshold << ", "
       << "online_pq_ema_alpha=" << online_pq_ema_alpha << ", "
       << "online_pq_eps=" << online_pq_eps << ", "
@@ -119,6 +123,11 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
   ExtractBool(text, "streaming_use_stream_batch_size", &cfg.streaming_use_stream_batch_size);
   ExtractBool(text, "online_pq_enable", &cfg.online_pq_enable);
+  ExtractString(text, "online_pq_update_scheme", &cfg.online_pq_update_scheme);
+  ExtractUint(text, "online_pq_sliding_window_size", &cfg.online_pq_sliding_window_size);
+  ExtractBool(text,
+              "online_pq_sliding_window_use_batches",
+              &cfg.online_pq_sliding_window_use_batches);
   ExtractDouble(text, "online_pq_qe_ratio_threshold", &cfg.online_pq_qe_ratio_threshold);
   ExtractDouble(text, "online_pq_ema_alpha", &cfg.online_pq_ema_alpha);
   ExtractDouble(text, "online_pq_eps", &cfg.online_pq_eps);
@@ -140,6 +149,20 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.enable_streaming && cfg.delta_train_window == 0) {
     return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");
+  }
+  if (cfg.online_pq_update_scheme != "minibatch" &&
+      cfg.online_pq_update_scheme != "sliding_window") {
+    return Status::InvalidArgument(
+        "online_pq_update_scheme must be either \"minibatch\" or \"sliding_window\"");
+  }
+  if (cfg.online_pq_update_scheme == "sliding_window" && cfg.online_pq_sliding_window_size == 0) {
+    return Status::InvalidArgument(
+        "online_pq_sliding_window_size must be > 0 when online_pq_update_scheme=\"sliding_window\"");
+  }
+  if (cfg.online_pq_update_scheme == "sliding_window" &&
+      cfg.online_pq_force_update_interval == 0) {
+    return Status::InvalidArgument(
+        "online_pq_force_update_interval must be > 0 in sliding_window mode");
   }
   if (cfg.online_pq_ema_alpha <= 0.0 || cfg.online_pq_ema_alpha > 1.0) {
     return Status::InvalidArgument("online_pq_ema_alpha must be in (0,1]");
