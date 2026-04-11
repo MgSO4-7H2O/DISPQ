@@ -116,6 +116,12 @@ struct EvalMetrics {
   uint32_t miss_not_probed{0};
   uint32_t miss_probed_filtered_by_pq{0};
   uint32_t pq_rank_loss_count{0};
+  uint64_t rerank_topk_main_total{0};
+  uint64_t rerank_topk_delta_total{0};
+  double rerank_topk_main_ratio{0.0};
+  double rerank_topk_delta_ratio{0.0};
+  double rerank_topk_main_avg{0.0};
+  double rerank_topk_delta_avg{0.0};
   std::vector<std::string> worst_queries;
 };
 
@@ -173,6 +179,12 @@ struct SnapshotRecord {
   uint32_t miss_not_probed{0};
   uint32_t miss_probed_filtered_by_pq{0};
   uint32_t pq_rank_loss_count{0};
+  uint64_t rerank_topk_main_total{0};
+  uint64_t rerank_topk_delta_total{0};
+  double rerank_topk_main_ratio{0.0};
+  double rerank_topk_delta_ratio{0.0};
+  double rerank_topk_main_avg{0.0};
+  double rerank_topk_delta_avg{0.0};
   std::vector<std::string> worst_queries;
   std::vector<MinibatchRecord> minibatches;
 };
@@ -545,6 +557,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return error_status;
   }
 
+  uint64_t rerank_topk_main_total = 0;
+  uint64_t rerank_topk_delta_total = 0;
   for (uint32_t qi = 0; qi < nq; ++qi) {
     Eigen::VectorXf q = queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
     Timer merge_timer;
@@ -570,6 +584,13 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     row.reserve(merged.topk.size());
     for (const auto& cand : merged.topk) {
       row.push_back(cand.doc_id);
+      if (config.enable_rerank_source_diag) {
+        if (cand.from_new == 1) {
+          rerank_topk_delta_total++;
+        } else {
+          rerank_topk_main_total++;
+        }
+      }
     }
     predictions[static_cast<size_t>(qi)] = std::move(row);
     search_ms[static_cast<size_t>(qi)] = q_search_ms;
@@ -829,6 +850,23 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.scanned_max = scanned_max;
   metrics.query_eval_ms = wall_elapsed_ms;
   metrics.query_count = nq;
+  if (config.enable_rerank_source_diag) {
+    metrics.rerank_topk_main_total = rerank_topk_main_total;
+    metrics.rerank_topk_delta_total = rerank_topk_delta_total;
+    const uint64_t rerank_topk_total = rerank_topk_main_total + rerank_topk_delta_total;
+    if (rerank_topk_total > 0) {
+      metrics.rerank_topk_main_ratio =
+          static_cast<double>(rerank_topk_main_total) / static_cast<double>(rerank_topk_total);
+      metrics.rerank_topk_delta_ratio =
+          static_cast<double>(rerank_topk_delta_total) / static_cast<double>(rerank_topk_total);
+    }
+    if (nq > 0) {
+      metrics.rerank_topk_main_avg =
+          static_cast<double>(rerank_topk_main_total) / static_cast<double>(nq);
+      metrics.rerank_topk_delta_avg =
+          static_cast<double>(rerank_topk_delta_total) / static_cast<double>(nq);
+    }
+  }
   if (config.enable_miss_diag) {
     metrics.gt_probed_rate =
         gt_total > 0 ? static_cast<double>(gt_probed) / static_cast<double>(gt_total) : 0.0;
@@ -1192,6 +1230,12 @@ int main(int argc, char** argv) {
     snap.miss_not_probed = metrics.miss_not_probed;
     snap.miss_probed_filtered_by_pq = metrics.miss_probed_filtered_by_pq;
     snap.pq_rank_loss_count = metrics.pq_rank_loss_count;
+    snap.rerank_topk_main_total = metrics.rerank_topk_main_total;
+    snap.rerank_topk_delta_total = metrics.rerank_topk_delta_total;
+    snap.rerank_topk_main_ratio = metrics.rerank_topk_main_ratio;
+    snap.rerank_topk_delta_ratio = metrics.rerank_topk_delta_ratio;
+    snap.rerank_topk_main_avg = metrics.rerank_topk_main_avg;
+    snap.rerank_topk_delta_avg = metrics.rerank_topk_delta_avg;
     snap.worst_queries = metrics.worst_queries;
     snap.minibatches = std::move(minibatches);
     snapshots.push_back(std::move(snap));
@@ -1452,6 +1496,17 @@ int main(int argc, char** argv) {
   } else {
     std::cout << "[MISS DIAG] disabled by config(enable_miss_diag=false)" << std::endl;
   }
+  if (config.enable_rerank_source_diag) {
+    std::cout << "[RERANK SOURCE DIAG] main_total=" << final_metrics.rerank_topk_main_total
+              << ", delta_total=" << final_metrics.rerank_topk_delta_total
+              << ", main_ratio=" << final_metrics.rerank_topk_main_ratio
+              << ", delta_ratio=" << final_metrics.rerank_topk_delta_ratio
+              << ", main_avg_topk=" << final_metrics.rerank_topk_main_avg
+              << ", delta_avg_topk=" << final_metrics.rerank_topk_delta_avg << std::endl;
+  } else {
+    std::cout << "[RERANK SOURCE DIAG] disabled by config(enable_rerank_source_diag=false)"
+              << std::endl;
+  }
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
@@ -1483,6 +1538,8 @@ int main(int argc, char** argv) {
   ofs << "    \"streaming_use_stream_batch_size\": "
       << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
   ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
+  ofs << "    \"enable_rerank_source_diag\": "
+      << (config.enable_rerank_source_diag ? "true" : "false") << ",\n";
   ofs << "    \"exact_rerank_enable\": " << (config.exact_rerank_enable ? "true" : "false")
       << ",\n";
   ofs << "    \"exact_rerank_candidates_per_route\": "
@@ -1527,7 +1584,13 @@ int main(int argc, char** argv) {
   ofs << "    \"avg_pq_rank_loss\": " << final_metrics.avg_pq_rank_loss << ",\n";
   ofs << "    \"miss_not_probed\": " << final_metrics.miss_not_probed << ",\n";
   ofs << "    \"miss_probed_filtered_by_pq\": " << final_metrics.miss_probed_filtered_by_pq << ",\n";
-  ofs << "    \"pq_rank_loss_count\": " << final_metrics.pq_rank_loss_count << "\n";
+  ofs << "    \"pq_rank_loss_count\": " << final_metrics.pq_rank_loss_count << ",\n";
+  ofs << "    \"rerank_topk_main_total\": " << final_metrics.rerank_topk_main_total << ",\n";
+  ofs << "    \"rerank_topk_delta_total\": " << final_metrics.rerank_topk_delta_total << ",\n";
+  ofs << "    \"rerank_topk_main_ratio\": " << final_metrics.rerank_topk_main_ratio << ",\n";
+  ofs << "    \"rerank_topk_delta_ratio\": " << final_metrics.rerank_topk_delta_ratio << ",\n";
+  ofs << "    \"rerank_topk_main_avg\": " << final_metrics.rerank_topk_main_avg << ",\n";
+  ofs << "    \"rerank_topk_delta_avg\": " << final_metrics.rerank_topk_delta_avg << "\n";
   ofs << "  },\n";
   ofs << "  \"pre_stream_metrics\": ";
   if (pre_stream_metrics.has_value()) {
@@ -1548,6 +1611,17 @@ int main(int argc, char** argv) {
     ofs << "    \"miss_probed_filtered_by_pq\": "
         << pre_stream_metrics->miss_probed_filtered_by_pq << ",\n";
     ofs << "    \"pq_rank_loss_count\": " << pre_stream_metrics->pq_rank_loss_count << ",\n";
+    ofs << "    \"rerank_topk_main_total\": " << pre_stream_metrics->rerank_topk_main_total
+        << ",\n";
+    ofs << "    \"rerank_topk_delta_total\": " << pre_stream_metrics->rerank_topk_delta_total
+        << ",\n";
+    ofs << "    \"rerank_topk_main_ratio\": " << pre_stream_metrics->rerank_topk_main_ratio
+        << ",\n";
+    ofs << "    \"rerank_topk_delta_ratio\": " << pre_stream_metrics->rerank_topk_delta_ratio
+        << ",\n";
+    ofs << "    \"rerank_topk_main_avg\": " << pre_stream_metrics->rerank_topk_main_avg << ",\n";
+    ofs << "    \"rerank_topk_delta_avg\": " << pre_stream_metrics->rerank_topk_delta_avg
+        << ",\n";
     ofs << "    \"worst_queries\": [\n";
     for (size_t wi = 0; wi < pre_stream_metrics->worst_queries.size(); ++wi) {
       ofs << "      \"" << pre_stream_metrics->worst_queries[wi] << "\"";
@@ -1609,6 +1683,12 @@ int main(int argc, char** argv) {
     ofs << "      \"miss_not_probed\": " << snap.miss_not_probed << ",\n";
     ofs << "      \"miss_probed_filtered_by_pq\": " << snap.miss_probed_filtered_by_pq << ",\n";
     ofs << "      \"pq_rank_loss_count\": " << snap.pq_rank_loss_count << ",\n";
+    ofs << "      \"rerank_topk_main_total\": " << snap.rerank_topk_main_total << ",\n";
+    ofs << "      \"rerank_topk_delta_total\": " << snap.rerank_topk_delta_total << ",\n";
+    ofs << "      \"rerank_topk_main_ratio\": " << snap.rerank_topk_main_ratio << ",\n";
+    ofs << "      \"rerank_topk_delta_ratio\": " << snap.rerank_topk_delta_ratio << ",\n";
+    ofs << "      \"rerank_topk_main_avg\": " << snap.rerank_topk_main_avg << ",\n";
+    ofs << "      \"rerank_topk_delta_avg\": " << snap.rerank_topk_delta_avg << ",\n";
     ofs << "      \"worst_queries\": [\n";
     for (size_t wi = 0; wi < snap.worst_queries.size(); ++wi) {
       ofs << "        \"" << snap.worst_queries[wi] << "\"";

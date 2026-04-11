@@ -22,6 +22,7 @@ struct Config {
   uint32_t max_queries{0};
   uint32_t snapshot_interval{0};
   bool enable_miss_diag{true};
+  bool enable_rerank_source_diag{false};
   bool exact_rerank_enable{false};
   uint32_t exact_rerank_candidates_per_route{0};
   bool enable_streaming{false};

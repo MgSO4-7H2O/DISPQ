@@ -13,6 +13,7 @@
   "max_queries": 1000,
   "snapshot_interval": 5000,
   "enable_miss_diag": true,
+  "enable_rerank_source_diag": false,
   "exact_rerank_enable": true,
   "exact_rerank_candidates_per_route": 300,
   "enable_streaming": true,
