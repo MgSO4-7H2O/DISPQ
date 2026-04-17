@@ -78,6 +78,11 @@ struct PQRuntimeState {
   uint64_t ntotal{0};
 };
 
+struct PartitionPatch {
+  std::vector<uint32_t> partition_ids;
+  std::vector<AlignedVector<VectorRecord>> replacement_records;
+};
+
 class IVFIndex {
  public:
   virtual ~IVFIndex() = default;
@@ -112,6 +117,15 @@ class IVFIndex {
   virtual Result<PQRuntimeState> GetPQRuntimeState(const VersionSet& route_versions) const = 0;
   virtual Result<std::vector<uint8_t>> GetDocPQCode(const VersionSet& route_versions,
                                                     DocId doc_id) const = 0;
+  virtual Result<AlignedVector<VectorRecord>> SnapshotRecords(
+      const VersionSet& route_versions) const = 0;
+  virtual Result<AlignedVector<VectorRecord>> GetPartitionRecords(
+      const VersionSet& route_versions,
+      uint32_t partition_id) const = 0;
+  virtual Result<std::vector<uint32_t>> GetPartitionSizes(
+      const VersionSet& route_versions) const = 0;
+  virtual Status CommitPartitionPatch(const VersionSet& route_versions,
+                                      const PartitionPatch& patch) = 0;
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;

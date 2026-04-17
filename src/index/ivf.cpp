@@ -988,6 +988,178 @@ class KMeansIVFIndex : public IVFIndex {
     return Status::NotFound("doc_id not found");
   }
 
+  Result<AlignedVector<VectorRecord>> SnapshotRecords(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    const IndexData& data = *it->second;
+    AlignedVector<VectorRecord> out;
+    out.reserve(static_cast<size_t>(data.ntotal));
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      const auto& list = data.lists[static_cast<size_t>(list_id)];
+      for (const auto& entry : list) {
+        VectorRecord rec;
+        rec.doc_id = entry.doc_id;
+        rec.dim = data.dim;
+        rec.versions = entry.versions;
+        rec.versions.index_version = data.version;
+        rec.ivf_id = list_id;
+        rec.x = entry.vector;
+        out.push_back(std::move(rec));
+      }
+    }
+    return out;
+  }
+
+  Result<AlignedVector<VectorRecord>> GetPartitionRecords(
+      const VersionSet& route_versions,
+      uint32_t partition_id) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    const IndexData& data = *it->second;
+    if (partition_id >= data.nlist) {
+      return Status::InvalidArgument("partition_id out of range");
+    }
+    const auto& list = data.lists[static_cast<size_t>(partition_id)];
+    AlignedVector<VectorRecord> out;
+    out.reserve(list.size());
+    for (const auto& entry : list) {
+      VectorRecord rec;
+      rec.doc_id = entry.doc_id;
+      rec.dim = data.dim;
+      rec.versions = entry.versions;
+      rec.versions.index_version = data.version;
+      rec.ivf_id = partition_id;
+      rec.x = entry.vector;
+      out.push_back(std::move(rec));
+    }
+    return out;
+  }
+
+  Result<std::vector<uint32_t>> GetPartitionSizes(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    const IndexData& data = *it->second;
+    std::vector<uint32_t> sizes(data.nlist, 0);
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      sizes[static_cast<size_t>(list_id)] =
+          static_cast<uint32_t>(data.lists[static_cast<size_t>(list_id)].size());
+    }
+    return sizes;
+  }
+
+  Status CommitPartitionPatch(const VersionSet& route_versions,
+                              const PartitionPatch& patch) override {
+    if (patch.partition_ids.size() != patch.replacement_records.size()) {
+      return Status::InvalidArgument(
+          "CommitPartitionPatch: partition_ids size mismatch with replacement_records");
+    }
+
+    std::unique_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    IndexData& data = *it->second;
+    std::unordered_set<uint32_t> patch_partitions;
+    patch_partitions.reserve(patch.partition_ids.size());
+    for (uint32_t partition_id : patch.partition_ids) {
+      if (partition_id >= data.nlist) {
+        return Status::InvalidArgument("CommitPartitionPatch: partition_id out of range");
+      }
+      if (!patch_partitions.insert(partition_id).second) {
+        return Status::InvalidArgument("CommitPartitionPatch: duplicate partition_id");
+      }
+    }
+
+    std::unordered_set<DocId> unaffected_doc_ids;
+    unaffected_doc_ids.reserve(data.doc_ids.size());
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      if (patch_partitions.find(list_id) != patch_partitions.end()) {
+        continue;
+      }
+      const auto& list = data.lists[static_cast<size_t>(list_id)];
+      for (const auto& entry : list) {
+        unaffected_doc_ids.insert(entry.doc_id);
+      }
+    }
+
+    std::unordered_set<DocId> patch_doc_ids;
+    patch_doc_ids.reserve(data.doc_ids.size());
+    for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
+      const auto& records = patch.replacement_records[i];
+      for (const auto& rec : records) {
+        if (static_cast<uint32_t>(rec.x.size()) != data.dim) {
+          return Status::InvalidArgument("CommitPartitionPatch: record dim mismatch");
+        }
+        if (!patch_doc_ids.insert(rec.doc_id).second) {
+          return Status::AlreadyExists("CommitPartitionPatch: duplicate doc_id in patch");
+        }
+        if (unaffected_doc_ids.find(rec.doc_id) != unaffected_doc_ids.end()) {
+          return Status::AlreadyExists(
+              "CommitPartitionPatch: doc_id collides with unaffected partitions");
+        }
+      }
+    }
+
+    for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
+      const uint32_t partition_id = patch.partition_ids[i];
+      const auto& records = patch.replacement_records[i];
+      auto& dst = data.lists[static_cast<size_t>(partition_id)];
+      dst.clear();
+      dst.reserve(records.size());
+      for (const auto& rec : records) {
+        ListEntry entry;
+        entry.doc_id = rec.doc_id;
+        entry.versions = rec.versions;
+        entry.versions.index_version = data.version;
+        entry.vector = rec.x;
+        if (data.use_pq) {
+          entry.pq_code.resize(data.M);
+          Eigen::VectorXf residual = rec.x;
+          if (data.pq_residual) {
+            residual -=
+                data.routing_centroids.row(static_cast<Eigen::Index>(partition_id)).transpose();
+          }
+          for (uint32_t m = 0; m < data.M; ++m) {
+            const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
+            Eigen::Map<const Eigen::VectorXf> sub(
+                residual.data() + static_cast<Eigen::Index>(m * data.dsub),
+                static_cast<Eigen::Index>(data.dsub));
+            entry.pq_code[static_cast<size_t>(m)] =
+                static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
+          }
+        } else {
+          entry.norm = rec.x.squaredNorm();
+        }
+        dst.push_back(std::move(entry));
+      }
+    }
+
+    data.doc_ids.clear();
+    data.doc_to_list.clear();
+    data.ntotal = 0;
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      const auto& list = data.lists[static_cast<size_t>(list_id)];
+      for (const auto& entry : list) {
+        data.doc_ids.insert(entry.doc_id);
+        data.doc_to_list[entry.doc_id] = list_id;
+        ++data.ntotal;
+      }
+    }
+    return Status::OK();
+  }
+
   Result<std::vector<uint8_t>> Serialize() const override { return std::vector<uint8_t>{}; }
 
   Status Deserialize(const std::vector<uint8_t>&) override { return Status::OK(); }

@@ -12,6 +12,7 @@ add_library(ann
   src/common/serialization.cpp
   src/whitening/whitening.cpp
   src/index/ivf.cpp
+  src/index/merge.cpp
   src/index/postings.cpp
   src/search/hybrid_search.cpp
   src/search/exact_search.cpp
@@ -44,7 +45,12 @@ add_executable(test_online_pq tests/test_online_pq.cpp)
 target_link_libraries(test_online_pq PRIVATE ann)
 ann_set_warnings(test_online_pq)
 
+add_executable(test_merge tests/test_merge.cpp)
+target_link_libraries(test_merge PRIVATE ann)
+ann_set_warnings(test_merge)
+
 enable_testing()
 add_test(NAME test_interfaces COMMAND test_interfaces)
 add_test(NAME test_recall_smoke COMMAND test_recall_smoke)
 add_test(NAME test_online_pq COMMAND test_online_pq)
+add_test(NAME test_merge COMMAND test_merge)

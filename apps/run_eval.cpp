@@ -25,6 +25,7 @@
 #include "common/types.h"
 #include "eval/metrics.h"
 #include "index/ivf.h"
+#include "index/merge.h"
 #include "search/exact_search.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
@@ -35,6 +36,9 @@ namespace {
 
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
+constexpr double kMergeScoreAlphaDefault = 1.0;
+constexpr double kMergeScoreBetaDefault = 0.05;
+constexpr double kMergeScoreThresholdDefault = 1.0;
 
 MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
   std::mt19937 gen(seed);
@@ -155,6 +159,7 @@ struct MinibatchRecord {
 struct SnapshotRecord {
   uint32_t base_rows{0};
   uint32_t main_rows{0};
+  uint32_t frozen_delta_docs{0};
   uint32_t delta_rows{0};
   uint32_t active_delta_docs{0};
   uint32_t snapshot_rows{0};
@@ -419,6 +424,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                   VersionId whitening_version,
                                   const std::shared_ptr<IVFIndex>& main_ivf,
                                   const VersionSet& main_versions,
+                                  const std::optional<DeltaShard>& frozen_delta,
                                   const std::optional<DeltaShard>& active_delta,
                                   const SearchParams& params) {
   if (seen_rows == 0 || seen_rows > static_cast<uint32_t>(base_whitened.rows())) {
@@ -431,26 +437,61 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return Status::InvalidArgument("EvaluateState: main index is null");
   }
 
-  const uint32_t active_docs = (active_delta.has_value() ? active_delta->rows : 0u);
-  if (active_docs > seen_rows) {
-    return Status::InvalidArgument("EvaluateState: invalid active docs");
+  auto main_records_res = main_ivf->SnapshotRecords(main_versions);
+  if (!main_records_res.ok()) {
+    return main_records_res.status();
   }
-  const uint32_t searchable_rows = main_rows + active_docs;
-  MatrixRM searchable_db(searchable_rows, base_whitened.cols());
-  std::vector<DocId> searchable_doc_ids(static_cast<size_t>(searchable_rows));
-  if (main_rows > 0) {
-    searchable_db.topRows(main_rows) = base_whitened.topRows(main_rows);
-    for (uint32_t i = 0; i < main_rows; ++i) {
-      searchable_doc_ids[static_cast<size_t>(i)] = i;
+
+  std::vector<DocId> searchable_doc_ids;
+  searchable_doc_ids.reserve(main_records_res.value().size() +
+                             (frozen_delta.has_value() ? frozen_delta->rows : 0u) +
+                             (active_delta.has_value() ? active_delta->rows : 0u));
+  std::unordered_set<DocId> searchable_seen;
+  searchable_seen.reserve(searchable_doc_ids.capacity() * 2 + 1);
+  auto append_unique = [&](const AlignedVector<VectorRecord>& records) -> Status {
+    for (const auto& rec : records) {
+      if (rec.doc_id >= seen_rows) {
+        return Status::InvalidArgument("EvaluateState: route doc_id exceeds seen_rows");
+      }
+      if (searchable_seen.insert(rec.doc_id).second) {
+        searchable_doc_ids.push_back(rec.doc_id);
+      }
+    }
+    return Status::OK();
+  };
+
+  Status append_main = append_unique(main_records_res.value());
+  if (!append_main.ok()) {
+    return append_main;
+  }
+  if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
+    auto frozen_records_res = frozen_delta->ivf->SnapshotRecords(frozen_delta->versions);
+    if (!frozen_records_res.ok()) {
+      return frozen_records_res.status();
+    }
+    Status append_frozen = append_unique(frozen_records_res.value());
+    if (!append_frozen.ok()) {
+      return append_frozen;
     }
   }
-  if (active_docs > 0) {
-    const uint32_t active_begin = seen_rows - active_docs;
-    searchable_db.middleRows(main_rows, active_docs) =
-        base_whitened.middleRows(active_begin, active_docs);
-    for (uint32_t i = 0; i < active_docs; ++i) {
-      searchable_doc_ids[static_cast<size_t>(main_rows + i)] = active_begin + i;
+  if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
+    auto active_records_res = active_delta->ivf->SnapshotRecords(active_delta->versions);
+    if (!active_records_res.ok()) {
+      return active_records_res.status();
     }
+    Status append_active = append_unique(active_records_res.value());
+    if (!append_active.ok()) {
+      return append_active;
+    }
+  }
+  if (searchable_doc_ids.empty()) {
+    return Status::InvalidArgument("EvaluateState: no searchable docs");
+  }
+
+  MatrixRM searchable_db(searchable_doc_ids.size(), base_whitened.cols());
+  for (size_t i = 0; i < searchable_doc_ids.size(); ++i) {
+    searchable_db.row(static_cast<Eigen::Index>(i)) =
+        base_whitened.row(static_cast<Eigen::Index>(searchable_doc_ids[i]));
   }
 
   auto gt_res = ExactSearchBatch(queries_whitened, searchable_db, config.topk);
@@ -469,6 +510,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 
   std::vector<SearchRoute> routes;
   routes.push_back(SearchRoute{main_ivf, main_versions, 0});
+  if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
+    routes.push_back(SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1});
+  }
   if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
     routes.push_back(SearchRoute{active_delta->ivf, active_delta->versions, 1});
   }
@@ -809,12 +853,14 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   double avg_whiten = 0.0;
   double avg_search = 0.0;
   double avg_total = 0.0;
+  double total_latency_sum_ms = 0.0;
   if (nq > 0) {
     avg_whiten =
         std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) / static_cast<double>(nq);
     avg_search =
         std::accumulate(search_ms.begin(), search_ms.end(), 0.0) / static_cast<double>(nq);
     avg_total = std::accumulate(total_ms.begin(), total_ms.end(), 0.0) / static_cast<double>(nq);
+    total_latency_sum_ms = std::accumulate(total_ms.begin(), total_ms.end(), 0.0);
   }
 
   double scanned_avg = 0.0;
@@ -829,8 +875,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
   }
 
-  const double qps =
-      wall_elapsed_ms > 0.0 ? (static_cast<double>(nq) / (wall_elapsed_ms / 1000.0)) : 0.0;
+  const double qps = total_latency_sum_ms > 0.0
+                         ? (1000.0 * static_cast<double>(nq) / total_latency_sum_ms)
+                         : 0.0;
 
   EvalMetrics metrics;
   metrics.recall = recall_res.value();
@@ -1089,6 +1136,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::optional<DeltaShard> active_delta;
+  std::optional<DeltaShard> frozen_delta;
+  std::deque<DocId> sliding_window_doc_ids;
+  uint32_t next_delta_shard_id = 2;
+  uint32_t active_delta_new_rows = 0;
+  MergeOptions merge_options;
+  merge_options.alpha = kMergeScoreAlphaDefault;
+  merge_options.beta = kMergeScoreBetaDefault;
+  merge_options.recluster_threshold = kMergeScoreThresholdDefault;
   if (config.enable_streaming && rows_after_main > 0) {
     // Train delta with the reserved window, then preload the same window as existing delta docs.
     MatrixRM delta_train = X_whitened.middleRows(main_rows_initial, delta_train_rows);
@@ -1112,6 +1167,61 @@ int main(int argc, char** argv) {
     }
     active_delta->rows = delta_train_rows;
   }
+
+  auto BuildActiveDeltaFromRecentWindow = [&](uint32_t end_row) -> Result<DeltaShard> {
+    if (delta_train_rows == 0) {
+      return Status::InvalidArgument("BuildActiveDeltaFromRecentWindow: delta_train_rows is 0");
+    }
+    if (end_row <= main_rows_initial) {
+      return Status::InvalidArgument("BuildActiveDeltaFromRecentWindow: not enough rows");
+    }
+    const uint32_t available = end_row - main_rows_initial;
+    const uint32_t train_rows = std::min<uint32_t>(delta_train_rows, available);
+    const uint32_t train_begin = end_row - train_rows;
+    MatrixRM delta_train = X_whitened.middleRows(train_begin, train_rows);
+    IVFParams delta_params = ivf_params;
+    delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
+    auto active_res =
+        BuildDeltaShard(delta_train, delta_params, whiten_version, next_delta_shard_id++);
+    if (!active_res.ok()) {
+      return active_res.status();
+    }
+    DeltaShard shard = active_res.value();
+    shard.rows = 0;
+    return shard;
+  };
+
+  auto FreezeActiveDeltaWindow = [&](uint32_t end_row) -> Status {
+    if (delta_train_rows == 0) {
+      return Status::InvalidArgument("FreezeActiveDeltaWindow: delta_train_rows is 0");
+    }
+    if (!active_delta.has_value()) {
+      return Status::InvalidArgument("FreezeActiveDeltaWindow: active_delta is missing");
+    }
+    if (frozen_delta.has_value()) {
+      return Status::AlreadyExists("FreezeActiveDeltaWindow: frozen_delta already exists");
+    }
+    if (active_delta->rows < delta_train_rows) {
+      return Status::InvalidArgument(
+          "FreezeActiveDeltaWindow: active_delta rows less than one window");
+    }
+    if (active_delta->rows > delta_train_rows) {
+      return Status::InvalidArgument(
+          "FreezeActiveDeltaWindow: active_delta rows exceed one window");
+    }
+    frozen_delta = active_delta;
+    auto next_active_res = BuildActiveDeltaFromRecentWindow(end_row);
+    if (!next_active_res.ok()) {
+      return next_active_res.status();
+    }
+    active_delta = next_active_res.value();
+    active_delta_new_rows = 0;
+    sliding_window_doc_ids.clear();
+    std::cout << "[MERGE] freeze_delta rows=" << frozen_delta->rows
+              << ", start background-style merge window with active_delta shard="
+              << active_delta->shard_id << std::endl;
+    return Status::OK();
+  };
   double rebuild_ms_total = init_timer.ElapsedMillis();
 
   OnlinePQUpdateOptions online_pq_options;
@@ -1145,7 +1255,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::deque<DocId> sliding_window_doc_ids;
   if (active_delta.has_value() && delta_train_rows > 0) {
     for (uint32_t i = main_rows_initial; i < stream_start_idx; ++i) {
       sliding_window_doc_ids.push_back(i);
@@ -1182,6 +1291,7 @@ int main(int argc, char** argv) {
                              whiten_version,
                              main_ivf,
                              main_versions,
+                             frozen_delta,
                              active_delta,
                              params);
     if (!res.ok()) {
@@ -1203,6 +1313,7 @@ int main(int argc, char** argv) {
     SnapshotRecord snap;
     snap.base_rows = active_rows;
     snap.main_rows = main_rows_current;
+    snap.frozen_delta_docs = frozen_delta.has_value() ? frozen_delta->rows : 0;
     snap.delta_rows = active_rows > main_rows_initial ? active_rows - main_rows_initial : 0;
     snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
     snap.snapshot_rows = active_rows >= last_snapshot_active_rows ? active_rows - last_snapshot_active_rows : 0;
@@ -1269,7 +1380,21 @@ int main(int argc, char** argv) {
     std::vector<MinibatchRecord> snapshot_minibatches;
 
     while (next_insert_idx < nx) {
+      if (delta_train_rows > 0 && !frozen_delta.has_value() && active_delta.has_value() &&
+          active_delta->rows >= delta_train_rows) {
+        Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx);
+        if (!freeze_status.ok()) {
+          std::cerr << freeze_status.ToString() << std::endl;
+          return 1;
+        }
+      }
+
       uint32_t chunk = std::min<uint32_t>(insert_step, nx - next_insert_idx);
+      if (delta_train_rows > 0 && active_delta.has_value() &&
+          active_delta->rows < delta_train_rows) {
+        const uint32_t remaining = delta_train_rows - active_delta->rows;
+        chunk = std::min<uint32_t>(chunk, remaining);
+      }
       if (collect_snapshots && inserted_rows < total_stream_rows) {
         const uint32_t rows_until_snapshot = next_snapshot_target - inserted_rows;
         if (rows_until_snapshot > 0) {
@@ -1355,6 +1480,7 @@ int main(int argc, char** argv) {
         } else {
           active_delta->rows += chunk;
         }
+        active_delta_new_rows += chunk;
       }
       const double step_update_ms = update_timer.ElapsedMillis();
 
@@ -1362,6 +1488,17 @@ int main(int argc, char** argv) {
       inserted_rows = next_insert_idx - stream_start_idx;
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
+
+      const bool can_start_merge = delta_train_rows > 0 && !frozen_delta.has_value() &&
+                                   active_delta.has_value() &&
+                                   active_delta->rows >= delta_train_rows;
+      if (can_start_merge) {
+        Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx);
+        if (!freeze_status.ok()) {
+          std::cerr << freeze_status.ToString() << std::endl;
+          return 1;
+        }
+      }
 
       std::optional<EvalMetrics> batch_metrics;
       if (eval_after_each_minibatch) {
@@ -1430,6 +1567,35 @@ int main(int argc, char** argv) {
                                                  : std::vector<MinibatchRecord>{});
         snapshot_minibatches.clear();
         pending_update_ms = 0.0;
+      }
+
+      const bool active_window_ready =
+          delta_train_rows > 0 && active_delta.has_value() &&
+          active_delta->rows >= delta_train_rows;
+      const bool should_commit_merge =
+          frozen_delta.has_value() && (next_insert_idx == nx || active_window_ready);
+      if (should_commit_merge) {
+        Timer merge_commit_timer;
+        auto merge_res = merge_frozen_delta_into_main(main_ivf,
+                                                      main_versions,
+                                                      frozen_delta->ivf,
+                                                      frozen_delta->versions,
+                                                      merge_options);
+        if (!merge_res.ok()) {
+          std::cerr << merge_res.status().ToString() << std::endl;
+          return 1;
+        }
+        const double merge_commit_ms = merge_commit_timer.ElapsedMillis();
+        rebuild_ms_total += merge_commit_ms;
+        main_rows_current = std::min<uint32_t>(
+            next_insert_idx, main_rows_current + merge_res.value().frozen_records);
+        std::cout << "[MERGE] commit done: frozen_rows=" << merge_res.value().frozen_records
+                  << ", patched_partitions=" << merge_res.value().patch_partitions
+                  << ", append_parts=" << merge_res.value().append_partitions
+                  << ", recluster_parts=" << merge_res.value().recluster_partitions
+                  << ", merge_ms=" << merge_commit_ms << std::endl;
+        frozen_delta.reset();
+        active_delta_new_rows = 0;
       }
     }
   }
@@ -1658,6 +1824,7 @@ int main(int argc, char** argv) {
     ofs << "    {\n";
     ofs << "      \"base_rows\": " << snap.base_rows << ",\n";
     ofs << "      \"main_rows\": " << snap.main_rows << ",\n";
+    ofs << "      \"frozen_delta_docs\": " << snap.frozen_delta_docs << ",\n";
     ofs << "      \"delta_rows\": " << snap.delta_rows << ",\n";
     ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
     ofs << "      \"snapshot_rows\": " << snap.snapshot_rows << ",\n";
