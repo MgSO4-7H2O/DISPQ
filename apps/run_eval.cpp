@@ -1068,10 +1068,14 @@ int main(int argc, char** argv) {
   const uint32_t rows_after_main = nx > main_rows_initial ? nx - main_rows_initial : 0;
   const uint32_t delta_train_rows =
       ResolveDeltaTrainRows(config, rows_after_main, insert_step, use_stream_batch_size);
+  const uint32_t merge_trigger_rows =
+      (config.merge_trigger_rows > 0) ? config.merge_trigger_rows : delta_train_rows;
   const uint32_t stream_start_idx = main_rows_initial + delta_train_rows;
   const uint32_t total_stream_rows = nx > stream_start_idx ? nx - stream_start_idx : 0;
   std::cout << "[INFO] main_rows=" << main_rows_initial
             << ", delta_train_rows=" << delta_train_rows
+            << ", merge_trigger_mode=" << config.merge_trigger_mode
+            << ", merge_trigger_rows=" << merge_trigger_rows
             << ", stream_rows=" << total_stream_rows
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
@@ -1201,13 +1205,8 @@ int main(int argc, char** argv) {
     if (frozen_delta.has_value()) {
       return Status::AlreadyExists("FreezeActiveDeltaWindow: frozen_delta already exists");
     }
-    if (active_delta->rows < delta_train_rows) {
-      return Status::InvalidArgument(
-          "FreezeActiveDeltaWindow: active_delta rows less than one window");
-    }
-    if (active_delta->rows > delta_train_rows) {
-      return Status::InvalidArgument(
-          "FreezeActiveDeltaWindow: active_delta rows exceed one window");
+    if (active_delta->rows == 0) {
+      return Status::InvalidArgument("FreezeActiveDeltaWindow: active_delta is empty");
     }
     frozen_delta = active_delta;
     auto next_active_res = BuildActiveDeltaFromRecentWindow(end_row);
@@ -1263,6 +1262,32 @@ int main(int argc, char** argv) {
 
   OnlinePQRollup online_pq_rollup;
   OnlinePQUpdateStats last_online_pq_stats;
+  auto ShouldFreezeForMerge = [&](const DeltaShard& shard,
+                                  uint32_t inserted_rows_since_create,
+                                  const OnlinePQUpdateStats& pq_stats) -> bool {
+    if (delta_train_rows == 0 || shard.rows == 0 || inserted_rows_since_create == 0) {
+      return false;
+    }
+    const bool rows_trigger =
+        merge_trigger_rows > 0 && inserted_rows_since_create >= merge_trigger_rows;
+    const bool qe_ratio_trigger =
+        config.merge_trigger_qe_ratio > 0.0 &&
+        pq_stats.qe_ratio >= config.merge_trigger_qe_ratio;
+    const bool drift_trigger =
+        config.merge_trigger_drift > 0.0 &&
+        pq_stats.codebook_drift_l2 >= config.merge_trigger_drift;
+
+    if (config.merge_trigger_mode == "rows") {
+      return rows_trigger;
+    }
+    if (config.merge_trigger_mode == "qe_ratio") {
+      return qe_ratio_trigger;
+    }
+    if (config.merge_trigger_mode == "drift") {
+      return drift_trigger;
+    }
+    return rows_trigger || qe_ratio_trigger || drift_trigger;
+  };
 
   std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
   std::error_code ec;
@@ -1380,8 +1405,8 @@ int main(int argc, char** argv) {
     std::vector<MinibatchRecord> snapshot_minibatches;
 
     while (next_insert_idx < nx) {
-      if (delta_train_rows > 0 && !frozen_delta.has_value() && active_delta.has_value() &&
-          active_delta->rows >= delta_train_rows) {
+      if (!frozen_delta.has_value() && active_delta.has_value() &&
+          ShouldFreezeForMerge(active_delta.value(), active_delta_new_rows, last_online_pq_stats)) {
         Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx);
         if (!freeze_status.ok()) {
           std::cerr << freeze_status.ToString() << std::endl;
@@ -1390,11 +1415,6 @@ int main(int argc, char** argv) {
       }
 
       uint32_t chunk = std::min<uint32_t>(insert_step, nx - next_insert_idx);
-      if (delta_train_rows > 0 && active_delta.has_value() &&
-          active_delta->rows < delta_train_rows) {
-        const uint32_t remaining = delta_train_rows - active_delta->rows;
-        chunk = std::min<uint32_t>(chunk, remaining);
-      }
       if (collect_snapshots && inserted_rows < total_stream_rows) {
         const uint32_t rows_until_snapshot = next_snapshot_target - inserted_rows;
         if (rows_until_snapshot > 0) {
@@ -1489,9 +1509,10 @@ int main(int argc, char** argv) {
       total_update_ms += step_update_ms;
       pending_update_ms += step_update_ms;
 
-      const bool can_start_merge = delta_train_rows > 0 && !frozen_delta.has_value() &&
-                                   active_delta.has_value() &&
-                                   active_delta->rows >= delta_train_rows;
+      const bool can_start_merge = !frozen_delta.has_value() && active_delta.has_value() &&
+                                   ShouldFreezeForMerge(active_delta.value(),
+                                                        active_delta_new_rows,
+                                                        last_online_pq_stats);
       if (can_start_merge) {
         Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx);
         if (!freeze_status.ok()) {
@@ -1570,8 +1591,8 @@ int main(int argc, char** argv) {
       }
 
       const bool active_window_ready =
-          delta_train_rows > 0 && active_delta.has_value() &&
-          active_delta->rows >= delta_train_rows;
+          active_delta.has_value() &&
+          ShouldFreezeForMerge(active_delta.value(), active_delta_new_rows, last_online_pq_stats);
       const bool should_commit_merge =
           frozen_delta.has_value() && (next_insert_idx == nx || active_window_ready);
       if (should_commit_merge) {
@@ -1595,7 +1616,6 @@ int main(int argc, char** argv) {
                   << ", recluster_parts=" << merge_res.value().recluster_partitions
                   << ", merge_ms=" << merge_commit_ms << std::endl;
         frozen_delta.reset();
-        active_delta_new_rows = 0;
       }
     }
   }
@@ -1695,6 +1715,11 @@ int main(int argc, char** argv) {
   ofs << "    \"rows_after_main\": " << rows_after_main << ",\n";
   ofs << "    \"delta_train_window\": " << config.delta_train_window << ",\n";
   ofs << "    \"delta_train_rows\": " << delta_train_rows << ",\n";
+  ofs << "    \"merge_trigger_mode\": \"" << config.merge_trigger_mode << "\",\n";
+  ofs << "    \"merge_trigger_rows\": " << config.merge_trigger_rows << ",\n";
+  ofs << "    \"merge_trigger_rows_resolved\": " << merge_trigger_rows << ",\n";
+  ofs << "    \"merge_trigger_qe_ratio\": " << config.merge_trigger_qe_ratio << ",\n";
+  ofs << "    \"merge_trigger_drift\": " << config.merge_trigger_drift << ",\n";
   ofs << "    \"delta_kmeans_iterations\": " << kDeltaKMeansIterationsDefault << ",\n";
   ofs << "    \"stream_start_row\": " << stream_start_idx << ",\n";
   ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";

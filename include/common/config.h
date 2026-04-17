@@ -28,6 +28,15 @@ struct Config {
   bool enable_streaming{false};
   uint32_t main_index_rows{0};
   uint32_t delta_train_window{1};
+  // Merge trigger config is decoupled from delta training window.
+  // mode: "rows" | "qe_ratio" | "drift" | "hybrid".
+  std::string merge_trigger_mode{"rows"};
+  // Rows inserted into current active-delta since it was created.
+  // 0 means fallback to delta_train_rows for backward compatibility.
+  uint32_t merge_trigger_rows{0};
+  // Optional merge triggers; 0 means disabled.
+  double merge_trigger_qe_ratio{0.0};
+  double merge_trigger_drift{0.0};
   std::string streaming_mode{"streaming"};
   uint32_t stream_batch_size{100};
   bool streaming_use_stream_batch_size{false};

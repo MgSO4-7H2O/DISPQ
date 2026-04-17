@@ -74,6 +74,10 @@ std::string Config::ToString() const {
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
+      << "merge_trigger_mode=" << merge_trigger_mode << ", "
+      << "merge_trigger_rows=" << merge_trigger_rows << ", "
+      << "merge_trigger_qe_ratio=" << merge_trigger_qe_ratio << ", "
+      << "merge_trigger_drift=" << merge_trigger_drift << ", "
       << "streaming_mode=" << streaming_mode << ", "
       << "stream_batch_size=" << stream_batch_size << ", "
       << "streaming_use_stream_batch_size=" << std::boolalpha << streaming_use_stream_batch_size
@@ -129,6 +133,10 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
+  ExtractString(text, "merge_trigger_mode", &cfg.merge_trigger_mode);
+  ExtractUint(text, "merge_trigger_rows", &cfg.merge_trigger_rows);
+  ExtractDouble(text, "merge_trigger_qe_ratio", &cfg.merge_trigger_qe_ratio);
+  ExtractDouble(text, "merge_trigger_drift", &cfg.merge_trigger_drift);
   ExtractString(text, "streaming_mode", &cfg.streaming_mode);
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
   ExtractBool(text, "streaming_use_stream_batch_size", &cfg.streaming_use_stream_batch_size);
@@ -171,6 +179,30 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.enable_streaming && cfg.delta_train_window == 0) {
     return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");
+  }
+  if (cfg.merge_trigger_mode != "rows" && cfg.merge_trigger_mode != "qe_ratio" &&
+      cfg.merge_trigger_mode != "drift" && cfg.merge_trigger_mode != "hybrid") {
+    return Status::InvalidArgument(
+        "merge_trigger_mode must be one of \"rows\", \"qe_ratio\", \"drift\", \"hybrid\"");
+  }
+  if (cfg.merge_trigger_qe_ratio < 0.0) {
+    return Status::InvalidArgument("merge_trigger_qe_ratio must be >= 0");
+  }
+  if (cfg.merge_trigger_drift < 0.0) {
+    return Status::InvalidArgument("merge_trigger_drift must be >= 0");
+  }
+  if (cfg.merge_trigger_mode == "qe_ratio" && cfg.merge_trigger_qe_ratio <= 0.0) {
+    return Status::InvalidArgument(
+        "merge_trigger_qe_ratio must be > 0 when merge_trigger_mode=\"qe_ratio\"");
+  }
+  if (cfg.merge_trigger_mode == "drift" && cfg.merge_trigger_drift <= 0.0) {
+    return Status::InvalidArgument(
+        "merge_trigger_drift must be > 0 when merge_trigger_mode=\"drift\"");
+  }
+  if (cfg.merge_trigger_mode == "hybrid" && cfg.merge_trigger_rows == 0 &&
+      cfg.merge_trigger_qe_ratio <= 0.0 && cfg.merge_trigger_drift <= 0.0) {
+    return Status::InvalidArgument(
+        "hybrid merge trigger needs at least one enabled trigger: rows/qe_ratio/drift");
   }
   if (cfg.online_pq_update_scheme != "minibatch" &&
       cfg.online_pq_update_scheme != "sliding_window") {
