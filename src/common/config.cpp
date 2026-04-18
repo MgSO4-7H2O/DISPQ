@@ -59,6 +59,7 @@ std::string Config::ToString() const {
       << "nprobe=" << nprobe << ", "
       << "use_whitening=" << std::boolalpha << use_whitening << ", "
       << "enable_dual_route=" << std::boolalpha << enable_dual_route << ", "
+      << "main_query_only=" << std::boolalpha << main_query_only << ", "
       << "dim=" << dim << ", "
       << "seed=" << seed << ", "
       << "pq_enable=" << std::boolalpha << pq_enable << ", "
@@ -74,6 +75,7 @@ std::string Config::ToString() const {
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
+      << "delta_ivf_nlist=" << delta_ivf_nlist << ", "
       << "merge_trigger_mode=" << merge_trigger_mode << ", "
       << "merge_trigger_rows=" << merge_trigger_rows << ", "
       << "merge_trigger_qe_ratio=" << merge_trigger_qe_ratio << ", "
@@ -118,6 +120,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "seed", &cfg.seed);
   ExtractBool(text, "use_whitening", &cfg.use_whitening);
   ExtractBool(text, "enable_dual_route", &cfg.enable_dual_route);
+  ExtractBool(text, "main_query_only", &cfg.main_query_only);
   ExtractBool(text, "pq_enable", &cfg.pq_enable);
   ExtractUint(text, "pq_m", &cfg.pq_m);
   ExtractUint(text, "pq_nbits", &cfg.pq_nbits);
@@ -133,6 +136,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
+  ExtractUint(text, "delta_ivf_nlist", &cfg.delta_ivf_nlist);
   ExtractString(text, "merge_trigger_mode", &cfg.merge_trigger_mode);
   ExtractUint(text, "merge_trigger_rows", &cfg.merge_trigger_rows);
   ExtractDouble(text, "merge_trigger_qe_ratio", &cfg.merge_trigger_qe_ratio);

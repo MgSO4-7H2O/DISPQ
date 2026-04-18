@@ -13,6 +13,8 @@ struct Config {
   uint32_t nprobe{8};
   bool use_whitening{true};
   bool enable_dual_route{true};
+  // When true, query only main index route and skip delta routes.
+  bool main_query_only{false};
   uint32_t dim{128};
   uint32_t seed{42};
   bool pq_enable{false};
@@ -28,10 +30,12 @@ struct Config {
   bool enable_streaming{false};
   uint32_t main_index_rows{0};
   uint32_t delta_train_window{1};
+  // 0 means fallback to ivf_nlist.
+  uint32_t delta_ivf_nlist{0};
   // Merge trigger config is decoupled from delta training window.
   // mode: "rows" | "qe_ratio" | "drift" | "hybrid".
   std::string merge_trigger_mode{"rows"};
-  // Rows inserted into current active-delta since it was created.
+  // Row upper bound of current active-delta (including warm-up vectors).
   // 0 means fallback to delta_train_rows for backward compatibility.
   uint32_t merge_trigger_rows{0};
   // Optional merge triggers; 0 means disabled.
