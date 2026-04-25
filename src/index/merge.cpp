@@ -1,6 +1,7 @@
 #include "index/merge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <numeric>
@@ -25,6 +26,34 @@ uint32_t NearestCentroid(Eigen::Ref<const Eigen::VectorXf> x,
     *dist_out = best;
   }
   return best_idx;
+}
+
+double QuantileFromSorted(const std::vector<double>& sorted, double q) {
+  if (sorted.empty()) {
+    return 0.0;
+  }
+  const double clamped = std::clamp(q, 0.0, 1.0);
+  const double pos = clamped * static_cast<double>(sorted.size() - 1);
+  const size_t lo = static_cast<size_t>(std::floor(pos));
+  const size_t hi = static_cast<size_t>(std::ceil(pos));
+  if (lo == hi) {
+    return sorted[lo];
+  }
+  const double w = pos - static_cast<double>(lo);
+  return sorted[lo] * (1.0 - w) + sorted[hi] * w;
+}
+
+DistributionSummary SummarizeDistribution(std::vector<double> values) {
+  DistributionSummary summary;
+  if (values.empty()) {
+    return summary;
+  }
+  std::sort(values.begin(), values.end());
+  summary.min = values.front();
+  summary.p50 = QuantileFromSorted(values, 0.50);
+  summary.p90 = QuantileFromSorted(values, 0.90);
+  summary.max = values.back();
+  return summary;
 }
 
 }  // namespace
@@ -314,12 +343,37 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   if (!commit.ok()) {
     return commit;
   }
+  auto codebook_ms_res = main_ivf->GetLastPatchPQReencodeMs(main_versions);
+  if (!codebook_ms_res.ok()) {
+    return codebook_ms_res.status();
+  }
 
   MergeReport report;
   report.frozen_records = static_cast<uint32_t>(frozen_delta.records.size());
   report.patch_partitions = static_cast<uint32_t>(patch_res.value().partition_ids.size());
   report.append_partitions = static_cast<uint32_t>(score_res.value().append_partitions.size());
   report.recluster_partitions = static_cast<uint32_t>(score_res.value().recluster_partitions.size());
+  report.codebook_rebuild_ms = codebook_ms_res.value();
+  std::vector<double> score_values;
+  std::vector<double> residual_values;
+  std::vector<double> growth_values;
+  score_values.reserve(report.patch_partitions);
+  residual_values.reserve(report.patch_partitions);
+  growth_values.reserve(report.patch_partitions);
+  const auto& stats = stats_res.value();
+  const auto& decisions = score_res.value().decisions;
+  const size_t n = std::min(stats.size(), decisions.size());
+  for (size_t i = 0; i < n; ++i) {
+    if (stats[i].insert_count == 0) {
+      continue;
+    }
+    score_values.push_back(decisions[i].score);
+    residual_values.push_back(stats[i].avg_residual_dist);
+    growth_values.push_back(stats[i].growth_ratio);
+  }
+  report.score_summary = SummarizeDistribution(std::move(score_values));
+  report.residual_summary = SummarizeDistribution(std::move(residual_values));
+  report.growth_summary = SummarizeDistribution(std::move(growth_values));
   report.stats = std::move(stats_res.value());
   report.scoring = std::move(score_res.value());
   return report;

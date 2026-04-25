@@ -25,6 +25,8 @@ struct Config {
   uint32_t snapshot_interval{0};
   bool enable_miss_diag{true};
   bool enable_rerank_source_diag{false};
+  // When true, emit extra latency diagnostics for route-level breakdown and slow queries.
+  bool enable_latency_debug{false};
   bool exact_rerank_enable{false};
   uint32_t exact_rerank_candidates_per_route{0};
   bool enable_streaming{false};

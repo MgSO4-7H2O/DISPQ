@@ -17,6 +17,8 @@
 #include <omp.h>
 #endif
 
+#include "common/timer.h"
+
 namespace ann {
 namespace {
 
@@ -56,6 +58,7 @@ struct IndexData {
   std::unordered_set<DocId> doc_ids;
   std::unordered_map<DocId, uint32_t> doc_to_list;
   uint64_t ntotal{0};
+  double last_patch_pq_reencode_ms{0.0};
 };
 
 int NearestCentroid(Eigen::Ref<const Eigen::VectorXf> vec, const IndexData& data) {
@@ -1071,6 +1074,7 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::NotFound("Index version not built");
     }
     IndexData& data = *it->second;
+    data.last_patch_pq_reencode_ms = 0.0;
     std::unordered_set<uint32_t> patch_partitions;
     patch_partitions.reserve(patch.partition_ids.size());
     for (uint32_t partition_id : patch.partition_ids) {
@@ -1112,12 +1116,14 @@ class KMeansIVFIndex : public IVFIndex {
       }
     }
 
+    double pq_reencode_ms = 0.0;
     for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
       const uint32_t partition_id = patch.partition_ids[i];
       const auto& records = patch.replacement_records[i];
       auto& dst = data.lists[static_cast<size_t>(partition_id)];
       dst.clear();
       dst.reserve(records.size());
+      Timer pq_reencode_timer;
       for (const auto& rec : records) {
         ListEntry entry;
         entry.doc_id = rec.doc_id;
@@ -1144,6 +1150,9 @@ class KMeansIVFIndex : public IVFIndex {
         }
         dst.push_back(std::move(entry));
       }
+      if (data.use_pq) {
+        pq_reencode_ms += pq_reencode_timer.ElapsedMillis();
+      }
     }
 
     data.doc_ids.clear();
@@ -1157,7 +1166,18 @@ class KMeansIVFIndex : public IVFIndex {
         ++data.ntotal;
       }
     }
+    data.last_patch_pq_reencode_ms = pq_reencode_ms;
     return Status::OK();
+  }
+
+  Result<double> GetLastPatchPQReencodeMs(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    return it->second->last_patch_pq_reencode_ms;
   }
 
   Result<std::vector<uint8_t>> Serialize() const override { return std::vector<uint8_t>{}; }

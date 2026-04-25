@@ -126,6 +126,8 @@ class IVFIndex {
       const VersionSet& route_versions) const = 0;
   virtual Status CommitPartitionPatch(const VersionSet& route_versions,
                                       const PartitionPatch& patch) = 0;
+  virtual Result<double> GetLastPatchPQReencodeMs(
+      const VersionSet& route_versions) const = 0;
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;
   virtual Status Deserialize(const std::vector<uint8_t>& bytes) = 0;

@@ -70,6 +70,7 @@ std::string Config::ToString() const {
       << "snapshot_interval=" << snapshot_interval << ", "
       << "enable_miss_diag=" << std::boolalpha << enable_miss_diag << ", "
       << "enable_rerank_source_diag=" << std::boolalpha << enable_rerank_source_diag << ", "
+      << "enable_latency_debug=" << std::boolalpha << enable_latency_debug << ", "
       << "exact_rerank_enable=" << std::boolalpha << exact_rerank_enable << ", "
       << "exact_rerank_candidates_per_route=" << exact_rerank_candidates_per_route << ", "
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
@@ -129,6 +130,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
   ExtractBool(text, "enable_miss_diag", &cfg.enable_miss_diag);
   ExtractBool(text, "enable_rerank_source_diag", &cfg.enable_rerank_source_diag);
+  ExtractBool(text, "enable_latency_debug", &cfg.enable_latency_debug);
   ExtractBool(text, "exact_rerank_enable", &cfg.exact_rerank_enable);
   ExtractUint(text,
               "exact_rerank_candidates_per_route",

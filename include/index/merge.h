@@ -50,11 +50,22 @@ struct MergeOptions {
   bool enable_local_centroid_refine{false};
 };
 
+struct DistributionSummary {
+  double min{0.0};
+  double p50{0.0};
+  double p90{0.0};
+  double max{0.0};
+};
+
 struct MergeReport {
   uint32_t frozen_records{0};
   uint32_t patch_partitions{0};
   uint32_t append_partitions{0};
   uint32_t recluster_partitions{0};
+  double codebook_rebuild_ms{0.0};
+  DistributionSummary score_summary;
+  DistributionSummary residual_summary;
+  DistributionSummary growth_summary;
   std::vector<PartitionStats> stats;
   PartitionScoreResult scoring;
 };

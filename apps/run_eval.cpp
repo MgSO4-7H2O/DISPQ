@@ -36,9 +36,107 @@ namespace {
 
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
+constexpr uint32_t kSlowQueryDebugCount = 5;
 constexpr double kMergeScoreAlphaDefault = 1.0;
 constexpr double kMergeScoreBetaDefault = 0.05;
 constexpr double kMergeScoreThresholdDefault = 1.0;
+
+struct DistributionStats {
+  double avg{0.0};
+  double p50{0.0};
+  double p90{0.0};
+  double p99{0.0};
+  double max{0.0};
+};
+
+double Percentile(std::vector<double> values, double q) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  std::sort(values.begin(), values.end());
+  const double idx = q * static_cast<double>(values.size() - 1);
+  size_t lo = static_cast<size_t>(std::floor(idx));
+  size_t hi = static_cast<size_t>(std::ceil(idx));
+  if (hi >= values.size()) {
+    hi = values.size() - 1;
+  }
+  const double frac = idx - static_cast<double>(lo);
+  return values[lo] + (values[hi] - values[lo]) * frac;
+}
+
+DistributionStats SummarizeDistribution(const std::vector<double>& values) {
+  DistributionStats stats;
+  if (values.empty()) {
+    return stats;
+  }
+  stats.avg =
+      std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+  stats.p50 = Percentile(values, 0.50);
+  stats.p90 = Percentile(values, 0.90);
+  stats.p99 = Percentile(values, 0.99);
+  stats.max = *std::max_element(values.begin(), values.end());
+  return stats;
+}
+
+struct RouteDebugStats {
+  std::string route_name;
+  uint8_t from_new{0};
+  DistributionStats search_ms;
+  DistributionStats scanned_candidates;
+};
+
+struct SlowQueryDebug {
+  uint32_t query_id{0};
+  double total_search_ms{0.0};
+  double merge_ms{0.0};
+  double max_route_search_ms{0.0};
+  double merged_scanned{0.0};
+  std::vector<double> route_search_ms;
+  std::vector<double> route_scanned_candidates;
+};
+
+struct LatencyDebugMetrics {
+  uint32_t route_count{0};
+  DistributionStats merge_ms;
+  DistributionStats max_route_search_ms;
+  std::vector<RouteDebugStats> routes;
+  std::vector<SlowQueryDebug> slow_queries;
+};
+
+struct IndexPartitionDebug {
+  std::string route_name;
+  uint32_t nlist{0};
+  uint32_t non_empty_lists{0};
+  uint64_t total_docs{0};
+  DistributionStats list_size;
+};
+
+Result<IndexPartitionDebug> BuildPartitionDebug(const std::string& route_name,
+                                                const std::shared_ptr<IVFIndex>& ivf,
+                                                const VersionSet& versions) {
+  if (!ivf) {
+    return Status::InvalidArgument("BuildPartitionDebug: null ivf for route " + route_name);
+  }
+  auto sizes_res = ivf->GetPartitionSizes(versions);
+  if (!sizes_res.ok()) {
+    return sizes_res.status();
+  }
+  const std::vector<uint32_t>& partition_sizes = sizes_res.value();
+  IndexPartitionDebug out;
+  out.route_name = route_name;
+  out.nlist = static_cast<uint32_t>(partition_sizes.size());
+  std::vector<double> values;
+  values.reserve(partition_sizes.size());
+  for (uint32_t size : partition_sizes) {
+    values.push_back(static_cast<double>(size));
+    out.total_docs += static_cast<uint64_t>(size);
+    if (size > 0) {
+      out.non_empty_lists++;
+    }
+  }
+  out.list_size = SummarizeDistribution(values);
+  return out;
+}
 
 MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
   std::mt19937 gen(seed);
@@ -127,6 +225,7 @@ struct EvalMetrics {
   double rerank_topk_main_avg{0.0};
   double rerank_topk_delta_avg{0.0};
   std::vector<std::string> worst_queries;
+  std::optional<LatencyDebugMetrics> latency_debug;
 };
 
 struct MinibatchRecord {
@@ -192,12 +291,27 @@ struct SnapshotRecord {
   double rerank_topk_delta_avg{0.0};
   std::vector<std::string> worst_queries;
   std::vector<MinibatchRecord> minibatches;
+  bool active_window_ready{false};
+  bool will_commit_merge{false};
+  std::optional<LatencyDebugMetrics> latency_debug;
+  std::vector<IndexPartitionDebug> partition_debug;
+};
+
+struct MergeEventRecord {
+  uint32_t base_rows{0};
+  uint32_t frozen_rows{0};
+  uint32_t patched_partitions{0};
+  uint32_t append_partitions{0};
+  uint32_t recluster_partitions{0};
+  double merge_ms{0.0};
+  double codebook_rebuild_ms{0.0};
 };
 
 struct SearchRoute {
   std::shared_ptr<IVFIndex> ivf;
   VersionSet versions{};
   uint8_t from_new{0};
+  std::string name;
 };
 
 struct OnlinePQRollup {
@@ -509,13 +623,13 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   }
 
   std::vector<SearchRoute> routes;
-  routes.push_back(SearchRoute{main_ivf, main_versions, 0});
+  routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main"});
   if (!config.main_query_only) {
     if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
-      routes.push_back(SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1});
+      routes.push_back(SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1, "frozen_delta"});
     }
     if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
-      routes.push_back(SearchRoute{active_delta->ivf, active_delta->versions, 1});
+      routes.push_back(SearchRoute{active_delta->ivf, active_delta->versions, 1, "active_delta"});
     }
   }
 
@@ -540,6 +654,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   std::vector<std::vector<SearchResult>> route_results(
       nq, std::vector<SearchResult>(route_count));
   std::vector<double> route_search_ms(static_cast<size_t>(nq) * route_count, 0.0);
+  std::vector<double> route_scanned_candidates(static_cast<size_t>(nq) * route_count, 0.0);
+  std::vector<double> merge_topk_ms(nq, 0.0);
+  std::vector<double> max_route_search_ms(nq, 0.0);
 
   Timer wall_timer;
 
@@ -596,6 +713,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
         continue;
       }
       route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] = sres.value();
+      route_scanned_candidates[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)] =
+          static_cast<double>(sres.value().scanned_candidates);
     }
   }
 
@@ -619,13 +738,15 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     }
     SearchResult merged = merged_res.value();
     const double merge_elapsed = merge_timer.ElapsedMillis();
-    double q_search_ms = 0.0;
+    double route_search_max = 0.0;
     for (uint32_t ri = 0; ri < route_count; ++ri) {
-      q_search_ms = std::max(
-          q_search_ms,
+      route_search_max = std::max(
+          route_search_max,
           route_search_ms[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)]);
     }
-    q_search_ms += merge_elapsed;
+    const double q_search_ms = route_search_max + merge_elapsed;
+    max_route_search_ms[static_cast<size_t>(qi)] = route_search_max;
+    merge_topk_ms[static_cast<size_t>(qi)] = merge_elapsed;
     std::vector<DocId> row;
     row.reserve(merged.topk.size());
     for (const auto& cand : merged.topk) {
@@ -837,21 +958,6 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return total_summary.status();
   }
 
-  auto percentile = [](std::vector<double> values, double q) -> double {
-    if (values.empty()) {
-      return 0.0;
-    }
-    std::sort(values.begin(), values.end());
-    const double idx = q * static_cast<double>(values.size() - 1);
-    size_t lo = static_cast<size_t>(std::floor(idx));
-    size_t hi = static_cast<size_t>(std::ceil(idx));
-    if (hi >= values.size()) {
-      hi = values.size() - 1;
-    }
-    const double frac = idx - static_cast<double>(lo);
-    return values[lo] + (values[hi] - values[lo]) * frac;
-  };
-
   double avg_whiten = 0.0;
   double avg_search = 0.0;
   double avg_total = 0.0;
@@ -872,8 +978,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   if (nq > 0) {
     scanned_avg =
         std::accumulate(scanned_counts.begin(), scanned_counts.end(), 0.0) / static_cast<double>(nq);
-    scanned_p50 = percentile(scanned_counts, 0.50);
-    scanned_p99 = percentile(scanned_counts, 0.99);
+    scanned_p50 = Percentile(scanned_counts, 0.50);
+    scanned_p99 = Percentile(scanned_counts, 0.99);
     scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
   }
 
@@ -933,6 +1039,59 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     metrics.pq_rank_loss_count = static_cast<uint32_t>(
         std::min<uint64_t>(pq_rank_loss_count, std::numeric_limits<uint32_t>::max()));
     metrics.worst_queries = std::move(worst_queries);
+  }
+  if (config.enable_latency_debug) {
+    LatencyDebugMetrics debug;
+    debug.route_count = route_count;
+    debug.merge_ms = SummarizeDistribution(merge_topk_ms);
+    debug.max_route_search_ms = SummarizeDistribution(max_route_search_ms);
+    debug.routes.reserve(route_count);
+    for (uint32_t ri = 0; ri < route_count; ++ri) {
+      std::vector<double> route_ms_values;
+      std::vector<double> route_scanned_values;
+      route_ms_values.reserve(nq);
+      route_scanned_values.reserve(nq);
+      for (uint32_t qi = 0; qi < nq; ++qi) {
+        const size_t idx = static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri);
+        route_ms_values.push_back(route_search_ms[idx]);
+        route_scanned_values.push_back(route_scanned_candidates[idx]);
+      }
+      RouteDebugStats route_debug;
+      route_debug.route_name = routes[static_cast<size_t>(ri)].name;
+      route_debug.from_new = routes[static_cast<size_t>(ri)].from_new;
+      route_debug.search_ms = SummarizeDistribution(route_ms_values);
+      route_debug.scanned_candidates = SummarizeDistribution(route_scanned_values);
+      debug.routes.push_back(std::move(route_debug));
+    }
+
+    std::vector<uint32_t> slow_query_order(nq);
+    std::iota(slow_query_order.begin(), slow_query_order.end(), 0u);
+    std::sort(slow_query_order.begin(),
+              slow_query_order.end(),
+              [&](uint32_t lhs, uint32_t rhs) {
+                return search_ms[static_cast<size_t>(lhs)] >
+                       search_ms[static_cast<size_t>(rhs)];
+              });
+    const size_t keep = std::min<size_t>(kSlowQueryDebugCount, slow_query_order.size());
+    debug.slow_queries.reserve(keep);
+    for (size_t i = 0; i < keep; ++i) {
+      const uint32_t qi = slow_query_order[i];
+      SlowQueryDebug slow;
+      slow.query_id = qi;
+      slow.total_search_ms = search_ms[static_cast<size_t>(qi)];
+      slow.merge_ms = merge_topk_ms[static_cast<size_t>(qi)];
+      slow.max_route_search_ms = max_route_search_ms[static_cast<size_t>(qi)];
+      slow.merged_scanned = scanned_counts[static_cast<size_t>(qi)];
+      slow.route_search_ms.reserve(route_count);
+      slow.route_scanned_candidates.reserve(route_count);
+      for (uint32_t ri = 0; ri < route_count; ++ri) {
+        const size_t idx = static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri);
+        slow.route_search_ms.push_back(route_search_ms[idx]);
+        slow.route_scanned_candidates.push_back(route_scanned_candidates[idx]);
+      }
+      debug.slow_queries.push_back(std::move(slow));
+    }
+    metrics.latency_debug = std::move(debug);
   }
   return metrics;
 }
@@ -1333,6 +1492,7 @@ int main(int argc, char** argv) {
                                                                      : total_stream_rows)
                         : 0;
   std::vector<SnapshotRecord> snapshots;
+  std::vector<MergeEventRecord> merge_events;
   uint32_t last_snapshot_active_rows = stream_start_idx;
   std::optional<EvalMetrics> pre_stream_metrics;
 
@@ -1362,9 +1522,11 @@ int main(int argc, char** argv) {
                             const EvalMetrics& metrics,
                             double update_ms,
                             const OnlinePQUpdateStats& pq_stats,
-                            std::vector<MinibatchRecord> minibatches) {
+                            bool active_window_ready,
+                            bool will_commit_merge,
+                            std::vector<MinibatchRecord> minibatches) -> Status {
     if (!collect_snapshots) {
-      return;
+      return Status::OK();
     }
     SnapshotRecord snap;
     snap.base_rows = active_rows;
@@ -1404,9 +1566,36 @@ int main(int argc, char** argv) {
     snap.rerank_topk_main_avg = metrics.rerank_topk_main_avg;
     snap.rerank_topk_delta_avg = metrics.rerank_topk_delta_avg;
     snap.worst_queries = metrics.worst_queries;
+    snap.active_window_ready = active_window_ready;
+    snap.will_commit_merge = will_commit_merge;
+    if (config.enable_latency_debug && metrics.latency_debug.has_value()) {
+      snap.latency_debug = metrics.latency_debug;
+      auto main_debug = BuildPartitionDebug("main", main_ivf, main_versions);
+      if (!main_debug.ok()) {
+        return main_debug.status();
+      }
+      snap.partition_debug.push_back(main_debug.value());
+      if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
+        auto frozen_debug =
+            BuildPartitionDebug("frozen_delta", frozen_delta->ivf, frozen_delta->versions);
+        if (!frozen_debug.ok()) {
+          return frozen_debug.status();
+        }
+        snap.partition_debug.push_back(frozen_debug.value());
+      }
+      if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
+        auto active_debug =
+            BuildPartitionDebug("active_delta", active_delta->ivf, active_delta->versions);
+        if (!active_debug.ok()) {
+          return active_debug.status();
+        }
+        snap.partition_debug.push_back(active_debug.value());
+      }
+    }
     snap.minibatches = std::move(minibatches);
     snapshots.push_back(std::move(snap));
     last_snapshot_active_rows = active_rows;
+    return Status::OK();
   };
 
   uint32_t inserted_rows = 0;
@@ -1421,11 +1610,17 @@ int main(int argc, char** argv) {
     }
     pre_stream_metrics = pre_res.value();
     if (collect_snapshots) {
-      write_snapshot(stream_start_idx,
-                     pre_stream_metrics.value(),
-                     0.0,
-                     last_online_pq_stats,
-                     std::vector<MinibatchRecord>{});
+      const Status ws = write_snapshot(stream_start_idx,
+                                       pre_stream_metrics.value(),
+                                       0.0,
+                                       last_online_pq_stats,
+                                       false,
+                                       false,
+                                       std::vector<MinibatchRecord>{});
+      if (!ws.ok()) {
+        std::cerr << ws.ToString() << std::endl;
+        return 1;
+      }
     }
   }
 
@@ -1599,6 +1794,11 @@ int main(int argc, char** argv) {
         snapshot_minibatches.push_back(std::move(minibatch));
       }
 
+      const bool active_window_ready =
+          active_delta.has_value() &&
+          ShouldFreezeForMerge(active_delta.value(), last_online_pq_stats);
+      const bool should_commit_merge =
+          frozen_delta.has_value() && (next_insert_idx == nx || active_window_ready);
       const bool hit_periodic_snapshot =
           collect_snapshots && inserted_rows == next_snapshot_target;
       const bool hit_final_snapshot = collect_snapshots && inserted_rows == total_stream_rows;
@@ -1619,21 +1819,23 @@ int main(int argc, char** argv) {
           }
           snapshot_metrics = sres.value();
         }
-        write_snapshot(next_insert_idx,
-                       snapshot_metrics,
-                       pending_update_ms,
-                       last_online_pq_stats,
-                       eval_after_each_minibatch ? std::move(snapshot_minibatches)
-                                                 : std::vector<MinibatchRecord>{});
+        const Status ws = write_snapshot(next_insert_idx,
+                                         snapshot_metrics,
+                                         pending_update_ms,
+                                         last_online_pq_stats,
+                                         active_window_ready,
+                                         should_commit_merge,
+                                         eval_after_each_minibatch
+                                             ? std::move(snapshot_minibatches)
+                                             : std::vector<MinibatchRecord>{});
+        if (!ws.ok()) {
+          std::cerr << ws.ToString() << std::endl;
+          return 1;
+        }
         snapshot_minibatches.clear();
         pending_update_ms = 0.0;
       }
 
-      const bool active_window_ready =
-          active_delta.has_value() &&
-          ShouldFreezeForMerge(active_delta.value(), last_online_pq_stats);
-      const bool should_commit_merge =
-          frozen_delta.has_value() && (next_insert_idx == nx || active_window_ready);
       if (should_commit_merge) {
         Timer merge_commit_timer;
         auto merge_res = merge_frozen_delta_into_main(main_ivf,
@@ -1649,10 +1851,20 @@ int main(int argc, char** argv) {
         rebuild_ms_total += merge_commit_ms;
         main_rows_current = std::min<uint32_t>(
             next_insert_idx, main_rows_current + merge_res.value().frozen_records);
+        MergeEventRecord merge_event;
+        merge_event.base_rows = next_insert_idx;
+        merge_event.frozen_rows = merge_res.value().frozen_records;
+        merge_event.patched_partitions = merge_res.value().patch_partitions;
+        merge_event.append_partitions = merge_res.value().append_partitions;
+        merge_event.recluster_partitions = merge_res.value().recluster_partitions;
+        merge_event.merge_ms = merge_commit_ms;
+        merge_event.codebook_rebuild_ms = merge_res.value().codebook_rebuild_ms;
+        merge_events.push_back(merge_event);
         std::cout << "[MERGE] commit done: frozen_rows=" << merge_res.value().frozen_records
                   << ", patched_partitions=" << merge_res.value().patch_partitions
                   << ", append_parts=" << merge_res.value().append_partitions
                   << ", recluster_parts=" << merge_res.value().recluster_partitions
+                  << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
         frozen_delta.reset();
       }
@@ -1773,6 +1985,8 @@ int main(int argc, char** argv) {
   ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
   ofs << "    \"enable_rerank_source_diag\": "
       << (config.enable_rerank_source_diag ? "true" : "false") << ",\n";
+  ofs << "    \"enable_latency_debug\": "
+      << (config.enable_latency_debug ? "true" : "false") << ",\n";
   ofs << "    \"exact_rerank_enable\": " << (config.exact_rerank_enable ? "true" : "false")
       << ",\n";
   ofs << "    \"exact_rerank_candidates_per_route\": "
@@ -1885,6 +2099,24 @@ int main(int argc, char** argv) {
   ofs << "    \"updated_subspaces\": " << online_pq_rollup.updated_subspaces << ",\n";
   ofs << "    \"updated_codewords\": " << online_pq_rollup.updated_codewords << "\n";
   ofs << "  },\n";
+  ofs << "  \"merge_events\": [\n";
+  for (size_t i = 0; i < merge_events.size(); ++i) {
+    const auto& ev = merge_events[i];
+    ofs << "    {\n";
+    ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
+    ofs << "      \"frozen_rows\": " << ev.frozen_rows << ",\n";
+    ofs << "      \"patched_partitions\": " << ev.patched_partitions << ",\n";
+    ofs << "      \"append_parts\": " << ev.append_partitions << ",\n";
+    ofs << "      \"recluster_parts\": " << ev.recluster_partitions << ",\n";
+    ofs << "      \"codebook_rebuild_ms\": " << ev.codebook_rebuild_ms << ",\n";
+    ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
+    ofs << "    }";
+    if (i + 1 < merge_events.size()) {
+      ofs << ",";
+    }
+    ofs << "\n";
+  }
+  ofs << "  ],\n";
   ofs << "  \"snapshots\": [\n";
   for (size_t i = 0; i < snapshots.size(); ++i) {
     const auto& snap = snapshots[i];
@@ -1967,7 +2199,115 @@ int main(int argc, char** argv) {
       }
       ofs << "\n";
     }
-    ofs << "      ]\n";
+    ofs << "      ]";
+    if (snap.latency_debug.has_value()) {
+      const auto& debug = snap.latency_debug.value();
+      ofs << ",\n";
+      ofs << "      \"latency_debug\": {\n";
+      ofs << "        \"route_count\": " << debug.route_count << ",\n";
+      ofs << "        \"active_window_ready\": " << (snap.active_window_ready ? "true" : "false")
+          << ",\n";
+      ofs << "        \"will_commit_merge\": " << (snap.will_commit_merge ? "true" : "false")
+          << ",\n";
+      ofs << "        \"merge_ms\": {\n";
+      ofs << "          \"avg\": " << debug.merge_ms.avg << ",\n";
+      ofs << "          \"p50\": " << debug.merge_ms.p50 << ",\n";
+      ofs << "          \"p90\": " << debug.merge_ms.p90 << ",\n";
+      ofs << "          \"p99\": " << debug.merge_ms.p99 << ",\n";
+      ofs << "          \"max\": " << debug.merge_ms.max << "\n";
+      ofs << "        },\n";
+      ofs << "        \"max_route_search_ms\": {\n";
+      ofs << "          \"avg\": " << debug.max_route_search_ms.avg << ",\n";
+      ofs << "          \"p50\": " << debug.max_route_search_ms.p50 << ",\n";
+      ofs << "          \"p90\": " << debug.max_route_search_ms.p90 << ",\n";
+      ofs << "          \"p99\": " << debug.max_route_search_ms.p99 << ",\n";
+      ofs << "          \"max\": " << debug.max_route_search_ms.max << "\n";
+      ofs << "        },\n";
+      ofs << "        \"routes\": [\n";
+      for (size_t ri = 0; ri < debug.routes.size(); ++ri) {
+        const auto& route = debug.routes[ri];
+        ofs << "          {\n";
+        ofs << "            \"name\": \"" << route.route_name << "\",\n";
+        ofs << "            \"from_new\": " << static_cast<uint32_t>(route.from_new) << ",\n";
+        ofs << "            \"search_ms\": {\n";
+        ofs << "              \"avg\": " << route.search_ms.avg << ",\n";
+        ofs << "              \"p50\": " << route.search_ms.p50 << ",\n";
+        ofs << "              \"p90\": " << route.search_ms.p90 << ",\n";
+        ofs << "              \"p99\": " << route.search_ms.p99 << ",\n";
+        ofs << "              \"max\": " << route.search_ms.max << "\n";
+        ofs << "            },\n";
+        ofs << "            \"scanned_candidates\": {\n";
+        ofs << "              \"avg\": " << route.scanned_candidates.avg << ",\n";
+        ofs << "              \"p50\": " << route.scanned_candidates.p50 << ",\n";
+        ofs << "              \"p90\": " << route.scanned_candidates.p90 << ",\n";
+        ofs << "              \"p99\": " << route.scanned_candidates.p99 << ",\n";
+        ofs << "              \"max\": " << route.scanned_candidates.max << "\n";
+        ofs << "            }\n";
+        ofs << "          }";
+        if (ri + 1 < debug.routes.size()) {
+          ofs << ",";
+        }
+        ofs << "\n";
+      }
+      ofs << "        ],\n";
+      ofs << "        \"slow_queries\": [\n";
+      for (size_t si = 0; si < debug.slow_queries.size(); ++si) {
+        const auto& slow = debug.slow_queries[si];
+        ofs << "          {\n";
+        ofs << "            \"query_id\": " << slow.query_id << ",\n";
+        ofs << "            \"total_search_ms\": " << slow.total_search_ms << ",\n";
+        ofs << "            \"merge_ms\": " << slow.merge_ms << ",\n";
+        ofs << "            \"max_route_search_ms\": " << slow.max_route_search_ms << ",\n";
+        ofs << "            \"merged_scanned\": " << slow.merged_scanned << ",\n";
+        ofs << "            \"route_search_ms\": [";
+        for (size_t rsi = 0; rsi < slow.route_search_ms.size(); ++rsi) {
+          ofs << slow.route_search_ms[rsi];
+          if (rsi + 1 < slow.route_search_ms.size()) {
+            ofs << ", ";
+          }
+        }
+        ofs << "],\n";
+        ofs << "            \"route_scanned_candidates\": [";
+        for (size_t rsi = 0; rsi < slow.route_scanned_candidates.size(); ++rsi) {
+          ofs << slow.route_scanned_candidates[rsi];
+          if (rsi + 1 < slow.route_scanned_candidates.size()) {
+            ofs << ", ";
+          }
+        }
+        ofs << "]\n";
+        ofs << "          }";
+        if (si + 1 < debug.slow_queries.size()) {
+          ofs << ",";
+        }
+        ofs << "\n";
+      }
+      ofs << "        ],\n";
+      ofs << "        \"partition_debug\": [\n";
+      for (size_t pi = 0; pi < snap.partition_debug.size(); ++pi) {
+        const auto& part = snap.partition_debug[pi];
+        ofs << "          {\n";
+        ofs << "            \"route\": \"" << part.route_name << "\",\n";
+        ofs << "            \"nlist\": " << part.nlist << ",\n";
+        ofs << "            \"non_empty_lists\": " << part.non_empty_lists << ",\n";
+        ofs << "            \"total_docs\": " << part.total_docs << ",\n";
+        ofs << "            \"list_size\": {\n";
+        ofs << "              \"avg\": " << part.list_size.avg << ",\n";
+        ofs << "              \"p50\": " << part.list_size.p50 << ",\n";
+        ofs << "              \"p90\": " << part.list_size.p90 << ",\n";
+        ofs << "              \"p99\": " << part.list_size.p99 << ",\n";
+        ofs << "              \"max\": " << part.list_size.max << "\n";
+        ofs << "            }\n";
+        ofs << "          }";
+        if (pi + 1 < snap.partition_debug.size()) {
+          ofs << ",";
+        }
+        ofs << "\n";
+      }
+      ofs << "        ]\n";
+      ofs << "      }\n";
+    } else {
+      ofs << "\n";
+    }
     ofs << "    }";
     if (i + 1 < snapshots.size()) {
       ofs << ",";
