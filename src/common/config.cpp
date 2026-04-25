@@ -81,6 +81,8 @@ std::string Config::ToString() const {
       << "merge_trigger_rows=" << merge_trigger_rows << ", "
       << "merge_trigger_qe_ratio=" << merge_trigger_qe_ratio << ", "
       << "merge_trigger_drift=" << merge_trigger_drift << ", "
+      << "merge_trigger_delta_main_ratio=" << merge_trigger_delta_main_ratio << ", "
+      << "merge_trigger_imbalance_ratio=" << merge_trigger_imbalance_ratio << ", "
       << "streaming_mode=" << streaming_mode << ", "
       << "stream_batch_size=" << stream_batch_size << ", "
       << "streaming_use_stream_batch_size=" << std::boolalpha << streaming_use_stream_batch_size
@@ -143,6 +145,8 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "merge_trigger_rows", &cfg.merge_trigger_rows);
   ExtractDouble(text, "merge_trigger_qe_ratio", &cfg.merge_trigger_qe_ratio);
   ExtractDouble(text, "merge_trigger_drift", &cfg.merge_trigger_drift);
+  ExtractDouble(text, "merge_trigger_delta_main_ratio", &cfg.merge_trigger_delta_main_ratio);
+  ExtractDouble(text, "merge_trigger_imbalance_ratio", &cfg.merge_trigger_imbalance_ratio);
   ExtractString(text, "streaming_mode", &cfg.streaming_mode);
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
   ExtractBool(text, "streaming_use_stream_batch_size", &cfg.streaming_use_stream_batch_size);
@@ -187,15 +191,24 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
     return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");
   }
   if (cfg.merge_trigger_mode != "rows" && cfg.merge_trigger_mode != "qe_ratio" &&
-      cfg.merge_trigger_mode != "drift" && cfg.merge_trigger_mode != "hybrid") {
+      cfg.merge_trigger_mode != "drift" && cfg.merge_trigger_mode != "imbalance" &&
+      cfg.merge_trigger_mode != "delta_main_ratio" && cfg.merge_trigger_mode != "state" &&
+      cfg.merge_trigger_mode != "hybrid") {
     return Status::InvalidArgument(
-        "merge_trigger_mode must be one of \"rows\", \"qe_ratio\", \"drift\", \"hybrid\"");
+        "merge_trigger_mode must be one of \"rows\", \"qe_ratio\", \"drift\", "
+        "\"imbalance\", \"delta_main_ratio\", \"state\", \"hybrid\"");
   }
   if (cfg.merge_trigger_qe_ratio < 0.0) {
     return Status::InvalidArgument("merge_trigger_qe_ratio must be >= 0");
   }
   if (cfg.merge_trigger_drift < 0.0) {
     return Status::InvalidArgument("merge_trigger_drift must be >= 0");
+  }
+  if (cfg.merge_trigger_delta_main_ratio < 0.0) {
+    return Status::InvalidArgument("merge_trigger_delta_main_ratio must be >= 0");
+  }
+  if (cfg.merge_trigger_imbalance_ratio < 0.0) {
+    return Status::InvalidArgument("merge_trigger_imbalance_ratio must be >= 0");
   }
   if (cfg.merge_trigger_mode == "qe_ratio" && cfg.merge_trigger_qe_ratio <= 0.0) {
     return Status::InvalidArgument(
@@ -205,10 +218,28 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
     return Status::InvalidArgument(
         "merge_trigger_drift must be > 0 when merge_trigger_mode=\"drift\"");
   }
-  if (cfg.merge_trigger_mode == "hybrid" && cfg.merge_trigger_rows == 0 &&
-      cfg.merge_trigger_qe_ratio <= 0.0 && cfg.merge_trigger_drift <= 0.0) {
+  if (cfg.merge_trigger_mode == "imbalance" && cfg.merge_trigger_imbalance_ratio <= 0.0) {
     return Status::InvalidArgument(
-        "hybrid merge trigger needs at least one enabled trigger: rows/qe_ratio/drift");
+        "merge_trigger_imbalance_ratio must be > 0 when merge_trigger_mode=\"imbalance\"");
+  }
+  if (cfg.merge_trigger_mode == "delta_main_ratio" && cfg.merge_trigger_delta_main_ratio <= 0.0) {
+    return Status::InvalidArgument(
+        "merge_trigger_delta_main_ratio must be > 0 when "
+        "merge_trigger_mode=\"delta_main_ratio\"");
+  }
+  if (cfg.merge_trigger_mode == "state" && cfg.merge_trigger_qe_ratio <= 0.0 &&
+      cfg.merge_trigger_drift <= 0.0 && cfg.merge_trigger_delta_main_ratio <= 0.0 &&
+      cfg.merge_trigger_imbalance_ratio <= 0.0) {
+    return Status::InvalidArgument(
+        "state merge trigger needs at least one enabled trigger: "
+        "qe_ratio/drift/delta_main_ratio/imbalance");
+  }
+  if (cfg.merge_trigger_mode == "hybrid" && cfg.merge_trigger_rows == 0 &&
+      cfg.merge_trigger_qe_ratio <= 0.0 && cfg.merge_trigger_drift <= 0.0 &&
+      cfg.merge_trigger_delta_main_ratio <= 0.0 && cfg.merge_trigger_imbalance_ratio <= 0.0) {
+    return Status::InvalidArgument(
+        "hybrid merge trigger needs at least one enabled trigger: "
+        "rows/qe_ratio/drift/delta_main_ratio/imbalance");
   }
   if (cfg.online_pq_update_scheme != "minibatch" &&
       cfg.online_pq_update_scheme != "sliding_window") {

@@ -35,7 +35,14 @@ struct Config {
   // 0 means fallback to ivf_nlist.
   uint32_t delta_ivf_nlist{0};
   // Merge trigger config is decoupled from delta training window.
-  // mode: "rows" | "qe_ratio" | "drift" | "hybrid".
+  // mode:
+  // - "rows": only row-based trigger
+  // - "qe_ratio": only OnlinePQ qe-ratio trigger
+  // - "drift": only codebook drift trigger
+  // - "imbalance": only active-delta list imbalance trigger
+  // - "delta_main_ratio": only active-delta/main ratio trigger
+  // - "state": any state trigger (qe_ratio/drift/imbalance/delta_main_ratio)
+  // - "hybrid": rows or any state trigger
   std::string merge_trigger_mode{"rows"};
   // Row upper bound of current active-delta (including warm-up vectors).
   // 0 means fallback to delta_train_rows for backward compatibility.
@@ -43,6 +50,10 @@ struct Config {
   // Optional merge triggers; 0 means disabled.
   double merge_trigger_qe_ratio{0.0};
   double merge_trigger_drift{0.0};
+  // Trigger when active_delta_rows / main_rows >= threshold. 0 disables it.
+  double merge_trigger_delta_main_ratio{0.0};
+  // Trigger when max_list_size / avg_non_empty_list_size >= threshold. 0 disables it.
+  double merge_trigger_imbalance_ratio{0.0};
   std::string streaming_mode{"streaming"};
   uint32_t stream_batch_size{100};
   bool streaming_use_stream_batch_size{false};

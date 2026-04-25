@@ -303,8 +303,46 @@ struct MergeEventRecord {
   uint32_t patched_partitions{0};
   uint32_t append_partitions{0};
   uint32_t recluster_partitions{0};
+  std::string trigger_mode;
+  std::string trigger_reason;
+  bool trigger_rows{false};
+  bool trigger_structure{false};
+  bool trigger_qe_ratio{false};
+  bool trigger_drift{false};
+  bool trigger_delta_main_ratio{false};
+  bool trigger_imbalance{false};
+  double trigger_qe_ratio_value{0.0};
+  double trigger_drift_value{0.0};
+  double trigger_delta_main_ratio_value{0.0};
+  double trigger_imbalance_value{0.0};
+  uint32_t trigger_active_rows{0};
+  uint32_t trigger_active_nlist{0};
+  uint32_t trigger_active_non_empty_lists{0};
+  uint32_t trigger_active_max_list{0};
+  double trigger_active_avg_non_empty_list{0.0};
   double merge_ms{0.0};
   double codebook_rebuild_ms{0.0};
+};
+
+struct MergeTriggerDecision {
+  bool rows_trigger{false};
+  bool qe_ratio_trigger{false};
+  bool drift_trigger{false};
+  bool delta_main_ratio_trigger{false};
+  bool imbalance_trigger{false};
+  bool structure_trigger{false};
+  bool should_trigger{false};
+  uint32_t active_rows{0};
+  uint32_t active_nlist{0};
+  uint32_t active_non_empty_lists{0};
+  uint32_t active_max_list_size{0};
+  double active_avg_non_empty_list_size{0.0};
+  double qe_ratio_value{0.0};
+  double drift_value{0.0};
+  double delta_main_ratio_value{0.0};
+  double imbalance_value{0.0};
+  std::string mode;
+  std::string reason;
 };
 
 struct SearchRoute {
@@ -1240,6 +1278,10 @@ int main(int argc, char** argv) {
             << ", delta_ivf_nlist=" << delta_ivf_nlist
             << ", merge_trigger_mode=" << config.merge_trigger_mode
             << ", merge_trigger_rows=" << merge_trigger_rows
+            << ", merge_trigger_qe_ratio=" << config.merge_trigger_qe_ratio
+            << ", merge_trigger_drift=" << config.merge_trigger_drift
+            << ", merge_trigger_delta_main_ratio=" << config.merge_trigger_delta_main_ratio
+            << ", merge_trigger_imbalance_ratio=" << config.merge_trigger_imbalance_ratio
             << ", stream_rows=" << total_stream_rows
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
@@ -1390,7 +1432,10 @@ int main(int argc, char** argv) {
     return Status::OK();
   };
 
-  auto FreezeActiveDeltaWindow = [&](uint32_t end_row) -> Status {
+  std::optional<MergeTriggerDecision> frozen_trigger_decision;
+
+  auto FreezeActiveDeltaWindow = [&](uint32_t end_row,
+                                     const MergeTriggerDecision* trigger_info) -> Status {
     if (delta_train_rows == 0) {
       return Status::InvalidArgument("FreezeActiveDeltaWindow: delta_train_rows is 0");
     }
@@ -1408,7 +1453,21 @@ int main(int argc, char** argv) {
     pending_active_train = true;
     pending_active_train_begin = end_row;
     sliding_window_doc_ids.clear();
+    if (trigger_info != nullptr) {
+      frozen_trigger_decision = *trigger_info;
+    } else {
+      frozen_trigger_decision.reset();
+    }
     std::cout << "[MERGE] freeze_delta rows=" << frozen_delta->rows
+              << ", reason=" << (trigger_info != nullptr ? trigger_info->reason : "unknown")
+              << ", rows_trigger=" << (trigger_info != nullptr && trigger_info->rows_trigger ? "true" : "false")
+              << ", structure_trigger="
+              << (trigger_info != nullptr && trigger_info->structure_trigger ? "true" : "false")
+              << ", qe_ratio=" << (trigger_info != nullptr ? trigger_info->qe_ratio_value : 0.0)
+              << ", drift=" << (trigger_info != nullptr ? trigger_info->drift_value : 0.0)
+              << ", delta_main_ratio="
+              << (trigger_info != nullptr ? trigger_info->delta_main_ratio_value : 0.0)
+              << ", imbalance_ratio=" << (trigger_info != nullptr ? trigger_info->imbalance_value : 0.0)
               << ", start background-style merge window training from row="
               << pending_active_train_begin << std::endl;
     return Status::OK();
@@ -1454,29 +1513,115 @@ int main(int argc, char** argv) {
 
   OnlinePQRollup online_pq_rollup;
   OnlinePQUpdateStats last_online_pq_stats;
-  auto ShouldFreezeForMerge = [&](const DeltaShard& shard,
-                                  const OnlinePQUpdateStats& pq_stats) -> bool {
-    if (delta_train_rows == 0 || shard.rows == 0) {
-      return false;
+  auto EvaluateMergeTriggerDecision =
+      [&](const DeltaShard& shard, const OnlinePQUpdateStats& pq_stats)
+      -> Result<MergeTriggerDecision> {
+    MergeTriggerDecision decision;
+    decision.mode = config.merge_trigger_mode;
+    decision.active_rows = shard.rows;
+    decision.qe_ratio_value = pq_stats.qe_ratio;
+    decision.drift_value = pq_stats.codebook_drift_l2;
+    if (main_rows_current > 0) {
+      decision.delta_main_ratio_value =
+          static_cast<double>(shard.rows) / static_cast<double>(main_rows_current);
     }
-    const bool rows_trigger = merge_trigger_rows > 0 && shard.rows >= merge_trigger_rows;
-    const bool qe_ratio_trigger =
+
+    if (delta_train_rows == 0 || shard.rows == 0) {
+      decision.reason = "none";
+      return decision;
+    }
+
+    decision.rows_trigger = merge_trigger_rows > 0 && shard.rows >= merge_trigger_rows;
+    decision.qe_ratio_trigger =
         config.merge_trigger_qe_ratio > 0.0 &&
         pq_stats.qe_ratio >= config.merge_trigger_qe_ratio;
-    const bool drift_trigger =
+    decision.drift_trigger =
         config.merge_trigger_drift > 0.0 &&
         pq_stats.codebook_drift_l2 >= config.merge_trigger_drift;
+    decision.delta_main_ratio_trigger =
+        config.merge_trigger_delta_main_ratio > 0.0 &&
+        decision.delta_main_ratio_value >= config.merge_trigger_delta_main_ratio;
+
+    if (config.merge_trigger_imbalance_ratio > 0.0) {
+      if (!shard.ivf) {
+        return Status::InvalidArgument("EvaluateMergeTriggerDecision: active delta ivf is null");
+      }
+      auto sizes_res = shard.ivf->GetPartitionSizes(shard.versions);
+      if (!sizes_res.ok()) {
+        return sizes_res.status();
+      }
+      const std::vector<uint32_t>& sizes = sizes_res.value();
+      decision.active_nlist = static_cast<uint32_t>(sizes.size());
+      uint64_t non_empty_total = 0;
+      for (uint32_t v : sizes) {
+        if (v > 0) {
+          decision.active_non_empty_lists++;
+          non_empty_total += static_cast<uint64_t>(v);
+        }
+        decision.active_max_list_size = std::max<uint32_t>(decision.active_max_list_size, v);
+      }
+      if (decision.active_non_empty_lists > 0) {
+        decision.active_avg_non_empty_list_size =
+            static_cast<double>(non_empty_total) /
+            static_cast<double>(decision.active_non_empty_lists);
+      }
+      const double denom = std::max(1.0, decision.active_avg_non_empty_list_size);
+      decision.imbalance_value = static_cast<double>(decision.active_max_list_size) / denom;
+      decision.imbalance_trigger =
+          decision.imbalance_value >= config.merge_trigger_imbalance_ratio;
+    }
+
+    decision.structure_trigger = decision.qe_ratio_trigger || decision.drift_trigger ||
+                                 decision.delta_main_ratio_trigger || decision.imbalance_trigger;
 
     if (config.merge_trigger_mode == "rows") {
-      return rows_trigger;
+      decision.should_trigger = decision.rows_trigger;
+    } else if (config.merge_trigger_mode == "qe_ratio") {
+      decision.should_trigger = decision.qe_ratio_trigger;
+    } else if (config.merge_trigger_mode == "drift") {
+      decision.should_trigger = decision.drift_trigger;
+    } else if (config.merge_trigger_mode == "imbalance") {
+      decision.should_trigger = decision.imbalance_trigger;
+    } else if (config.merge_trigger_mode == "delta_main_ratio") {
+      decision.should_trigger = decision.delta_main_ratio_trigger;
+    } else if (config.merge_trigger_mode == "state") {
+      decision.should_trigger = decision.structure_trigger;
+    } else {
+      decision.should_trigger = decision.rows_trigger || decision.structure_trigger;
     }
-    if (config.merge_trigger_mode == "qe_ratio") {
-      return qe_ratio_trigger;
+
+    if (!decision.should_trigger) {
+      decision.reason = "none";
+      return decision;
     }
-    if (config.merge_trigger_mode == "drift") {
-      return drift_trigger;
+
+    std::string reason;
+    auto append_reason = [&](const std::string& token) {
+      if (!reason.empty()) {
+        reason += "+";
+      }
+      reason += token;
+    };
+    if (decision.rows_trigger) {
+      append_reason("delta_full");
     }
-    return rows_trigger || qe_ratio_trigger || drift_trigger;
+    if (decision.imbalance_trigger) {
+      append_reason("structure_imbalance");
+    }
+    if (decision.delta_main_ratio_trigger) {
+      append_reason("delta_main_ratio");
+    }
+    if (decision.qe_ratio_trigger) {
+      append_reason("qe_ratio");
+    }
+    if (decision.drift_trigger) {
+      append_reason("drift");
+    }
+    if (reason.empty()) {
+      reason = "triggered";
+    }
+    decision.reason = reason;
+    return decision;
   };
 
   std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
@@ -1636,12 +1781,18 @@ int main(int argc, char** argv) {
         std::cerr << activate_status.ToString() << std::endl;
         return 1;
       }
-      if (!frozen_delta.has_value() && active_delta.has_value() &&
-          ShouldFreezeForMerge(active_delta.value(), last_online_pq_stats)) {
-        Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx);
-        if (!freeze_status.ok()) {
-          std::cerr << freeze_status.ToString() << std::endl;
+      if (!frozen_delta.has_value() && active_delta.has_value()) {
+        auto trigger_res = EvaluateMergeTriggerDecision(active_delta.value(), last_online_pq_stats);
+        if (!trigger_res.ok()) {
+          std::cerr << trigger_res.status().ToString() << std::endl;
           return 1;
+        }
+        if (trigger_res.value().should_trigger) {
+          Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx, &trigger_res.value());
+          if (!freeze_status.ok()) {
+            std::cerr << freeze_status.ToString() << std::endl;
+            return 1;
+          }
         }
       }
 
@@ -1745,10 +1896,22 @@ int main(int argc, char** argv) {
         return 1;
       }
 
-      const bool can_start_merge = !frozen_delta.has_value() && active_delta.has_value() &&
-                                   ShouldFreezeForMerge(active_delta.value(), last_online_pq_stats);
+      bool can_start_merge = false;
+      std::optional<MergeTriggerDecision> post_update_trigger;
+      if (!frozen_delta.has_value() && active_delta.has_value()) {
+        auto trigger_res = EvaluateMergeTriggerDecision(active_delta.value(), last_online_pq_stats);
+        if (!trigger_res.ok()) {
+          std::cerr << trigger_res.status().ToString() << std::endl;
+          return 1;
+        }
+        post_update_trigger = trigger_res.value();
+        can_start_merge = trigger_res.value().should_trigger;
+      }
       if (can_start_merge) {
-        Status freeze_status = FreezeActiveDeltaWindow(next_insert_idx);
+        Status freeze_status =
+            FreezeActiveDeltaWindow(next_insert_idx, post_update_trigger.has_value()
+                                                         ? &post_update_trigger.value()
+                                                         : nullptr);
         if (!freeze_status.ok()) {
           std::cerr << freeze_status.ToString() << std::endl;
           return 1;
@@ -1794,9 +1957,15 @@ int main(int argc, char** argv) {
         snapshot_minibatches.push_back(std::move(minibatch));
       }
 
-      const bool active_window_ready =
-          active_delta.has_value() &&
-          ShouldFreezeForMerge(active_delta.value(), last_online_pq_stats);
+      bool active_window_ready = false;
+      if (active_delta.has_value()) {
+        auto trigger_res = EvaluateMergeTriggerDecision(active_delta.value(), last_online_pq_stats);
+        if (!trigger_res.ok()) {
+          std::cerr << trigger_res.status().ToString() << std::endl;
+          return 1;
+        }
+        active_window_ready = trigger_res.value().should_trigger;
+      }
       const bool should_commit_merge =
           frozen_delta.has_value() && (next_insert_idx == nx || active_window_ready);
       const bool hit_periodic_snapshot =
@@ -1857,6 +2026,31 @@ int main(int argc, char** argv) {
         merge_event.patched_partitions = merge_res.value().patch_partitions;
         merge_event.append_partitions = merge_res.value().append_partitions;
         merge_event.recluster_partitions = merge_res.value().recluster_partitions;
+        merge_event.trigger_mode = config.merge_trigger_mode;
+        if (frozen_trigger_decision.has_value()) {
+          merge_event.trigger_reason = frozen_trigger_decision->reason;
+          merge_event.trigger_rows = frozen_trigger_decision->rows_trigger;
+          merge_event.trigger_structure = frozen_trigger_decision->structure_trigger;
+          merge_event.trigger_qe_ratio = frozen_trigger_decision->qe_ratio_trigger;
+          merge_event.trigger_drift = frozen_trigger_decision->drift_trigger;
+          merge_event.trigger_delta_main_ratio =
+              frozen_trigger_decision->delta_main_ratio_trigger;
+          merge_event.trigger_imbalance = frozen_trigger_decision->imbalance_trigger;
+          merge_event.trigger_qe_ratio_value = frozen_trigger_decision->qe_ratio_value;
+          merge_event.trigger_drift_value = frozen_trigger_decision->drift_value;
+          merge_event.trigger_delta_main_ratio_value =
+              frozen_trigger_decision->delta_main_ratio_value;
+          merge_event.trigger_imbalance_value = frozen_trigger_decision->imbalance_value;
+          merge_event.trigger_active_rows = frozen_trigger_decision->active_rows;
+          merge_event.trigger_active_nlist = frozen_trigger_decision->active_nlist;
+          merge_event.trigger_active_non_empty_lists =
+              frozen_trigger_decision->active_non_empty_lists;
+          merge_event.trigger_active_max_list = frozen_trigger_decision->active_max_list_size;
+          merge_event.trigger_active_avg_non_empty_list =
+              frozen_trigger_decision->active_avg_non_empty_list_size;
+        } else {
+          merge_event.trigger_reason = "unknown";
+        }
         merge_event.merge_ms = merge_commit_ms;
         merge_event.codebook_rebuild_ms = merge_res.value().codebook_rebuild_ms;
         merge_events.push_back(merge_event);
@@ -1864,9 +2058,11 @@ int main(int argc, char** argv) {
                   << ", patched_partitions=" << merge_res.value().patch_partitions
                   << ", append_parts=" << merge_res.value().append_partitions
                   << ", recluster_parts=" << merge_res.value().recluster_partitions
+                  << ", trigger_reason=" << merge_event.trigger_reason
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
         frozen_delta.reset();
+        frozen_trigger_decision.reset();
       }
     }
   }
@@ -1974,6 +2170,10 @@ int main(int argc, char** argv) {
   ofs << "    \"merge_trigger_rows_resolved\": " << merge_trigger_rows << ",\n";
   ofs << "    \"merge_trigger_qe_ratio\": " << config.merge_trigger_qe_ratio << ",\n";
   ofs << "    \"merge_trigger_drift\": " << config.merge_trigger_drift << ",\n";
+  ofs << "    \"merge_trigger_delta_main_ratio\": " << config.merge_trigger_delta_main_ratio
+      << ",\n";
+  ofs << "    \"merge_trigger_imbalance_ratio\": " << config.merge_trigger_imbalance_ratio
+      << ",\n";
   ofs << "    \"delta_kmeans_iterations\": " << kDeltaKMeansIterationsDefault << ",\n";
   ofs << "    \"stream_start_row\": " << stream_start_idx << ",\n";
   ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
@@ -2108,6 +2308,28 @@ int main(int argc, char** argv) {
     ofs << "      \"patched_partitions\": " << ev.patched_partitions << ",\n";
     ofs << "      \"append_parts\": " << ev.append_partitions << ",\n";
     ofs << "      \"recluster_parts\": " << ev.recluster_partitions << ",\n";
+    ofs << "      \"trigger_mode\": \"" << ev.trigger_mode << "\",\n";
+    ofs << "      \"trigger_reason\": \"" << ev.trigger_reason << "\",\n";
+    ofs << "      \"trigger_rows\": " << (ev.trigger_rows ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_structure\": " << (ev.trigger_structure ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_qe_ratio\": " << (ev.trigger_qe_ratio ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_drift\": " << (ev.trigger_drift ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_delta_main_ratio\": "
+        << (ev.trigger_delta_main_ratio ? "true" : "false") << ",\n";
+    ofs << "      \"trigger_imbalance\": " << (ev.trigger_imbalance ? "true" : "false")
+        << ",\n";
+    ofs << "      \"trigger_qe_ratio_value\": " << ev.trigger_qe_ratio_value << ",\n";
+    ofs << "      \"trigger_drift_value\": " << ev.trigger_drift_value << ",\n";
+    ofs << "      \"trigger_delta_main_ratio_value\": " << ev.trigger_delta_main_ratio_value
+        << ",\n";
+    ofs << "      \"trigger_imbalance_value\": " << ev.trigger_imbalance_value << ",\n";
+    ofs << "      \"trigger_active_rows\": " << ev.trigger_active_rows << ",\n";
+    ofs << "      \"trigger_active_nlist\": " << ev.trigger_active_nlist << ",\n";
+    ofs << "      \"trigger_active_non_empty_lists\": " << ev.trigger_active_non_empty_lists
+        << ",\n";
+    ofs << "      \"trigger_active_max_list\": " << ev.trigger_active_max_list << ",\n";
+    ofs << "      \"trigger_active_avg_non_empty_list\": "
+        << ev.trigger_active_avg_non_empty_list << ",\n";
     ofs << "      \"codebook_rebuild_ms\": " << ev.codebook_rebuild_ms << ",\n";
     ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
     ofs << "    }";
