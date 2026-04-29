@@ -38,8 +38,8 @@ constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
 constexpr double kMergeScoreAlphaDefault = 1.0;
-constexpr double kMergeScoreBetaDefault = 0.05;
-constexpr double kMergeScoreThresholdDefault = 1.0;
+constexpr double kMergeScoreBetaDefault = 1e-7;
+constexpr double kMergeScoreThresholdDefault = 10.0;
 
 struct DistributionStats {
   double avg{0.0};
@@ -342,6 +342,48 @@ struct MergeTriggerDecision {
   double delta_main_ratio_value{0.0};
   double imbalance_value{0.0};
   std::string mode;
+  std::string reason;
+};
+
+struct GlobalRebuildDecision {
+  bool should_trigger{false};
+  bool main_rows_trigger{false};
+  bool imbalance_trigger{false};
+  uint32_t seen_rows{0};
+  uint32_t main_rows_current{0};
+  uint32_t main_rows_since_last_rebuild{0};
+  uint32_t main_nlist{0};
+  uint32_t main_non_empty_lists{0};
+  uint32_t main_max_list_size{0};
+  double main_avg_non_empty_list_size{0.0};
+  double main_imbalance_ratio{0.0};
+  std::string reason;
+};
+
+struct GlobalRebuildEventRecord {
+  uint32_t base_rows{0};
+  uint32_t old_main_rows{0};
+  uint32_t new_main_rows{0};
+  uint32_t active_seed_rows{0};
+  uint32_t rebuild_count{0};
+  uint32_t max_count{0};
+  uint32_t main_nlist{0};
+  uint32_t main_non_empty_lists{0};
+  uint32_t main_max_list_size{0};
+  double main_avg_non_empty_list_size{0.0};
+  bool trigger_main_rows{false};
+  bool trigger_imbalance{false};
+  uint32_t trigger_main_rows_since_last_rebuild{0};
+  uint32_t trigger_main_rows_threshold{0};
+  double trigger_imbalance_threshold{0.0};
+  double threshold{0.0};
+  double main_imbalance_ratio{0.0};
+  double whitening_ms{0.0};
+  double whitening_transform_ms{0.0};
+  double main_build_ms{0.0};
+  double main_add_ms{0.0};
+  double delta_seed_ms{0.0};
+  double total_ms{0.0};
   std::string reason;
 };
 
@@ -1282,6 +1324,12 @@ int main(int argc, char** argv) {
             << ", merge_trigger_drift=" << config.merge_trigger_drift
             << ", merge_trigger_delta_main_ratio=" << config.merge_trigger_delta_main_ratio
             << ", merge_trigger_imbalance_ratio=" << config.merge_trigger_imbalance_ratio
+            << ", enable_global_rebuild=" << std::boolalpha << config.enable_global_rebuild
+            << ", global_rebuild_max_count=" << config.global_rebuild_max_count
+            << ", global_rebuild_main_imbalance_ratio="
+            << config.global_rebuild_main_imbalance_ratio
+            << ", global_rebuild_force_main_rows=" << config.global_rebuild_force_main_rows
+            << ", global_rebuild_cooldown_rows=" << config.global_rebuild_cooldown_rows
             << ", stream_rows=" << total_stream_rows
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
@@ -1513,6 +1561,10 @@ int main(int argc, char** argv) {
 
   OnlinePQRollup online_pq_rollup;
   OnlinePQUpdateStats last_online_pq_stats;
+  std::vector<GlobalRebuildEventRecord> global_rebuild_events;
+  uint32_t global_rebuild_count = 0;
+  uint32_t last_global_rebuild_rows = 0;
+  uint32_t last_global_rebuild_main_rows = main_rows_current;
   auto EvaluateMergeTriggerDecision =
       [&](const DeltaShard& shard, const OnlinePQUpdateStats& pq_stats)
       -> Result<MergeTriggerDecision> {
@@ -1622,6 +1674,253 @@ int main(int argc, char** argv) {
     }
     decision.reason = reason;
     return decision;
+  };
+
+  auto EvaluateGlobalRebuildDecision = [&](uint32_t seen_rows)
+      -> Result<GlobalRebuildDecision> {
+    GlobalRebuildDecision decision;
+    decision.seen_rows = seen_rows;
+    decision.main_rows_current = main_rows_current;
+    if (main_rows_current >= last_global_rebuild_main_rows) {
+      decision.main_rows_since_last_rebuild = main_rows_current - last_global_rebuild_main_rows;
+    }
+    decision.reason = "none";
+    if (!config.enable_global_rebuild || config.global_rebuild_max_count == 0) {
+      return decision;
+    }
+    if (global_rebuild_count >= config.global_rebuild_max_count) {
+      decision.reason = "max_count_reached";
+      return decision;
+    }
+    if (!main_ivf) {
+      return Status::InvalidArgument("EvaluateGlobalRebuildDecision: main ivf is null");
+    }
+    decision.main_rows_trigger =
+        config.global_rebuild_force_main_rows > 0 &&
+        decision.main_rows_since_last_rebuild >= config.global_rebuild_force_main_rows;
+
+    auto sizes_res = main_ivf->GetPartitionSizes(main_versions);
+    if (!sizes_res.ok()) {
+      return sizes_res.status();
+    }
+    const std::vector<uint32_t>& sizes = sizes_res.value();
+    decision.main_nlist = static_cast<uint32_t>(sizes.size());
+    uint64_t non_empty_total = 0;
+    for (uint32_t sz : sizes) {
+      if (sz > 0) {
+        decision.main_non_empty_lists++;
+        non_empty_total += static_cast<uint64_t>(sz);
+      }
+      decision.main_max_list_size = std::max<uint32_t>(decision.main_max_list_size, sz);
+    }
+    if (decision.main_non_empty_lists > 0) {
+      decision.main_avg_non_empty_list_size =
+          static_cast<double>(non_empty_total) /
+          static_cast<double>(decision.main_non_empty_lists);
+    }
+    const double denom = std::max(1.0, decision.main_avg_non_empty_list_size);
+    decision.main_imbalance_ratio =
+        static_cast<double>(decision.main_max_list_size) / denom;
+    if (config.global_rebuild_main_imbalance_ratio > 0.0) {
+      decision.imbalance_trigger =
+          decision.main_imbalance_ratio >= config.global_rebuild_main_imbalance_ratio;
+    }
+
+    decision.should_trigger = decision.main_rows_trigger || decision.imbalance_trigger;
+    if (!decision.should_trigger) {
+      decision.reason = "none";
+      return decision;
+    }
+    if (config.global_rebuild_cooldown_rows > 0 && seen_rows > last_global_rebuild_rows &&
+        (seen_rows - last_global_rebuild_rows) < config.global_rebuild_cooldown_rows) {
+      decision.should_trigger = false;
+      decision.reason = "cooldown";
+      return decision;
+    }
+
+    std::string reason;
+    auto append_reason = [&](const std::string& token) {
+      if (!reason.empty()) {
+        reason += "+";
+      }
+      reason += token;
+    };
+    if (decision.main_rows_trigger) {
+      append_reason("main_rows");
+    }
+    if (decision.imbalance_trigger) {
+      append_reason("main_structure_imbalance");
+    }
+    decision.reason = reason.empty() ? "triggered" : reason;
+    return decision;
+  };
+
+  auto RunGlobalRebuild = [&](const GlobalRebuildDecision& trigger) -> Status {
+    if (!trigger.should_trigger) {
+      return Status::OK();
+    }
+    if (trigger.seen_rows == 0 || trigger.seen_rows > nx) {
+      return Status::InvalidArgument("RunGlobalRebuild: invalid seen_rows");
+    }
+    if (global_rebuild_count >= config.global_rebuild_max_count) {
+      return Status::OK();
+    }
+
+    Timer total_timer;
+    const uint32_t seen_rows = trigger.seen_rows;
+    const uint32_t old_main_rows = main_rows_current;
+    uint32_t rebuild_main_rows = seen_rows;
+    if (delta_train_rows > 0 && seen_rows > delta_train_rows) {
+      rebuild_main_rows = seen_rows - delta_train_rows;
+    }
+    rebuild_main_rows = std::max<uint32_t>(1, rebuild_main_rows);
+    const uint32_t active_seed_begin = rebuild_main_rows;
+    const uint32_t active_seed_rows = seen_rows > active_seed_begin ? seen_rows - active_seed_begin : 0;
+
+    Timer fit_timer;
+    auto new_whiten_res = whitening->Fit(X.topRows(seen_rows));
+    if (!new_whiten_res.ok()) {
+      return new_whiten_res.status();
+    }
+    const VersionId new_whiten_version = new_whiten_res.value();
+    const double whitening_ms = fit_timer.ElapsedMillis();
+
+    Timer transform_timer;
+    auto xb_res = whitening->TransformBatch(X, new_whiten_version);
+    if (!xb_res.ok()) {
+      return xb_res.status();
+    }
+    auto qb_res = whitening->TransformBatch(Q, new_whiten_version);
+    if (!qb_res.ok()) {
+      return qb_res.status();
+    }
+    MatrixRM new_x_whitened = xb_res.value();
+    MatrixRM new_q_whitened = qb_res.value();
+    const double whitening_transform_ms = transform_timer.ElapsedMillis();
+
+    auto new_main_ivf = CreateIVFIndex();
+    std::vector<DocId> main_ids(static_cast<size_t>(rebuild_main_rows));
+    std::iota(main_ids.begin(), main_ids.end(), 0);
+    MatrixRM main_train = new_x_whitened.topRows(rebuild_main_rows);
+    Timer build_timer;
+    auto new_main_version_res = new_main_ivf->Build(main_train, main_ids, ivf_params, 0);
+    if (!new_main_version_res.ok()) {
+      return new_main_version_res.status();
+    }
+    const double main_build_ms = build_timer.ElapsedMillis();
+    const VersionSet new_main_versions{new_whiten_version, new_main_version_res.value()};
+
+    Timer add_main_timer;
+    Status add_main =
+        AddRangeToIndex(new_main_ivf, new_x_whitened, 0, rebuild_main_rows, config.dim, new_main_versions);
+    if (!add_main.ok()) {
+      return add_main;
+    }
+    const double main_add_ms = add_main_timer.ElapsedMillis();
+
+    std::optional<DeltaShard> rebuilt_active_delta;
+    std::deque<DocId> rebuilt_sliding_window_doc_ids;
+    bool rebuilt_pending_active_train = false;
+    uint32_t rebuilt_pending_active_train_begin = 0;
+    double delta_seed_ms = 0.0;
+    if (config.enable_streaming && rows_after_main > 0) {
+      if (active_seed_rows > 0) {
+        Timer delta_timer;
+        MatrixRM delta_train = new_x_whitened.middleRows(active_seed_begin, active_seed_rows);
+        IVFParams delta_params = ivf_params;
+        delta_params.nlist = std::max(1u, delta_ivf_nlist);
+        delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
+        auto active_res =
+            BuildDeltaShard(delta_train, delta_params, new_whiten_version, next_delta_shard_id++);
+        if (!active_res.ok()) {
+          return active_res.status();
+        }
+        DeltaShard shard = active_res.value();
+        const Status add_delta_seed = AddRangeToIndex(shard.ivf,
+                                                      new_x_whitened,
+                                                      active_seed_begin,
+                                                      seen_rows,
+                                                      config.dim,
+                                                      shard.versions);
+        if (!add_delta_seed.ok()) {
+          return add_delta_seed;
+        }
+        shard.rows = active_seed_rows;
+        rebuilt_active_delta = std::move(shard);
+        for (uint32_t i = active_seed_begin; i < seen_rows; ++i) {
+          rebuilt_sliding_window_doc_ids.push_back(i);
+        }
+        delta_seed_ms = delta_timer.ElapsedMillis();
+      } else if (seen_rows < nx && delta_train_rows > 0) {
+        rebuilt_pending_active_train = true;
+        rebuilt_pending_active_train_begin = seen_rows;
+      }
+    }
+
+    X_whitened = std::move(new_x_whitened);
+    Q_whitened = std::move(new_q_whitened);
+    whiten_version = new_whiten_version;
+    main_ivf = std::move(new_main_ivf);
+    main_versions = new_main_versions;
+    main_rows_current = rebuild_main_rows;
+    active_delta = std::move(rebuilt_active_delta);
+    frozen_delta.reset();
+    frozen_trigger_decision.reset();
+    pending_active_train = rebuilt_pending_active_train;
+    pending_active_train_begin = rebuilt_pending_active_train_begin;
+    sliding_window_doc_ids = std::move(rebuilt_sliding_window_doc_ids);
+    last_online_pq_stats = OnlinePQUpdateStats{};
+
+    const double total_ms = total_timer.ElapsedMillis();
+    rebuild_ms_total += total_ms;
+    global_rebuild_count++;
+    last_global_rebuild_rows = seen_rows;
+    last_global_rebuild_main_rows = main_rows_current;
+
+    GlobalRebuildEventRecord event;
+    event.base_rows = seen_rows;
+    event.old_main_rows = old_main_rows;
+    event.new_main_rows = rebuild_main_rows;
+    event.active_seed_rows = active_seed_rows;
+    event.rebuild_count = global_rebuild_count;
+    event.max_count = config.global_rebuild_max_count;
+    event.main_nlist = trigger.main_nlist;
+    event.main_non_empty_lists = trigger.main_non_empty_lists;
+    event.main_max_list_size = trigger.main_max_list_size;
+    event.main_avg_non_empty_list_size = trigger.main_avg_non_empty_list_size;
+    event.trigger_main_rows = trigger.main_rows_trigger;
+    event.trigger_imbalance = trigger.imbalance_trigger;
+    event.trigger_main_rows_since_last_rebuild = trigger.main_rows_since_last_rebuild;
+    event.trigger_main_rows_threshold = config.global_rebuild_force_main_rows;
+    event.trigger_imbalance_threshold = config.global_rebuild_main_imbalance_ratio;
+    event.threshold = config.global_rebuild_main_imbalance_ratio;
+    event.main_imbalance_ratio = trigger.main_imbalance_ratio;
+    event.whitening_ms = whitening_ms;
+    event.whitening_transform_ms = whitening_transform_ms;
+    event.main_build_ms = main_build_ms;
+    event.main_add_ms = main_add_ms;
+    event.delta_seed_ms = delta_seed_ms;
+    event.total_ms = total_ms;
+    event.reason = trigger.reason;
+    global_rebuild_events.push_back(event);
+
+    std::cout << "[GLOBAL REBUILD] done: base_rows=" << seen_rows
+              << ", reason=" << trigger.reason
+              << ", count=" << global_rebuild_count << "/" << config.global_rebuild_max_count
+              << ", main_rows_since_last=" << trigger.main_rows_since_last_rebuild
+              << ", main_rows_threshold=" << config.global_rebuild_force_main_rows
+              << ", imbalance=" << trigger.main_imbalance_ratio
+              << ", imbalance_threshold=" << config.global_rebuild_main_imbalance_ratio
+              << ", old_main_rows=" << old_main_rows
+              << ", new_main_rows=" << rebuild_main_rows
+              << ", active_seed_rows=" << active_seed_rows
+              << ", whitening_ms=" << whitening_ms
+              << ", whitening_transform_ms=" << whitening_transform_ms
+              << ", main_build_ms=" << main_build_ms
+              << ", main_add_ms=" << main_add_ms
+              << ", delta_seed_ms=" << delta_seed_ms
+              << ", total_ms=" << total_ms << std::endl;
+    return Status::OK();
   };
 
   std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
@@ -2064,6 +2363,31 @@ int main(int argc, char** argv) {
         frozen_delta.reset();
         frozen_trigger_decision.reset();
       }
+
+      if (config.enable_global_rebuild && next_insert_idx < nx) {
+        auto global_trigger_res = EvaluateGlobalRebuildDecision(next_insert_idx);
+        if (!global_trigger_res.ok()) {
+          std::cerr << global_trigger_res.status().ToString() << std::endl;
+          return 1;
+        }
+        const GlobalRebuildDecision& global_trigger = global_trigger_res.value();
+        std::cout << "[GLOBAL REBUILD] check: base_rows=" << next_insert_idx
+                  << ", main_rows_current=" << global_trigger.main_rows_current
+                  << ", main_rows_since_last=" << global_trigger.main_rows_since_last_rebuild
+                  << ", imbalance=" << global_trigger.main_imbalance_ratio
+                  << ", imbalance_threshold=" << config.global_rebuild_main_imbalance_ratio
+                  << ", rows_trigger=" << std::boolalpha << global_trigger.main_rows_trigger
+                  << ", imbalance_trigger=" << global_trigger.imbalance_trigger
+                  << ", should_trigger=" << global_trigger.should_trigger
+                  << ", reason=" << global_trigger.reason << std::noboolalpha << std::endl;
+        if (global_trigger.should_trigger) {
+          Status rebuild_status = RunGlobalRebuild(global_trigger);
+          if (!rebuild_status.ok()) {
+            std::cerr << rebuild_status.ToString() << std::endl;
+            return 1;
+          }
+        }
+      }
     }
   }
 
@@ -2106,6 +2430,11 @@ int main(int argc, char** argv) {
             << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
             << "; QPS=" << final_metrics.qps << std::endl;
+  std::cout << "[GLOBAL REBUILD] enabled=" << std::boolalpha << config.enable_global_rebuild
+            << ", count=" << global_rebuild_count << "/" << config.global_rebuild_max_count
+            << ", trigger_main_imbalance=" << config.global_rebuild_main_imbalance_ratio
+            << ", trigger_main_rows=" << config.global_rebuild_force_main_rows
+            << ", cooldown_rows=" << config.global_rebuild_cooldown_rows << std::endl;
   std::cout << "[ONLINE PQ] enabled=" << std::boolalpha << online_pq_options.enable
             << ", mode=" << config.online_pq_update_scheme
             << ", batches=" << online_pq_rollup.batches
@@ -2174,6 +2503,15 @@ int main(int argc, char** argv) {
       << ",\n";
   ofs << "    \"merge_trigger_imbalance_ratio\": " << config.merge_trigger_imbalance_ratio
       << ",\n";
+  ofs << "    \"enable_global_rebuild\": "
+      << (config.enable_global_rebuild ? "true" : "false") << ",\n";
+  ofs << "    \"global_rebuild_max_count\": " << config.global_rebuild_max_count << ",\n";
+  ofs << "    \"global_rebuild_main_imbalance_ratio\": "
+      << config.global_rebuild_main_imbalance_ratio << ",\n";
+  ofs << "    \"global_rebuild_force_main_rows\": " << config.global_rebuild_force_main_rows
+      << ",\n";
+  ofs << "    \"global_rebuild_cooldown_rows\": " << config.global_rebuild_cooldown_rows
+      << ",\n";
   ofs << "    \"delta_kmeans_iterations\": " << kDeltaKMeansIterationsDefault << ",\n";
   ofs << "    \"stream_start_row\": " << stream_start_idx << ",\n";
   ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
@@ -2221,6 +2559,7 @@ int main(int argc, char** argv) {
   ofs << "    \"qps\": " << final_metrics.qps << ",\n";
   ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
+  ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
   ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << ",\n";
@@ -2334,6 +2673,46 @@ int main(int argc, char** argv) {
     ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
     ofs << "    }";
     if (i + 1 < merge_events.size()) {
+      ofs << ",";
+    }
+    ofs << "\n";
+  }
+  ofs << "  ],\n";
+  ofs << "  \"global_rebuild_events\": [\n";
+  for (size_t i = 0; i < global_rebuild_events.size(); ++i) {
+    const auto& ev = global_rebuild_events[i];
+    ofs << "    {\n";
+    ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
+    ofs << "      \"old_main_rows\": " << ev.old_main_rows << ",\n";
+    ofs << "      \"new_main_rows\": " << ev.new_main_rows << ",\n";
+    ofs << "      \"active_seed_rows\": " << ev.active_seed_rows << ",\n";
+    ofs << "      \"rebuild_count\": " << ev.rebuild_count << ",\n";
+    ofs << "      \"max_count\": " << ev.max_count << ",\n";
+    ofs << "      \"main_nlist\": " << ev.main_nlist << ",\n";
+    ofs << "      \"main_non_empty_lists\": " << ev.main_non_empty_lists << ",\n";
+    ofs << "      \"main_max_list_size\": " << ev.main_max_list_size << ",\n";
+    ofs << "      \"main_avg_non_empty_list_size\": " << ev.main_avg_non_empty_list_size
+        << ",\n";
+    ofs << "      \"trigger_main_rows\": " << (ev.trigger_main_rows ? "true" : "false")
+        << ",\n";
+    ofs << "      \"trigger_imbalance\": " << (ev.trigger_imbalance ? "true" : "false")
+        << ",\n";
+    ofs << "      \"trigger_main_rows_since_last_rebuild\": "
+        << ev.trigger_main_rows_since_last_rebuild << ",\n";
+    ofs << "      \"trigger_main_rows_threshold\": " << ev.trigger_main_rows_threshold << ",\n";
+    ofs << "      \"trigger_imbalance_threshold\": " << ev.trigger_imbalance_threshold
+        << ",\n";
+    ofs << "      \"threshold\": " << ev.threshold << ",\n";
+    ofs << "      \"main_imbalance_ratio\": " << ev.main_imbalance_ratio << ",\n";
+    ofs << "      \"reason\": \"" << ev.reason << "\",\n";
+    ofs << "      \"whitening_ms\": " << ev.whitening_ms << ",\n";
+    ofs << "      \"whitening_transform_ms\": " << ev.whitening_transform_ms << ",\n";
+    ofs << "      \"main_build_ms\": " << ev.main_build_ms << ",\n";
+    ofs << "      \"main_add_ms\": " << ev.main_add_ms << ",\n";
+    ofs << "      \"delta_seed_ms\": " << ev.delta_seed_ms << ",\n";
+    ofs << "      \"total_ms\": " << ev.total_ms << "\n";
+    ofs << "    }";
+    if (i + 1 < global_rebuild_events.size()) {
       ofs << ",";
     }
     ofs << "\n";

@@ -54,6 +54,18 @@ struct Config {
   double merge_trigger_delta_main_ratio{0.0};
   // Trigger when max_list_size / avg_non_empty_list_size >= threshold. 0 disables it.
   double merge_trigger_imbalance_ratio{0.0};
+  // Global rebuild trigger config (keep small and explicit).
+  bool enable_global_rebuild{false};
+  // Hard cap of global rebuild count in one run; 0 disables global rebuild.
+  uint32_t global_rebuild_max_count{0};
+  // Trigger global rebuild when main max_list_size / avg_non_empty_list_size >= threshold.
+  // 0 disables this trigger.
+  double global_rebuild_main_imbalance_ratio{0.0};
+  // Force global rebuild when main rows increased by this amount since last global rebuild.
+  // 0 disables this fallback trigger.
+  uint32_t global_rebuild_force_main_rows{0};
+  // Minimum row gap between two global rebuilds. 0 disables cooldown.
+  uint32_t global_rebuild_cooldown_rows{0};
   std::string streaming_mode{"streaming"};
   uint32_t stream_batch_size{100};
   bool streaming_use_stream_batch_size{false};

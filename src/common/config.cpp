@@ -83,6 +83,11 @@ std::string Config::ToString() const {
       << "merge_trigger_drift=" << merge_trigger_drift << ", "
       << "merge_trigger_delta_main_ratio=" << merge_trigger_delta_main_ratio << ", "
       << "merge_trigger_imbalance_ratio=" << merge_trigger_imbalance_ratio << ", "
+      << "enable_global_rebuild=" << std::boolalpha << enable_global_rebuild << ", "
+      << "global_rebuild_max_count=" << global_rebuild_max_count << ", "
+      << "global_rebuild_main_imbalance_ratio=" << global_rebuild_main_imbalance_ratio << ", "
+      << "global_rebuild_force_main_rows=" << global_rebuild_force_main_rows << ", "
+      << "global_rebuild_cooldown_rows=" << global_rebuild_cooldown_rows << ", "
       << "streaming_mode=" << streaming_mode << ", "
       << "stream_batch_size=" << stream_batch_size << ", "
       << "streaming_use_stream_batch_size=" << std::boolalpha << streaming_use_stream_batch_size
@@ -147,6 +152,13 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractDouble(text, "merge_trigger_drift", &cfg.merge_trigger_drift);
   ExtractDouble(text, "merge_trigger_delta_main_ratio", &cfg.merge_trigger_delta_main_ratio);
   ExtractDouble(text, "merge_trigger_imbalance_ratio", &cfg.merge_trigger_imbalance_ratio);
+  ExtractBool(text, "enable_global_rebuild", &cfg.enable_global_rebuild);
+  ExtractUint(text, "global_rebuild_max_count", &cfg.global_rebuild_max_count);
+  ExtractDouble(text,
+                "global_rebuild_main_imbalance_ratio",
+                &cfg.global_rebuild_main_imbalance_ratio);
+  ExtractUint(text, "global_rebuild_force_main_rows", &cfg.global_rebuild_force_main_rows);
+  ExtractUint(text, "global_rebuild_cooldown_rows", &cfg.global_rebuild_cooldown_rows);
   ExtractString(text, "streaming_mode", &cfg.streaming_mode);
   ExtractUint(text, "stream_batch_size", &cfg.stream_batch_size);
   ExtractBool(text, "streaming_use_stream_batch_size", &cfg.streaming_use_stream_batch_size);
@@ -210,6 +222,9 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   if (cfg.merge_trigger_imbalance_ratio < 0.0) {
     return Status::InvalidArgument("merge_trigger_imbalance_ratio must be >= 0");
   }
+  if (cfg.global_rebuild_main_imbalance_ratio < 0.0) {
+    return Status::InvalidArgument("global_rebuild_main_imbalance_ratio must be >= 0");
+  }
   if (cfg.merge_trigger_mode == "qe_ratio" && cfg.merge_trigger_qe_ratio <= 0.0) {
     return Status::InvalidArgument(
         "merge_trigger_qe_ratio must be > 0 when merge_trigger_mode=\"qe_ratio\"");
@@ -240,6 +255,17 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
     return Status::InvalidArgument(
         "hybrid merge trigger needs at least one enabled trigger: "
         "rows/qe_ratio/drift/delta_main_ratio/imbalance");
+  }
+  if (cfg.enable_global_rebuild && cfg.global_rebuild_max_count == 0) {
+    return Status::InvalidArgument(
+        "global_rebuild_max_count must be > 0 when enable_global_rebuild=true");
+  }
+  if (cfg.enable_global_rebuild && cfg.global_rebuild_main_imbalance_ratio <= 0.0) {
+    if (cfg.global_rebuild_force_main_rows == 0) {
+      return Status::InvalidArgument(
+          "enable_global_rebuild=true requires at least one trigger: "
+          "global_rebuild_main_imbalance_ratio>0 or global_rebuild_force_main_rows>0");
+    }
   }
   if (cfg.online_pq_update_scheme != "minibatch" &&
       cfg.online_pq_update_scheme != "sliding_window") {
