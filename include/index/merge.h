@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "common/result.h"
@@ -48,6 +49,11 @@ struct MergeOptions {
   uint32_t local_recluster_k{2};
   uint32_t local_kmeans_iterations{5};
   bool enable_local_centroid_refine{false};
+  std::string assignment_mode{"local_constrained"};
+  uint32_t assignment_top_r{4};
+  double assignment_gamma{1.05};
+  double assignment_hard_cap_ratio{1.5};
+  double assignment_lambda{0.2};
 };
 
 struct DistributionSummary {
@@ -63,6 +69,11 @@ struct MergeReport {
   uint32_t append_partitions{0};
   uint32_t recluster_partitions{0};
   double codebook_rebuild_ms{0.0};
+  double moved_delta_ratio{0.0};
+  double avg_assignment_dist_ratio{1.0};
+  double max_assignment_dist_ratio{1.0};
+  double imbalance_before{0.0};
+  double imbalance_after{0.0};
   DistributionSummary score_summary;
   DistributionSummary residual_summary;
   DistributionSummary growth_summary;

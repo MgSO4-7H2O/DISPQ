@@ -117,6 +117,60 @@ Fixture BuildFixture() {
   return fx;
 }
 
+Fixture BuildHealthierNeighborFixture() {
+  constexpr uint32_t kDim = 2;
+  MatrixRM centroids(2, kDim);
+  centroids << 0.0f, 0.0f, 1.0f, 0.0f;
+
+  MatrixRM train = MatrixRM::Zero(2, kDim);
+  std::vector<DocId> train_ids = {0, 1};
+
+  IVFParams params;
+  params.nlist = 2;
+  params.dim = kDim;
+  params.use_fixed_routing_centroids = true;
+  params.fixed_routing_centroids = centroids;
+  params.pq.enable = false;
+
+  auto main_ivf = CreateIVFIndex();
+  auto main_ver = main_ivf->Build(train, train_ids, params, 301);
+  assert(main_ver.ok());
+  VersionSet main_versions{0, main_ver.value()};
+
+  MatrixRM main_docs(10, kDim);
+  main_docs << 0.00f, 0.00f,
+      0.01f, 0.00f,
+      0.02f, 0.00f,
+      0.03f, 0.00f,
+      0.04f, 0.00f,
+      0.05f, 0.00f,
+      0.06f, 0.00f,
+      1.00f, 0.00f,
+      1.01f, 0.00f,
+      1.02f, 0.00f;
+  std::vector<DocId> main_doc_ids = {10, 11, 12, 13, 14, 15, 16, 20, 21, 22};
+  auto main_records = MakeRecords(main_docs, main_doc_ids, kDim, main_versions);
+  assert(main_ivf->Add(main_records).ok());
+
+  auto delta_ivf = CreateIVFIndex();
+  auto delta_ver = delta_ivf->Build(train, train_ids, params, 302);
+  assert(delta_ver.ok());
+  VersionSet delta_versions{0, delta_ver.value()};
+
+  MatrixRM delta_docs(1, kDim);
+  delta_docs << 0.49f, 0.0f;
+  std::vector<DocId> delta_doc_ids = {200};
+  auto delta_records = MakeRecords(delta_docs, delta_doc_ids, kDim, delta_versions);
+  assert(delta_ivf->Add(delta_records).ok());
+
+  Fixture fx;
+  fx.main_ivf = main_ivf;
+  fx.main_versions = main_versions;
+  fx.delta_ivf = delta_ivf;
+  fx.delta_versions = delta_versions;
+  return fx;
+}
+
 }  // namespace
 
 int main() {
@@ -242,6 +296,28 @@ int main() {
   assert(sizes_after_full[0] == 3);
   assert(sizes_after_full[1] == 3);
   assert(sizes_after_full[2] == 1);
+
+  // 7) local constrained assignment should prefer a healthier nearby list
+  // when the nearest list is already overloaded relative to local average.
+  Fixture fx3 = BuildHealthierNeighborFixture();
+  MergeOptions constrained_options;
+  constrained_options.alpha = 0.0;
+  constrained_options.beta = 0.0;
+  constrained_options.recluster_threshold = 1.0;
+  constrained_options.assignment_mode = "local_constrained";
+  constrained_options.assignment_top_r = 2;
+  constrained_options.assignment_gamma = 1.1;
+  constrained_options.assignment_hard_cap_ratio = 1.5;
+  constrained_options.assignment_lambda = 0.0;
+  auto constrained_merge_res = merge_frozen_delta_into_main(
+      fx3.main_ivf, fx3.main_versions, fx3.delta_ivf, fx3.delta_versions, constrained_options);
+  assert(constrained_merge_res.ok());
+  auto constrained_sizes_res = fx3.main_ivf->GetPartitionSizes(fx3.main_versions);
+  assert(constrained_sizes_res.ok());
+  const auto& constrained_sizes = constrained_sizes_res.value();
+  assert(constrained_sizes.size() == 2);
+  assert(constrained_sizes[0] == 7);
+  assert(constrained_sizes[1] == 4);
 
   return 0;
 }

@@ -83,6 +83,11 @@ std::string Config::ToString() const {
       << "merge_trigger_drift=" << merge_trigger_drift << ", "
       << "merge_trigger_delta_main_ratio=" << merge_trigger_delta_main_ratio << ", "
       << "merge_trigger_imbalance_ratio=" << merge_trigger_imbalance_ratio << ", "
+      << "merge_assignment_mode=" << merge_assignment_mode << ", "
+      << "merge_assignment_top_r=" << merge_assignment_top_r << ", "
+      << "merge_assignment_gamma=" << merge_assignment_gamma << ", "
+      << "merge_assignment_hard_cap_ratio=" << merge_assignment_hard_cap_ratio << ", "
+      << "merge_assignment_lambda=" << merge_assignment_lambda << ", "
       << "enable_global_rebuild=" << std::boolalpha << enable_global_rebuild << ", "
       << "global_rebuild_max_count=" << global_rebuild_max_count << ", "
       << "global_rebuild_main_imbalance_ratio=" << global_rebuild_main_imbalance_ratio << ", "
@@ -152,6 +157,11 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractDouble(text, "merge_trigger_drift", &cfg.merge_trigger_drift);
   ExtractDouble(text, "merge_trigger_delta_main_ratio", &cfg.merge_trigger_delta_main_ratio);
   ExtractDouble(text, "merge_trigger_imbalance_ratio", &cfg.merge_trigger_imbalance_ratio);
+  ExtractString(text, "merge_assignment_mode", &cfg.merge_assignment_mode);
+  ExtractUint(text, "merge_assignment_top_r", &cfg.merge_assignment_top_r);
+  ExtractDouble(text, "merge_assignment_gamma", &cfg.merge_assignment_gamma);
+  ExtractDouble(text, "merge_assignment_hard_cap_ratio", &cfg.merge_assignment_hard_cap_ratio);
+  ExtractDouble(text, "merge_assignment_lambda", &cfg.merge_assignment_lambda);
   ExtractBool(text, "enable_global_rebuild", &cfg.enable_global_rebuild);
   ExtractUint(text, "global_rebuild_max_count", &cfg.global_rebuild_max_count);
   ExtractDouble(text,
@@ -221,6 +231,24 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.merge_trigger_imbalance_ratio < 0.0) {
     return Status::InvalidArgument("merge_trigger_imbalance_ratio must be >= 0");
+  }
+  if (cfg.merge_assignment_mode != "nearest" &&
+      cfg.merge_assignment_mode != "local_constrained" &&
+      cfg.merge_assignment_mode != "balanced_append") {
+    return Status::InvalidArgument(
+        "merge_assignment_mode must be one of \"nearest\", \"local_constrained\", \"balanced_append\"");
+  }
+  if (cfg.merge_assignment_top_r == 0) {
+    return Status::InvalidArgument("merge_assignment_top_r must be > 0");
+  }
+  if (cfg.merge_assignment_gamma <= 0.0) {
+    return Status::InvalidArgument("merge_assignment_gamma must be > 0");
+  }
+  if (cfg.merge_assignment_hard_cap_ratio <= 0.0) {
+    return Status::InvalidArgument("merge_assignment_hard_cap_ratio must be > 0");
+  }
+  if (cfg.merge_assignment_lambda < 0.0) {
+    return Status::InvalidArgument("merge_assignment_lambda must be >= 0");
   }
   if (cfg.global_rebuild_main_imbalance_ratio < 0.0) {
     return Status::InvalidArgument("global_rebuild_main_imbalance_ratio must be >= 0");

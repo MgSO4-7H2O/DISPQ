@@ -54,6 +54,18 @@ struct Config {
   double merge_trigger_delta_main_ratio{0.0};
   // Trigger when max_list_size / avg_non_empty_list_size >= threshold. 0 disables it.
   double merge_trigger_imbalance_ratio{0.0};
+  // Delta->main assignment mode during merge:
+  // - "nearest": always nearest main centroid
+  // - "local_constrained" or "balanced_append": constrained local balancing
+  std::string merge_assignment_mode{"local_constrained"};
+  // top-r nearest centroids considered by constrained assignment.
+  uint32_t merge_assignment_top_r{4};
+  // candidate must satisfy dist <= gamma * nearest_dist.
+  double merge_assignment_gamma{1.05};
+  // hard cap ratio on projected list size: hard_cap = avg_after * ratio.
+  double merge_assignment_hard_cap_ratio{1.5};
+  // cost weight for balance penalty in constrained assignment.
+  double merge_assignment_lambda{0.2};
   // Global rebuild trigger config (keep small and explicit).
   bool enable_global_rebuild{false};
   // Hard cap of global rebuild count in one run; 0 disables global rebuild.

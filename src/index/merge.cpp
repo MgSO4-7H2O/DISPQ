@@ -56,6 +56,174 @@ DistributionSummary SummarizeDistribution(std::vector<double> values) {
   return summary;
 }
 
+struct AssignmentDiagnostics {
+  double moved_delta_ratio{0.0};
+  double avg_assignment_dist_ratio{1.0};
+  double max_assignment_dist_ratio{1.0};
+  double imbalance_before{0.0};
+  double imbalance_after{0.0};
+};
+
+double ComputeImbalanceRatio(const std::vector<uint32_t>& sizes) {
+  if (sizes.empty()) {
+    return 0.0;
+  }
+  uint64_t total = 0;
+  uint32_t max_size = 0;
+  for (uint32_t sz : sizes) {
+    total += static_cast<uint64_t>(sz);
+    max_size = std::max<uint32_t>(max_size, sz);
+  }
+  const double avg = static_cast<double>(total) / static_cast<double>(sizes.size());
+  return static_cast<double>(max_size) / std::max(1.0, avg);
+}
+
+Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
+    const FrozenDelta& frozen_delta,
+    Eigen::Ref<const MatrixRM> main_centroids,
+    const std::vector<uint32_t>& main_partition_sizes,
+    const MergeOptions& options,
+    AssignmentDiagnostics* diag_out) {
+  if (main_centroids.rows() == 0 || main_centroids.cols() == 0) {
+    return Status::InvalidArgument("assign_delta_to_main_centroids_for_merge: empty main_centroids");
+  }
+  if (main_partition_sizes.size() != static_cast<size_t>(main_centroids.rows())) {
+    return Status::InvalidArgument(
+        "assign_delta_to_main_centroids_for_merge: main_partition_sizes size mismatch");
+  }
+
+  AssignmentDiagnostics diag;
+  diag.imbalance_before = ComputeImbalanceRatio(main_partition_sizes);
+
+  const uint32_t nlist = static_cast<uint32_t>(main_centroids.rows());
+  const bool use_local_constrained =
+      options.assignment_mode == "local_constrained" || options.assignment_mode == "balanced_append";
+  const uint32_t top_r = std::max<uint32_t>(1, std::min<uint32_t>(options.assignment_top_r, nlist));
+  const double main_rows = std::accumulate(main_partition_sizes.begin(),
+                                           main_partition_sizes.end(),
+                                           0.0);
+  const double delta_rows = static_cast<double>(frozen_delta.records.size());
+  const double avg_after = (main_rows + delta_rows) / std::max(1.0, static_cast<double>(nlist));
+  const double hard_cap = avg_after * options.assignment_hard_cap_ratio;
+  const double balance_denom = std::max(1.0, avg_after);
+  const double eps = 1e-12;
+
+  PartitionAssignments assigned(static_cast<size_t>(nlist));
+  std::vector<uint32_t> projected_size = main_partition_sizes;
+  uint32_t moved_count = 0;
+  double ratio_sum = 0.0;
+  double ratio_max = 1.0;
+
+  for (const auto& rec : frozen_delta.records) {
+    if (rec.x.size() != main_centroids.cols()) {
+      return Status::InvalidArgument(
+          "assign_delta_to_main_centroids_for_merge: record dim mismatch with main centroids");
+    }
+
+    std::vector<std::pair<float, uint32_t>> dists;
+    dists.reserve(static_cast<size_t>(nlist));
+    for (uint32_t i = 0; i < nlist; ++i) {
+      const float dist =
+          (rec.x - main_centroids.row(static_cast<Eigen::Index>(i)).transpose()).squaredNorm();
+      dists.emplace_back(dist, i);
+    }
+    std::partial_sort(dists.begin(),
+                      dists.begin() + static_cast<std::ptrdiff_t>(top_r),
+                      dists.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+    const uint32_t nearest_partition = dists[0].second;
+    const float nearest_dist = dists[0].first;
+    uint32_t chosen_partition = nearest_partition;
+    float chosen_dist = nearest_dist;
+
+    if (use_local_constrained) {
+      const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
+      const double nearest_penalty = std::max(
+          0.0,
+          (static_cast<double>(projected_size[static_cast<size_t>(nearest_partition)]) + 1.0) -
+              avg_after) /
+          balance_denom;
+      const bool nearest_overloaded = nearest_penalty > 0.0;
+
+      struct CandidateState {
+        uint32_t part{0};
+        float dist{0.0f};
+        double penalty{0.0};
+        double cost{0.0};
+      };
+
+      std::vector<CandidateState> legal_candidates;
+      legal_candidates.reserve(top_r);
+      std::vector<CandidateState> healthier_candidates;
+      healthier_candidates.reserve(top_r);
+
+      for (uint32_t k = 0; k < top_r; ++k) {
+        const float dist = dists[static_cast<size_t>(k)].first;
+        const uint32_t part = dists[static_cast<size_t>(k)].second;
+        if (dist > dist_cap) {
+          continue;
+        }
+        if (static_cast<double>(projected_size[static_cast<size_t>(part)]) >= hard_cap) {
+          continue;
+        }
+        CandidateState cand;
+        cand.part = part;
+        cand.dist = dist;
+        cand.penalty = std::max(
+            0.0,
+            (static_cast<double>(projected_size[static_cast<size_t>(part)]) + 1.0) - avg_after) /
+                       balance_denom;
+        cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
+        legal_candidates.push_back(cand);
+        if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
+          healthier_candidates.push_back(cand);
+        }
+      }
+
+      const std::vector<CandidateState>& candidates =
+          healthier_candidates.empty() ? legal_candidates : healthier_candidates;
+      double best_cost = std::numeric_limits<double>::infinity();
+      bool found_candidate = false;
+      for (const auto& cand : candidates) {
+        if (!found_candidate || cand.cost < best_cost) {
+          found_candidate = true;
+          best_cost = cand.cost;
+          chosen_partition = cand.part;
+          chosen_dist = cand.dist;
+        }
+      }
+    }
+
+    DeltaAssignment item;
+    item.record = rec;
+    item.record.ivf_id = chosen_partition;
+    item.main_partition = chosen_partition;
+    item.residual_dist = chosen_dist;
+    assigned[static_cast<size_t>(chosen_partition)].push_back(std::move(item));
+    projected_size[static_cast<size_t>(chosen_partition)]++;
+
+    if (chosen_partition != nearest_partition) {
+      moved_count++;
+    }
+    const double ratio = nearest_dist > eps ? static_cast<double>(chosen_dist) / nearest_dist : 1.0;
+    ratio_sum += ratio;
+    ratio_max = std::max(ratio_max, ratio);
+  }
+
+  if (!frozen_delta.records.empty()) {
+    const double denom = static_cast<double>(frozen_delta.records.size());
+    diag.moved_delta_ratio = static_cast<double>(moved_count) / denom;
+    diag.avg_assignment_dist_ratio = ratio_sum / denom;
+    diag.max_assignment_dist_ratio = ratio_max;
+  }
+  diag.imbalance_after = ComputeImbalanceRatio(projected_size);
+  if (diag_out != nullptr) {
+    *diag_out = diag;
+  }
+  return assigned;
+}
+
 }  // namespace
 
 Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
@@ -321,7 +489,9 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   if (!sizes_res.ok()) {
     return sizes_res.status();
   }
-  auto assign_res = assign_delta_to_main_centroids(frozen_delta, centroids_res.value());
+  AssignmentDiagnostics assignment_diag;
+  auto assign_res = assign_delta_to_main_centroids_for_merge(
+      frozen_delta, centroids_res.value(), sizes_res.value(), options, &assignment_diag);
   if (!assign_res.ok()) {
     return assign_res.status();
   }
@@ -354,6 +524,11 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   report.append_partitions = static_cast<uint32_t>(score_res.value().append_partitions.size());
   report.recluster_partitions = static_cast<uint32_t>(score_res.value().recluster_partitions.size());
   report.codebook_rebuild_ms = codebook_ms_res.value();
+  report.moved_delta_ratio = assignment_diag.moved_delta_ratio;
+  report.avg_assignment_dist_ratio = assignment_diag.avg_assignment_dist_ratio;
+  report.max_assignment_dist_ratio = assignment_diag.max_assignment_dist_ratio;
+  report.imbalance_before = assignment_diag.imbalance_before;
+  report.imbalance_after = assignment_diag.imbalance_after;
   std::vector<double> score_values;
   std::vector<double> residual_values;
   std::vector<double> growth_values;

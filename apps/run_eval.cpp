@@ -201,7 +201,7 @@ struct EvalMetrics {
   double total_p50{0.0};
   double total_p99{0.0};
   double avg_query_ms{0.0};
-  double qps{0.0};
+  double query_qps{0.0};
   double rebuild_ms{0.0};
   double scanned_avg{0.0};
   double scanned_p50{0.0};
@@ -209,6 +209,7 @@ struct EvalMetrics {
   double scanned_max{0.0};
   double update_total_ms{0.0};
   double update_per_vector_ms{0.0};
+  double update_throughput_vecps{0.0};
   double query_eval_ms{0.0};
   uint32_t query_count{0};
   double gt_probed_rate{0.0};
@@ -237,8 +238,9 @@ struct MinibatchRecord {
   double recall{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
-  double qps{0.0};
+  double query_qps{0.0};
   double update_ms{0.0};
+  double update_throughput_vecps{0.0};
   double query_eval_ms{0.0};
   double nqe_batch{0.0};
   double qe_ratio{1.0};
@@ -265,11 +267,11 @@ struct SnapshotRecord {
   double recall{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
-  double qps{0.0};
+  double query_qps{0.0};
   double update_ms{0.0};
   double query_eval_ms{0.0};
   double snapshot_total_ms{0.0};
-  double snapshot_qps{0.0};
+  double update_throughput_vecps{0.0};
   double nqe_batch{0.0};
   double qe_ratio{1.0};
   double codebook_drift{0.0};
@@ -303,6 +305,11 @@ struct MergeEventRecord {
   uint32_t patched_partitions{0};
   uint32_t append_partitions{0};
   uint32_t recluster_partitions{0};
+  double moved_delta_ratio{0.0};
+  double avg_assignment_dist_ratio{1.0};
+  double max_assignment_dist_ratio{1.0};
+  double imbalance_before{0.0};
+  double imbalance_after{0.0};
   std::string trigger_mode;
   std::string trigger_reason;
   bool trigger_rows{false};
@@ -1041,14 +1048,12 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   double avg_whiten = 0.0;
   double avg_search = 0.0;
   double avg_total = 0.0;
-  double total_latency_sum_ms = 0.0;
   if (nq > 0) {
     avg_whiten =
         std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) / static_cast<double>(nq);
     avg_search =
         std::accumulate(search_ms.begin(), search_ms.end(), 0.0) / static_cast<double>(nq);
     avg_total = std::accumulate(total_ms.begin(), total_ms.end(), 0.0) / static_cast<double>(nq);
-    total_latency_sum_ms = std::accumulate(total_ms.begin(), total_ms.end(), 0.0);
   }
 
   double scanned_avg = 0.0;
@@ -1063,9 +1068,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
   }
 
-  const double qps = total_latency_sum_ms > 0.0
-                         ? (1000.0 * static_cast<double>(nq) / total_latency_sum_ms)
-                         : 0.0;
+  const double query_qps = wall_elapsed_ms > 0.0
+                               ? (1000.0 * static_cast<double>(nq) / wall_elapsed_ms)
+                               : 0.0;
 
   EvalMetrics metrics;
   metrics.recall = recall_res.value();
@@ -1078,7 +1083,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.total_p50 = total_summary.value().p50_ms;
   metrics.total_p99 = total_summary.value().p99_ms;
   metrics.avg_query_ms = avg_total;
-  metrics.qps = qps;
+  metrics.query_qps = query_qps;
   metrics.scanned_avg = scanned_avg;
   metrics.scanned_p50 = scanned_p50;
   metrics.scanned_p99 = scanned_p99;
@@ -1330,6 +1335,11 @@ int main(int argc, char** argv) {
             << config.global_rebuild_main_imbalance_ratio
             << ", global_rebuild_force_main_rows=" << config.global_rebuild_force_main_rows
             << ", global_rebuild_cooldown_rows=" << config.global_rebuild_cooldown_rows
+            << ", merge_assignment_mode=" << config.merge_assignment_mode
+            << ", merge_assignment_top_r=" << config.merge_assignment_top_r
+            << ", merge_assignment_gamma=" << config.merge_assignment_gamma
+            << ", merge_assignment_hard_cap_ratio=" << config.merge_assignment_hard_cap_ratio
+            << ", merge_assignment_lambda=" << config.merge_assignment_lambda
             << ", stream_rows=" << total_stream_rows
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
@@ -1403,6 +1413,11 @@ int main(int argc, char** argv) {
   merge_options.alpha = kMergeScoreAlphaDefault;
   merge_options.beta = kMergeScoreBetaDefault;
   merge_options.recluster_threshold = kMergeScoreThresholdDefault;
+  merge_options.assignment_mode = config.merge_assignment_mode;
+  merge_options.assignment_top_r = config.merge_assignment_top_r;
+  merge_options.assignment_gamma = config.merge_assignment_gamma;
+  merge_options.assignment_hard_cap_ratio = config.merge_assignment_hard_cap_ratio;
+  merge_options.assignment_lambda = config.merge_assignment_lambda;
   if (config.enable_streaming && rows_after_main > 0) {
     // Train delta with the reserved window, then preload the same window as existing delta docs.
     MatrixRM delta_train = X_whitened.middleRows(main_rows_initial, delta_train_rows);
@@ -1982,11 +1997,11 @@ int main(int argc, char** argv) {
     snap.recall = metrics.recall;
     snap.avg_search_ms = metrics.avg_search_ms;
     snap.avg_scanned = metrics.scanned_avg;
-    snap.qps = metrics.qps;
+    snap.query_qps = metrics.query_qps;
     snap.update_ms = update_ms;
     snap.query_eval_ms = metrics.query_eval_ms;
     snap.snapshot_total_ms = update_ms;
-    snap.snapshot_qps =
+    snap.update_throughput_vecps =
         (snap.snapshot_rows > 0 && snap.snapshot_total_ms > 0.0)
             ? (static_cast<double>(snap.snapshot_rows) / (snap.snapshot_total_ms / 1000.0))
             : 0.0;
@@ -2236,8 +2251,12 @@ int main(int argc, char** argv) {
         minibatch.recall = batch_metrics->recall;
         minibatch.avg_search_ms = batch_metrics->avg_search_ms;
         minibatch.avg_scanned = batch_metrics->scanned_avg;
-        minibatch.qps = batch_metrics->qps;
+        minibatch.query_qps = batch_metrics->query_qps;
         minibatch.update_ms = step_update_ms;
+        minibatch.update_throughput_vecps =
+            (chunk > 0 && step_update_ms > 0.0)
+                ? (static_cast<double>(chunk) / (step_update_ms / 1000.0))
+                : 0.0;
         minibatch.query_eval_ms = batch_metrics->query_eval_ms;
         minibatch.nqe_batch = last_online_pq_stats.nqe_batch;
         minibatch.qe_ratio = last_online_pq_stats.qe_ratio;
@@ -2325,6 +2344,11 @@ int main(int argc, char** argv) {
         merge_event.patched_partitions = merge_res.value().patch_partitions;
         merge_event.append_partitions = merge_res.value().append_partitions;
         merge_event.recluster_partitions = merge_res.value().recluster_partitions;
+        merge_event.moved_delta_ratio = merge_res.value().moved_delta_ratio;
+        merge_event.avg_assignment_dist_ratio = merge_res.value().avg_assignment_dist_ratio;
+        merge_event.max_assignment_dist_ratio = merge_res.value().max_assignment_dist_ratio;
+        merge_event.imbalance_before = merge_res.value().imbalance_before;
+        merge_event.imbalance_after = merge_res.value().imbalance_after;
         merge_event.trigger_mode = config.merge_trigger_mode;
         if (frozen_trigger_decision.has_value()) {
           merge_event.trigger_reason = frozen_trigger_decision->reason;
@@ -2357,6 +2381,11 @@ int main(int argc, char** argv) {
                   << ", patched_partitions=" << merge_res.value().patch_partitions
                   << ", append_parts=" << merge_res.value().append_partitions
                   << ", recluster_parts=" << merge_res.value().recluster_partitions
+                  << ", moved_delta_ratio=" << merge_res.value().moved_delta_ratio
+                  << ", avg_assignment_dist_ratio=" << merge_res.value().avg_assignment_dist_ratio
+                  << ", max_assignment_dist_ratio=" << merge_res.value().max_assignment_dist_ratio
+                  << ", imbalance_before=" << merge_res.value().imbalance_before
+                  << ", imbalance_after=" << merge_res.value().imbalance_after
                   << ", trigger_reason=" << merge_event.trigger_reason
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
@@ -2397,9 +2426,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   EvalMetrics final_metrics = final_res.value();
+  const double online_update_total_ms = total_update_ms + rebuild_ms_total;
   final_metrics.update_total_ms = total_update_ms;
   final_metrics.update_per_vector_ms =
       inserted_rows > 0 ? total_update_ms / static_cast<double>(inserted_rows) : 0.0;
+  final_metrics.update_throughput_vecps =
+      (inserted_rows > 0 && online_update_total_ms > 0.0)
+          ? (1000.0 * static_cast<double>(inserted_rows) / online_update_total_ms)
+          : 0.0;
   const double online_avg_nqe =
       online_pq_rollup.batches > 0
           ? online_pq_rollup.sum_nqe_batch / static_cast<double>(online_pq_rollup.batches)
@@ -2429,7 +2463,9 @@ int main(int argc, char** argv) {
             << "ms, per_vec=" << final_metrics.update_per_vector_ms << "ms; "
             << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
-            << "; QPS=" << final_metrics.qps << std::endl;
+            << "; Query QPS=" << final_metrics.query_qps
+            << ", Update throughput=" << final_metrics.update_throughput_vecps << " vec/s"
+            << std::endl;
   std::cout << "[GLOBAL REBUILD] enabled=" << std::boolalpha << config.enable_global_rebuild
             << ", count=" << global_rebuild_count << "/" << config.global_rebuild_max_count
             << ", trigger_main_imbalance=" << config.global_rebuild_main_imbalance_ratio
@@ -2503,6 +2539,12 @@ int main(int argc, char** argv) {
       << ",\n";
   ofs << "    \"merge_trigger_imbalance_ratio\": " << config.merge_trigger_imbalance_ratio
       << ",\n";
+  ofs << "    \"merge_assignment_mode\": \"" << config.merge_assignment_mode << "\",\n";
+  ofs << "    \"merge_assignment_top_r\": " << config.merge_assignment_top_r << ",\n";
+  ofs << "    \"merge_assignment_gamma\": " << config.merge_assignment_gamma << ",\n";
+  ofs << "    \"merge_assignment_hard_cap_ratio\": " << config.merge_assignment_hard_cap_ratio
+      << ",\n";
+  ofs << "    \"merge_assignment_lambda\": " << config.merge_assignment_lambda << ",\n";
   ofs << "    \"enable_global_rebuild\": "
       << (config.enable_global_rebuild ? "true" : "false") << ",\n";
   ofs << "    \"global_rebuild_max_count\": " << config.global_rebuild_max_count << ",\n";
@@ -2556,12 +2598,13 @@ int main(int argc, char** argv) {
   ofs << "  },\n";
   ofs << "  \"metrics\": {\n";
   ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
-  ofs << "    \"qps\": " << final_metrics.qps << ",\n";
+  ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
   ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
   ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
+  ofs << "    \"update_throughput_vecps\": " << final_metrics.update_throughput_vecps << ",\n";
   ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << ",\n";
   ofs << "    \"gt_probed_rate\": " << final_metrics.gt_probed_rate << ",\n";
   ofs << "    \"recall_on_probed_gt\": " << final_metrics.recall_on_probed_gt << ",\n";
@@ -2585,7 +2628,7 @@ int main(int argc, char** argv) {
     ofs << "    \"recall\": " << pre_stream_metrics->recall << ",\n";
     ofs << "    \"avg_query_ms\": " << pre_stream_metrics->avg_query_ms << ",\n";
     ofs << "    \"avg_search_ms\": " << pre_stream_metrics->avg_search_ms << ",\n";
-    ofs << "    \"qps\": " << pre_stream_metrics->qps << ",\n";
+    ofs << "    \"query_qps\": " << pre_stream_metrics->query_qps << ",\n";
     ofs << "    \"avg_scanned\": " << pre_stream_metrics->scanned_avg << ",\n";
     ofs << "    \"query_eval_ms\": " << pre_stream_metrics->query_eval_ms << ",\n";
     ofs << "    \"gt_probed_rate\": " << pre_stream_metrics->gt_probed_rate << ",\n";
@@ -2647,6 +2690,11 @@ int main(int argc, char** argv) {
     ofs << "      \"patched_partitions\": " << ev.patched_partitions << ",\n";
     ofs << "      \"append_parts\": " << ev.append_partitions << ",\n";
     ofs << "      \"recluster_parts\": " << ev.recluster_partitions << ",\n";
+    ofs << "      \"moved_delta_ratio\": " << ev.moved_delta_ratio << ",\n";
+    ofs << "      \"avg_assignment_dist_ratio\": " << ev.avg_assignment_dist_ratio << ",\n";
+    ofs << "      \"max_assignment_dist_ratio\": " << ev.max_assignment_dist_ratio << ",\n";
+    ofs << "      \"imbalance_before\": " << ev.imbalance_before << ",\n";
+    ofs << "      \"imbalance_after\": " << ev.imbalance_after << ",\n";
     ofs << "      \"trigger_mode\": \"" << ev.trigger_mode << "\",\n";
     ofs << "      \"trigger_reason\": \"" << ev.trigger_reason << "\",\n";
     ofs << "      \"trigger_rows\": " << (ev.trigger_rows ? "true" : "false") << ",\n";
@@ -2731,11 +2779,11 @@ int main(int argc, char** argv) {
     ofs << "      \"recall\": " << snap.recall << ",\n";
     ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
-    ofs << "      \"qps\": " << snap.qps << ",\n";
+    ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
     ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
     ofs << "      \"query_eval_ms\": " << snap.query_eval_ms << ",\n";
     ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
-    ofs << "      \"snapshot_qps\": " << snap.snapshot_qps << ",\n";
+    ofs << "      \"update_throughput_vecps\": " << snap.update_throughput_vecps << ",\n";
     ofs << "      \"nqe_batch\": " << snap.nqe_batch << ",\n";
     ofs << "      \"qe_ratio\": " << snap.qe_ratio << ",\n";
     ofs << "      \"codebook_drift\": " << snap.codebook_drift << ",\n";
@@ -2777,8 +2825,9 @@ int main(int argc, char** argv) {
       ofs << "          \"recall\": " << mb.recall << ",\n";
       ofs << "          \"avg_search_ms\": " << mb.avg_search_ms << ",\n";
       ofs << "          \"avg_scanned\": " << mb.avg_scanned << ",\n";
-      ofs << "          \"qps\": " << mb.qps << ",\n";
+      ofs << "          \"query_qps\": " << mb.query_qps << ",\n";
       ofs << "          \"update_ms\": " << mb.update_ms << ",\n";
+      ofs << "          \"update_throughput_vecps\": " << mb.update_throughput_vecps << ",\n";
       ofs << "          \"query_eval_ms\": " << mb.query_eval_ms << ",\n";
       ofs << "          \"nqe_batch\": " << mb.nqe_batch << ",\n";
       ofs << "          \"qe_ratio\": " << mb.qe_ratio << ",\n";
