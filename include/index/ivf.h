@@ -111,7 +111,8 @@ class IVFIndex {
                                       uint32_t topk,
                                       uint32_t nprobe,
                                       const VersionSet& route_versions,
-                                      uint8_t from_new) const = 0;
+                                      uint8_t from_new,
+                                      bool collect_scan_trace = false) const = 0;
 
   virtual Result<MatrixRM> GetRoutingCentroids(const VersionSet& route_versions) const = 0;
   virtual Result<PQRuntimeState> GetPQRuntimeState(const VersionSet& route_versions) const = 0;

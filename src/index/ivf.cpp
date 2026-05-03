@@ -828,7 +828,8 @@ class KMeansIVFIndex : public IVFIndex {
                               uint32_t topk,
                               uint32_t nprobe,
                               const VersionSet& route_versions,
-                              uint8_t from_new) const override {
+                              uint8_t from_new,
+                              bool collect_scan_trace) const override {
     if (topk == 0) {
       return Status::InvalidArgument("topk must be positive");
     }
@@ -908,8 +909,10 @@ class KMeansIVFIndex : public IVFIndex {
         cand.versions = entry.versions;
         cand.versions.index_version = data.version;
         cand.from_new = from_new;
-        scanned_doc_ids.push_back(cand.doc_id);
-        scanned_approx_dists.push_back(cand.approx_dist);
+        if (collect_scan_trace) {
+          scanned_doc_ids.push_back(cand.doc_id);
+          scanned_approx_dists.push_back(cand.approx_dist);
+        }
         if (heap.size() < topk) {
           heap.push_back(std::move(cand));
           std::push_heap(heap.begin(), heap.end(), heap_cmp);
@@ -924,8 +927,10 @@ class KMeansIVFIndex : public IVFIndex {
     if (heap.empty()) {
       SearchResult result;
       result.scanned_candidates = scanned;
-      result.scanned_doc_ids = std::move(scanned_doc_ids);
-      result.scanned_approx_dists = std::move(scanned_approx_dists);
+      if (collect_scan_trace) {
+        result.scanned_doc_ids = std::move(scanned_doc_ids);
+        result.scanned_approx_dists = std::move(scanned_approx_dists);
+      }
       return result;
     }
 
@@ -934,8 +939,10 @@ class KMeansIVFIndex : public IVFIndex {
     SearchResult result;
     result.topk = std::move(heap);
     result.scanned_candidates = scanned;
-    result.scanned_doc_ids = std::move(scanned_doc_ids);
-    result.scanned_approx_dists = std::move(scanned_approx_dists);
+    if (collect_scan_trace) {
+      result.scanned_doc_ids = std::move(scanned_doc_ids);
+      result.scanned_approx_dists = std::move(scanned_approx_dists);
+    }
     return result;
   }
 

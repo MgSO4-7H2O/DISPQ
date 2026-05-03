@@ -789,7 +789,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
           route_topk,
           params.nprobe,
           routes[static_cast<size_t>(ri)].versions,
-          routes[static_cast<size_t>(ri)].from_new);
+          routes[static_cast<size_t>(ri)].from_new,
+          config.enable_miss_diag);
       const double elapsed = stimer.ElapsedMillis();
       route_search_ms[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)] = elapsed;
       if (!sres.ok()) {
