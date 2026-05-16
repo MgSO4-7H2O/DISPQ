@@ -56,8 +56,8 @@ struct Config {
   double merge_trigger_imbalance_ratio{0.0};
   // Delta->main assignment mode during merge:
   // - "nearest": always nearest main centroid
-  // - "local_constrained" or "balanced_append": constrained local balancing
-  std::string merge_assignment_mode{"local_constrained"};
+  // - "balanced_append": constrained local balancing + neighborhood repartition patching
+  std::string merge_assignment_mode{"balanced_append"};
   // top-r nearest centroids considered by constrained assignment.
   uint32_t merge_assignment_top_r{4};
   // candidate must satisfy dist <= gamma * nearest_dist.

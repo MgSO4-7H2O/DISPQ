@@ -261,13 +261,13 @@ int main() {
   auto patch_res =
       prepare_partition_patch(fx.main_ivf, fx.main_versions, assignments, score, options);
   assert(patch_res.ok());
-  assert(patch_res.value().partition_ids.size() == 2);
+  assert(patch_res.value().partition_ids.size() == 3);
   {
     std::unordered_set<uint32_t> patch_parts(patch_res.value().partition_ids.begin(),
                                              patch_res.value().partition_ids.end());
     assert(patch_parts.find(0) != patch_parts.end());
     assert(patch_parts.find(1) != patch_parts.end());
-    assert(patch_parts.find(2) == patch_parts.end());
+    assert(patch_parts.find(2) != patch_parts.end());
   }
   assert(commit_partition_patch(fx.main_ivf, fx.main_versions, patch_res.value()).ok());
 
@@ -288,7 +288,7 @@ int main() {
       merge_frozen_delta_into_main(fx2.main_ivf, fx2.main_versions, fx2.delta_ivf, fx2.delta_versions, options);
   assert(report_res.ok());
   assert(report_res.value().frozen_records == 3);
-  assert(report_res.value().patch_partitions == 2);
+  assert(report_res.value().patch_partitions == 3);
 
   auto sizes_after_full_res = fx2.main_ivf->GetPartitionSizes(fx2.main_versions);
   assert(sizes_after_full_res.ok());
@@ -297,14 +297,14 @@ int main() {
   assert(sizes_after_full[1] == 3);
   assert(sizes_after_full[2] == 1);
 
-  // 7) local constrained assignment should prefer a healthier nearby list
-  // when the nearest list is already overloaded relative to local average.
+  // 7) balanced_append should prefer a healthier nearby list when the nearest
+  // list is already overloaded relative to local average.
   Fixture fx3 = BuildHealthierNeighborFixture();
   MergeOptions constrained_options;
   constrained_options.alpha = 0.0;
   constrained_options.beta = 0.0;
   constrained_options.recluster_threshold = 1.0;
-  constrained_options.assignment_mode = "local_constrained";
+  constrained_options.assignment_mode = "balanced_append";
   constrained_options.assignment_top_r = 2;
   constrained_options.assignment_gamma = 1.1;
   constrained_options.assignment_hard_cap_ratio = 1.5;
@@ -312,6 +312,7 @@ int main() {
   auto constrained_merge_res = merge_frozen_delta_into_main(
       fx3.main_ivf, fx3.main_versions, fx3.delta_ivf, fx3.delta_versions, constrained_options);
   assert(constrained_merge_res.ok());
+  assert(constrained_merge_res.value().patch_partitions == 2);
   auto constrained_sizes_res = fx3.main_ivf->GetPartitionSizes(fx3.main_versions);
   assert(constrained_sizes_res.ok());
   const auto& constrained_sizes = constrained_sizes_res.value();

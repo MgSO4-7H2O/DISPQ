@@ -49,7 +49,7 @@ struct MergeOptions {
   uint32_t local_recluster_k{2};
   uint32_t local_kmeans_iterations{5};
   bool enable_local_centroid_refine{false};
-  std::string assignment_mode{"local_constrained"};
+  std::string assignment_mode{"balanced_append"};
   uint32_t assignment_top_r{4};
   double assignment_gamma{1.05};
   double assignment_hard_cap_ratio{1.5};

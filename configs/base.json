@@ -25,7 +25,7 @@
   "merge_trigger_rows": 20,
   "merge_trigger_qe_ratio": 0.0,
   "merge_trigger_drift": 0.0,
-  "merge_assignment_mode": "local_constrained",
+  "merge_assignment_mode": "balanced_append",
   "merge_assignment_top_r": 4,
   "merge_assignment_gamma": 1.05,
   "merge_assignment_hard_cap_ratio": 1.5,

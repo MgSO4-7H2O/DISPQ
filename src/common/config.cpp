@@ -232,11 +232,14 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   if (cfg.merge_trigger_imbalance_ratio < 0.0) {
     return Status::InvalidArgument("merge_trigger_imbalance_ratio must be >= 0");
   }
+  if (cfg.merge_assignment_mode == "local_constrained") {
+    // Backward-compat alias: local_constrained now uses balanced_append behavior.
+    cfg.merge_assignment_mode = "balanced_append";
+  }
   if (cfg.merge_assignment_mode != "nearest" &&
-      cfg.merge_assignment_mode != "local_constrained" &&
       cfg.merge_assignment_mode != "balanced_append") {
     return Status::InvalidArgument(
-        "merge_assignment_mode must be one of \"nearest\", \"local_constrained\", \"balanced_append\"");
+        "merge_assignment_mode must be one of \"nearest\", \"balanced_append\"");
   }
   if (cfg.merge_assignment_top_r == 0) {
     return Status::InvalidArgument("merge_assignment_top_r must be > 0");

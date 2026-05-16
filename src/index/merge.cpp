@@ -96,8 +96,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
   diag.imbalance_before = ComputeImbalanceRatio(main_partition_sizes);
 
   const uint32_t nlist = static_cast<uint32_t>(main_centroids.rows());
-  const bool use_local_constrained =
-      options.assignment_mode == "local_constrained" || options.assignment_mode == "balanced_append";
+  const bool use_balanced_append = options.assignment_mode == "balanced_append";
   const uint32_t top_r = std::max<uint32_t>(1, std::min<uint32_t>(options.assignment_top_r, nlist));
   const double main_rows = std::accumulate(main_partition_sizes.begin(),
                                            main_partition_sizes.end(),
@@ -137,7 +136,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     uint32_t chosen_partition = nearest_partition;
     float chosen_dist = nearest_dist;
 
-    if (use_local_constrained) {
+    if (use_balanced_append) {
       const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
       const double nearest_penalty = std::max(
           0.0,
@@ -222,6 +221,180 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     *diag_out = diag;
   }
   return assigned;
+}
+
+std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
+                                             Eigen::Ref<const MatrixRM> main_centroids,
+                                             uint32_t top_r) {
+  const uint32_t nlist = static_cast<uint32_t>(main_centroids.rows());
+  if (nlist == 0 || seed_partition >= nlist) {
+    return {};
+  }
+  const uint32_t keep = std::max<uint32_t>(1, std::min<uint32_t>(top_r, nlist));
+  const Eigen::VectorXf seed = main_centroids.row(static_cast<Eigen::Index>(seed_partition)).transpose();
+  std::vector<std::pair<float, uint32_t>> dists;
+  dists.reserve(static_cast<size_t>(nlist));
+  for (uint32_t p = 0; p < nlist; ++p) {
+    const float dist = (seed - main_centroids.row(static_cast<Eigen::Index>(p)).transpose()).squaredNorm();
+    dists.emplace_back(dist, p);
+  }
+  std::partial_sort(dists.begin(),
+                    dists.begin() + static_cast<std::ptrdiff_t>(keep),
+                    dists.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+  std::vector<uint32_t> out;
+  out.reserve(keep);
+  for (uint32_t i = 0; i < keep; ++i) {
+    out.push_back(dists[static_cast<size_t>(i)].second);
+  }
+  return out;
+}
+
+Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
+    const std::vector<uint32_t>& neighborhood_partitions,
+    const std::vector<AlignedVector<VectorRecord>>& neighborhood_main_records,
+    const PartitionAssignments& assignments,
+    Eigen::Ref<const MatrixRM> main_centroids,
+    const MergeOptions& options) {
+  if (neighborhood_partitions.empty()) {
+    return Status::InvalidArgument("RepartitionNeighborhood: empty neighborhood");
+  }
+  if (neighborhood_partitions.size() != neighborhood_main_records.size()) {
+    return Status::InvalidArgument(
+        "RepartitionNeighborhood: partition/main-records size mismatch");
+  }
+
+  const uint32_t neighborhood_n = static_cast<uint32_t>(neighborhood_partitions.size());
+  for (uint32_t part : neighborhood_partitions) {
+    if (part >= static_cast<uint32_t>(assignments.size())) {
+      return Status::InvalidArgument("RepartitionNeighborhood: partition out of assignments range");
+    }
+    if (part >= static_cast<uint32_t>(main_centroids.rows())) {
+      return Status::InvalidArgument("RepartitionNeighborhood: partition out of centroid range");
+    }
+  }
+
+  AlignedVector<VectorRecord> pooled_records;
+  size_t reserve_count = 0;
+  for (const auto& records : neighborhood_main_records) {
+    reserve_count += records.size();
+  }
+  for (uint32_t part : neighborhood_partitions) {
+    reserve_count += assignments[static_cast<size_t>(part)].size();
+  }
+  pooled_records.reserve(reserve_count);
+
+  for (const auto& records : neighborhood_main_records) {
+    for (const auto& rec : records) {
+      pooled_records.push_back(rec);
+    }
+  }
+  for (uint32_t part : neighborhood_partitions) {
+    const auto& delta_bucket = assignments[static_cast<size_t>(part)];
+    for (const auto& item : delta_bucket) {
+      pooled_records.push_back(item.record);
+    }
+  }
+
+  std::vector<AlignedVector<VectorRecord>> repartitioned(neighborhood_n);
+  if (pooled_records.empty()) {
+    return repartitioned;
+  }
+
+  const double avg_after =
+      static_cast<double>(pooled_records.size()) / static_cast<double>(neighborhood_n);
+  const double hard_cap = avg_after * options.assignment_hard_cap_ratio;
+  const double balance_denom = std::max(1.0, avg_after);
+  std::vector<uint32_t> projected_size(neighborhood_n, 0u);
+
+  for (const auto& rec : pooled_records) {
+    if (rec.x.size() != main_centroids.cols()) {
+      return Status::InvalidArgument("RepartitionNeighborhood: record dim mismatch");
+    }
+    std::vector<std::pair<float, uint32_t>> dists;
+    dists.reserve(neighborhood_n);
+    for (uint32_t local_idx = 0; local_idx < neighborhood_n; ++local_idx) {
+      const uint32_t part = neighborhood_partitions[static_cast<size_t>(local_idx)];
+      const float dist =
+          (rec.x - main_centroids.row(static_cast<Eigen::Index>(part)).transpose()).squaredNorm();
+      dists.emplace_back(dist, local_idx);
+    }
+    std::sort(dists.begin(),
+              dists.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+    const uint32_t nearest_local = dists[0].second;
+    const float nearest_dist = dists[0].first;
+    uint32_t chosen_local = nearest_local;
+
+    const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
+    const double nearest_penalty = std::max(
+        0.0,
+        (static_cast<double>(projected_size[static_cast<size_t>(nearest_local)]) + 1.0) -
+            avg_after) /
+                                   balance_denom;
+    const bool nearest_overloaded = nearest_penalty > 0.0;
+
+    struct CandidateState {
+      uint32_t local_idx{0};
+      float dist{0.0f};
+      double penalty{0.0};
+      double cost{0.0};
+    };
+
+    std::vector<CandidateState> legal_candidates;
+    legal_candidates.reserve(neighborhood_n);
+    std::vector<CandidateState> healthier_candidates;
+    healthier_candidates.reserve(neighborhood_n);
+
+    for (const auto& dist_item : dists) {
+      const float dist = dist_item.first;
+      const uint32_t local_idx = dist_item.second;
+      if (dist > dist_cap) {
+        continue;
+      }
+      if (static_cast<double>(projected_size[static_cast<size_t>(local_idx)]) >= hard_cap) {
+        continue;
+      }
+      CandidateState cand;
+      cand.local_idx = local_idx;
+      cand.dist = dist;
+      cand.penalty = std::max(
+          0.0,
+          (static_cast<double>(projected_size[static_cast<size_t>(local_idx)]) + 1.0) -
+              avg_after) /
+                     balance_denom;
+      cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
+      legal_candidates.push_back(cand);
+      if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
+        healthier_candidates.push_back(cand);
+      }
+    }
+
+    const std::vector<CandidateState>& candidates =
+        healthier_candidates.empty() ? legal_candidates : healthier_candidates;
+    double best_cost = std::numeric_limits<double>::infinity();
+    bool found_candidate = false;
+    for (const auto& cand : candidates) {
+      if (!found_candidate || cand.cost < best_cost) {
+        found_candidate = true;
+        best_cost = cand.cost;
+        chosen_local = cand.local_idx;
+      }
+    }
+
+    VectorRecord out = rec;
+    out.ivf_id = neighborhood_partitions[static_cast<size_t>(chosen_local)];
+    repartitioned[static_cast<size_t>(chosen_local)].push_back(std::move(out));
+    projected_size[static_cast<size_t>(chosen_local)]++;
+  }
+
+  for (auto& bucket : repartitioned) {
+    std::sort(bucket.begin(), bucket.end(), [](const VectorRecord& lhs, const VectorRecord& rhs) {
+      return lhs.doc_id < rhs.doc_id;
+    });
+  }
+  return repartitioned;
 }
 
 }  // namespace
@@ -433,6 +606,78 @@ Result<PartitionPatch> prepare_partition_patch(
   if (!main_ivf) {
     return Status::InvalidArgument("prepare_partition_patch: main_ivf is null");
   }
+
+  if (options.assignment_mode == "balanced_append") {
+    auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
+    if (!centroids_res.ok()) {
+      return centroids_res.status();
+    }
+    if (assignments.size() != static_cast<size_t>(centroids_res.value().rows())) {
+      return Status::InvalidArgument(
+          "prepare_partition_patch: assignments size mismatch with centroids");
+    }
+
+    std::vector<uint32_t> seeds;
+    seeds.reserve(assignments.size());
+    for (uint32_t p = 0; p < static_cast<uint32_t>(assignments.size()); ++p) {
+      if (!assignments[static_cast<size_t>(p)].empty()) {
+        seeds.push_back(p);
+      }
+    }
+    std::sort(seeds.begin(),
+              seeds.end(),
+              [&](uint32_t lhs, uint32_t rhs) {
+                return assignments[static_cast<size_t>(lhs)].size() >
+                       assignments[static_cast<size_t>(rhs)].size();
+              });
+
+    PartitionPatch patch;
+    std::vector<uint8_t> claimed(assignments.size(), 0u);
+    for (uint32_t seed : seeds) {
+      if (claimed[static_cast<size_t>(seed)] != 0u) {
+        continue;
+      }
+      std::vector<uint32_t> neighborhood =
+          TopRNeighborPartitions(seed, centroids_res.value(), options.assignment_top_r);
+      std::vector<uint32_t> active_neighborhood;
+      active_neighborhood.reserve(neighborhood.size());
+      for (uint32_t part : neighborhood) {
+        if (claimed[static_cast<size_t>(part)] == 0u) {
+          active_neighborhood.push_back(part);
+        }
+      }
+      if (active_neighborhood.empty()) {
+        continue;
+      }
+
+      std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
+      neighborhood_main_records.reserve(active_neighborhood.size());
+      for (uint32_t part : active_neighborhood) {
+        auto main_records_res = main_ivf->GetPartitionRecords(main_versions, part);
+        if (!main_records_res.ok()) {
+          return main_records_res.status();
+        }
+        neighborhood_main_records.push_back(std::move(main_records_res.value()));
+      }
+
+      auto repartition_res = RepartitionNeighborhood(active_neighborhood,
+                                                     neighborhood_main_records,
+                                                     assignments,
+                                                     centroids_res.value(),
+                                                     options);
+      if (!repartition_res.ok()) {
+        return repartition_res.status();
+      }
+      std::vector<AlignedVector<VectorRecord>> repartitioned = std::move(repartition_res.value());
+      for (size_t i = 0; i < active_neighborhood.size(); ++i) {
+        patch.partition_ids.push_back(active_neighborhood[i]);
+        patch.replacement_records.push_back(std::move(repartitioned[i]));
+        claimed[static_cast<size_t>(active_neighborhood[i])] = 1u;
+      }
+    }
+    return patch;
+  }
+
   std::vector<uint8_t> recluster_flags(assignments.size(), 0);
   for (const auto& d : score_result.decisions) {
     if (d.partition_id >= assignments.size()) {

@@ -183,6 +183,37 @@ uint32_t ResolveDeltaTrainRows(const Config& config,
   return std::min<uint32_t>(available_stream_rows, requested_rows);
 }
 
+double ComputeNonEmptyListImbalance(const std::vector<uint32_t>& sizes,
+                                    uint32_t* non_empty_out = nullptr,
+                                    uint32_t* max_list_out = nullptr,
+                                    double* avg_non_empty_out = nullptr) {
+  uint32_t non_empty = 0;
+  uint32_t max_list = 0;
+  uint64_t non_empty_total = 0;
+  for (uint32_t sz : sizes) {
+    if (sz > 0) {
+      non_empty++;
+      non_empty_total += static_cast<uint64_t>(sz);
+    }
+    max_list = std::max<uint32_t>(max_list, sz);
+  }
+  const double avg_non_empty =
+      non_empty > 0 ? static_cast<double>(non_empty_total) / static_cast<double>(non_empty) : 0.0;
+  if (non_empty_out != nullptr) {
+    *non_empty_out = non_empty;
+  }
+  if (max_list_out != nullptr) {
+    *max_list_out = max_list;
+  }
+  if (avg_non_empty_out != nullptr) {
+    *avg_non_empty_out = avg_non_empty;
+  }
+  if (non_empty == 0) {
+    return 0.0;
+  }
+  return static_cast<double>(max_list) / std::max(1.0, avg_non_empty);
+}
+
 struct DeltaShard {
   std::shared_ptr<IVFIndex> ivf;
   VersionSet versions{};
@@ -310,6 +341,10 @@ struct MergeEventRecord {
   double max_assignment_dist_ratio{1.0};
   double imbalance_before{0.0};
   double imbalance_after{0.0};
+  uint32_t main_non_empty_lists_after{0};
+  uint32_t main_max_list_after{0};
+  double main_avg_non_empty_list_after{0.0};
+  double main_imbalance_after_real{0.0};
   std::string trigger_mode;
   std::string trigger_reason;
   bool trigger_rows{false};
@@ -2339,6 +2374,19 @@ int main(int argc, char** argv) {
         rebuild_ms_total += merge_commit_ms;
         main_rows_current = std::min<uint32_t>(
             next_insert_idx, main_rows_current + merge_res.value().frozen_records);
+        auto main_sizes_after_merge_res = main_ivf->GetPartitionSizes(main_versions);
+        if (!main_sizes_after_merge_res.ok()) {
+          std::cerr << main_sizes_after_merge_res.status().ToString() << std::endl;
+          return 1;
+        }
+        uint32_t main_non_empty_after = 0;
+        uint32_t main_max_after = 0;
+        double main_avg_non_empty_after = 0.0;
+        const double main_imbalance_after_real = ComputeNonEmptyListImbalance(
+            main_sizes_after_merge_res.value(),
+            &main_non_empty_after,
+            &main_max_after,
+            &main_avg_non_empty_after);
         MergeEventRecord merge_event;
         merge_event.base_rows = next_insert_idx;
         merge_event.frozen_rows = merge_res.value().frozen_records;
@@ -2350,6 +2398,10 @@ int main(int argc, char** argv) {
         merge_event.max_assignment_dist_ratio = merge_res.value().max_assignment_dist_ratio;
         merge_event.imbalance_before = merge_res.value().imbalance_before;
         merge_event.imbalance_after = merge_res.value().imbalance_after;
+        merge_event.main_non_empty_lists_after = main_non_empty_after;
+        merge_event.main_max_list_after = main_max_after;
+        merge_event.main_avg_non_empty_list_after = main_avg_non_empty_after;
+        merge_event.main_imbalance_after_real = main_imbalance_after_real;
         merge_event.trigger_mode = config.merge_trigger_mode;
         if (frozen_trigger_decision.has_value()) {
           merge_event.trigger_reason = frozen_trigger_decision->reason;
@@ -2387,6 +2439,7 @@ int main(int argc, char** argv) {
                   << ", max_assignment_dist_ratio=" << merge_res.value().max_assignment_dist_ratio
                   << ", imbalance_before=" << merge_res.value().imbalance_before
                   << ", imbalance_after=" << merge_res.value().imbalance_after
+                  << ", main_imbalance_after_real=" << merge_event.main_imbalance_after_real
                   << ", trigger_reason=" << merge_event.trigger_reason
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
@@ -2513,6 +2566,62 @@ int main(int argc, char** argv) {
   if (!ofs) {
     std::cerr << "Failed to write results to " << result_path << std::endl;
     return 1;
+  }
+
+  const bool debug_output_enabled =
+      config.enable_miss_diag || config.enable_rerank_source_diag || config.enable_latency_debug;
+  if (!debug_output_enabled) {
+    ofs << "{\n";
+    ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
+    ofs << "  \"timestamp\": " << ts << ",\n";
+    ofs << "  \"params\": {\n";
+    ofs << "    \"topk\": " << config.topk << ",\n";
+    ofs << "    \"nprobe\": " << params.nprobe << ",\n";
+    ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+    ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
+    ofs << "  },\n";
+    ofs << "  \"metrics\": {\n";
+    ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
+    ofs << "    \"latency_ms\": " << final_metrics.avg_query_ms << ",\n";
+    ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
+    ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
+    ofs << "  },\n";
+    ofs << "  \"global_rebuild_count\": " << global_rebuild_count << ",\n";
+    ofs << "  \"merge_events\": [\n";
+    for (size_t i = 0; i < merge_events.size(); ++i) {
+      const auto& ev = merge_events[i];
+      ofs << "    {\n";
+      ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
+      ofs << "      \"frozen_rows\": " << ev.frozen_rows << ",\n";
+      ofs << "      \"merge_ms\": " << ev.merge_ms << ",\n";
+      ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << "\n";
+      ofs << "    }";
+      if (i + 1 < merge_events.size()) {
+        ofs << ",";
+      }
+      ofs << "\n";
+    }
+    ofs << "  ],\n";
+    ofs << "  \"snapshots\": [\n";
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+      const auto& snap = snapshots[i];
+      ofs << "    {\n";
+      ofs << "      \"snapshot_size\": " << snap.snapshot_rows << ",\n";
+      ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
+      ofs << "      \"latency_ms\": " << snap.query_eval_ms << ",\n";
+      ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
+      ofs << "      \"throughput\": " << snap.update_throughput_vecps << "\n";
+      ofs << "    }";
+      if (i + 1 < snapshots.size()) {
+        ofs << ",";
+      }
+      ofs << "\n";
+    }
+    ofs << "  ]\n";
+    ofs << "}\n";
+
+    std::cout << "Saved metrics to " << result_path << std::endl;
+    return 0;
   }
 
   ofs << "{\n";
@@ -2696,6 +2805,11 @@ int main(int argc, char** argv) {
     ofs << "      \"max_assignment_dist_ratio\": " << ev.max_assignment_dist_ratio << ",\n";
     ofs << "      \"imbalance_before\": " << ev.imbalance_before << ",\n";
     ofs << "      \"imbalance_after\": " << ev.imbalance_after << ",\n";
+    ofs << "      \"main_non_empty_lists_after\": " << ev.main_non_empty_lists_after << ",\n";
+    ofs << "      \"main_max_list_after\": " << ev.main_max_list_after << ",\n";
+    ofs << "      \"main_avg_non_empty_list_after\": " << ev.main_avg_non_empty_list_after
+        << ",\n";
+    ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << ",\n";
     ofs << "      \"trigger_mode\": \"" << ev.trigger_mode << "\",\n";
     ofs << "      \"trigger_reason\": \"" << ev.trigger_reason << "\",\n";
     ofs << "      \"trigger_rows\": " << (ev.trigger_rows ? "true" : "false") << ",\n";
