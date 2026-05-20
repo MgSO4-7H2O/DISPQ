@@ -232,6 +232,7 @@ struct EvalMetrics {
   double total_p50{0.0};
   double total_p99{0.0};
   double avg_query_ms{0.0};
+  double end_to_end_overhead_ms{0.0};
   double query_qps{0.0};
   double rebuild_ms{0.0};
   double scanned_avg{0.0};
@@ -267,6 +268,8 @@ struct MinibatchRecord {
   uint32_t batch_rows{0};
   uint32_t snapshot_rows_total{0};
   double recall{0.0};
+  double latency_ms{0.0};
+  double end_to_end_overhead_ms{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
   double query_qps{0.0};
@@ -296,6 +299,8 @@ struct SnapshotRecord {
   uint32_t active_delta_docs{0};
   uint32_t snapshot_rows{0};
   double recall{0.0};
+  double latency_ms{0.0};
+  double end_to_end_overhead_ms{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
   double query_qps{0.0};
@@ -764,6 +769,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
           : params.topk;
   std::vector<std::vector<DocId>> predictions(nq);
   std::vector<double> whitening_ms(nq, 0.0);
+  std::vector<double> latency_ms(nq, 0.0);
   std::vector<double> search_ms(nq, 0.0);
   std::vector<double> total_ms(nq, 0.0);
   std::vector<double> scanned_counts(nq, 0.0);
@@ -884,6 +890,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     }
     predictions[static_cast<size_t>(qi)] = std::move(row);
     search_ms[static_cast<size_t>(qi)] = q_search_ms;
+    latency_ms[static_cast<size_t>(qi)] =
+        whitening_ms[static_cast<size_t>(qi)] + route_search_max;
     total_ms[static_cast<size_t>(qi)] = whitening_ms[static_cast<size_t>(qi)] + q_search_ms;
     scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
   }
@@ -1082,11 +1090,14 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   }
 
   double avg_whiten = 0.0;
+  double avg_latency = 0.0;
   double avg_search = 0.0;
   double avg_total = 0.0;
   if (nq > 0) {
     avg_whiten =
         std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) / static_cast<double>(nq);
+    avg_latency =
+        std::accumulate(latency_ms.begin(), latency_ms.end(), 0.0) / static_cast<double>(nq);
     avg_search =
         std::accumulate(search_ms.begin(), search_ms.end(), 0.0) / static_cast<double>(nq);
     avg_total = std::accumulate(total_ms.begin(), total_ms.end(), 0.0) / static_cast<double>(nq);
@@ -1118,7 +1129,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.search_p99 = search_summary.value().p99_ms;
   metrics.total_p50 = total_summary.value().p50_ms;
   metrics.total_p99 = total_summary.value().p99_ms;
-  metrics.avg_query_ms = avg_total;
+  metrics.avg_query_ms = avg_latency;
+  metrics.end_to_end_overhead_ms = avg_total;
   metrics.query_qps = query_qps;
   metrics.scanned_avg = scanned_avg;
   metrics.scanned_p50 = scanned_p50;
@@ -2031,6 +2043,8 @@ int main(int argc, char** argv) {
     snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
     snap.snapshot_rows = active_rows >= last_snapshot_active_rows ? active_rows - last_snapshot_active_rows : 0;
     snap.recall = metrics.recall;
+    snap.latency_ms = metrics.avg_query_ms;
+    snap.end_to_end_overhead_ms = metrics.end_to_end_overhead_ms;
     snap.avg_search_ms = metrics.avg_search_ms;
     snap.avg_scanned = metrics.scanned_avg;
     snap.query_qps = metrics.query_qps;
@@ -2285,6 +2299,8 @@ int main(int argc, char** argv) {
         minibatch.snapshot_rows_total =
             next_insert_idx >= last_snapshot_active_rows ? next_insert_idx - last_snapshot_active_rows : 0;
         minibatch.recall = batch_metrics->recall;
+        minibatch.latency_ms = batch_metrics->avg_query_ms;
+        minibatch.end_to_end_overhead_ms = batch_metrics->end_to_end_overhead_ms;
         minibatch.avg_search_ms = batch_metrics->avg_search_ms;
         minibatch.avg_scanned = batch_metrics->scanned_avg;
         minibatch.query_qps = batch_metrics->query_qps;
@@ -2507,7 +2523,8 @@ int main(int argc, char** argv) {
             << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
             << ", rerank_candidates_per_route=" << config.exact_rerank_candidates_per_route
             << ")" << std::endl;
-  std::cout << "Avg query=" << final_metrics.avg_query_ms << "ms; "
+  std::cout << "Latency(whiten+ann)=" << final_metrics.avg_query_ms << "ms; "
+            << "End-to-end overhead=" << final_metrics.end_to_end_overhead_ms << "ms; "
             << "Search p50=" << final_metrics.search_p50 << "ms, p99=" << final_metrics.search_p99
             << "ms; "
             << "Total p50=" << final_metrics.total_p50 << "ms, p99=" << final_metrics.total_p99
@@ -2583,6 +2600,7 @@ int main(int argc, char** argv) {
     ofs << "  \"metrics\": {\n";
     ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
     ofs << "    \"latency_ms\": " << final_metrics.avg_query_ms << ",\n";
+    ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
     ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
     ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
     ofs << "  },\n";
@@ -2608,7 +2626,8 @@ int main(int argc, char** argv) {
       ofs << "    {\n";
       ofs << "      \"snapshot_size\": " << snap.snapshot_rows << ",\n";
       ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
-      ofs << "      \"latency_ms\": " << snap.query_eval_ms << ",\n";
+      ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
+      ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
       ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
       ofs << "      \"throughput\": " << snap.update_throughput_vecps << "\n";
       ofs << "    }";
@@ -2708,6 +2727,7 @@ int main(int argc, char** argv) {
   ofs << "  },\n";
   ofs << "  \"metrics\": {\n";
   ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
+  ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
   ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
   ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
@@ -2737,6 +2757,7 @@ int main(int argc, char** argv) {
     ofs << "    \"base_rows\": " << stream_start_idx << ",\n";
     ofs << "    \"recall\": " << pre_stream_metrics->recall << ",\n";
     ofs << "    \"avg_query_ms\": " << pre_stream_metrics->avg_query_ms << ",\n";
+    ofs << "    \"end_to_end_overhead_ms\": " << pre_stream_metrics->end_to_end_overhead_ms << ",\n";
     ofs << "    \"avg_search_ms\": " << pre_stream_metrics->avg_search_ms << ",\n";
     ofs << "    \"query_qps\": " << pre_stream_metrics->query_qps << ",\n";
     ofs << "    \"avg_scanned\": " << pre_stream_metrics->scanned_avg << ",\n";
@@ -2892,6 +2913,8 @@ int main(int argc, char** argv) {
     ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
     ofs << "      \"snapshot_rows\": " << snap.snapshot_rows << ",\n";
     ofs << "      \"recall\": " << snap.recall << ",\n";
+    ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
+    ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
     ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
     ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
@@ -2938,6 +2961,8 @@ int main(int argc, char** argv) {
       ofs << "          \"batch_rows\": " << mb.batch_rows << ",\n";
       ofs << "          \"snapshot_rows_total\": " << mb.snapshot_rows_total << ",\n";
       ofs << "          \"recall\": " << mb.recall << ",\n";
+      ofs << "          \"latency_ms\": " << mb.latency_ms << ",\n";
+      ofs << "          \"end_to_end_overhead_ms\": " << mb.end_to_end_overhead_ms << ",\n";
       ofs << "          \"avg_search_ms\": " << mb.avg_search_ms << ",\n";
       ofs << "          \"avg_scanned\": " << mb.avg_scanned << ",\n";
       ofs << "          \"query_qps\": " << mb.query_qps << ",\n";
