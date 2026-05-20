@@ -769,7 +769,6 @@ Result<EvalMetrics> EvaluateState(const Config& config,
           : params.topk;
   std::vector<std::vector<DocId>> predictions(nq);
   std::vector<double> whitening_ms(nq, 0.0);
-  std::vector<double> latency_ms(nq, 0.0);
   std::vector<double> search_ms(nq, 0.0);
   std::vector<double> total_ms(nq, 0.0);
   std::vector<double> scanned_counts(nq, 0.0);
@@ -890,8 +889,6 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     }
     predictions[static_cast<size_t>(qi)] = std::move(row);
     search_ms[static_cast<size_t>(qi)] = q_search_ms;
-    latency_ms[static_cast<size_t>(qi)] =
-        whitening_ms[static_cast<size_t>(qi)] + route_search_max;
     total_ms[static_cast<size_t>(qi)] = whitening_ms[static_cast<size_t>(qi)] + q_search_ms;
     scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
   }
@@ -1090,14 +1087,11 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   }
 
   double avg_whiten = 0.0;
-  double avg_latency = 0.0;
   double avg_search = 0.0;
   double avg_total = 0.0;
   if (nq > 0) {
     avg_whiten =
         std::accumulate(whitening_ms.begin(), whitening_ms.end(), 0.0) / static_cast<double>(nq);
-    avg_latency =
-        std::accumulate(latency_ms.begin(), latency_ms.end(), 0.0) / static_cast<double>(nq);
     avg_search =
         std::accumulate(search_ms.begin(), search_ms.end(), 0.0) / static_cast<double>(nq);
     avg_total = std::accumulate(total_ms.begin(), total_ms.end(), 0.0) / static_cast<double>(nq);
@@ -1118,6 +1112,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   const double query_qps = wall_elapsed_ms > 0.0
                                ? (1000.0 * static_cast<double>(nq) / wall_elapsed_ms)
                                : 0.0;
+  const double avg_query_wall_ms =
+      nq > 0 ? (wall_elapsed_ms / static_cast<double>(nq)) : 0.0;
 
   EvalMetrics metrics;
   metrics.recall = recall_res.value();
@@ -1129,7 +1125,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.search_p99 = search_summary.value().p99_ms;
   metrics.total_p50 = total_summary.value().p50_ms;
   metrics.total_p99 = total_summary.value().p99_ms;
-  metrics.avg_query_ms = avg_latency;
+  metrics.avg_query_ms = avg_query_wall_ms;
   metrics.end_to_end_overhead_ms = avg_total;
   metrics.query_qps = query_qps;
   metrics.scanned_avg = scanned_avg;
@@ -2523,7 +2519,7 @@ int main(int argc, char** argv) {
             << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
             << ", rerank_candidates_per_route=" << config.exact_rerank_candidates_per_route
             << ")" << std::endl;
-  std::cout << "Latency(whiten+ann)=" << final_metrics.avg_query_ms << "ms; "
+  std::cout << "Latency(wall)=" << final_metrics.avg_query_ms << "ms; "
             << "End-to-end overhead=" << final_metrics.end_to_end_overhead_ms << "ms; "
             << "Search p50=" << final_metrics.search_p50 << "ms, p99=" << final_metrics.search_p99
             << "ms; "
