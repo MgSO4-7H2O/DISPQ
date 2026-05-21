@@ -445,32 +445,16 @@ struct SearchRoute {
   uint32_t rows{0};
 };
 
-uint32_t ResolveRouteNprobe(const Config& config,
-                            const SearchRoute& route,
-                            uint32_t default_nprobe) {
-  uint32_t base_nprobe = default_nprobe;
-  if (route.name == "main" && config.main_query_nprobe > 0) {
-    base_nprobe = config.main_query_nprobe;
-  } else if (route.name == "active_delta" && config.active_query_nprobe > 0) {
-    base_nprobe = config.active_query_nprobe;
-  } else if (route.name == "frozen_delta" && config.frozen_query_nprobe > 0) {
-    base_nprobe = config.frozen_query_nprobe;
+uint32_t ResolveRouteExactRerankCandidates(const Config& config, const SearchRoute& route) {
+  uint32_t candidates = config.exact_rerank_candidates_per_route;
+  if (route.name == "main" && config.main_exact_rerank_candidates > 0) {
+    candidates = config.main_exact_rerank_candidates;
+  } else if (route.name == "active_delta" && config.active_exact_rerank_candidates > 0) {
+    candidates = config.active_exact_rerank_candidates;
+  } else if (route.name == "frozen_delta" && config.frozen_exact_rerank_candidates > 0) {
+    candidates = config.frozen_exact_rerank_candidates;
   }
-  return std::max<uint32_t>(1u, base_nprobe);
-}
-
-uint32_t ResolveRouteTopK(const Config& config,
-                          const SearchRoute& route,
-                          uint32_t default_topk) {
-  uint32_t base_topk = default_topk;
-  if (route.name == "main" && config.main_query_topk > 0) {
-    base_topk = config.main_query_topk;
-  } else if (route.name == "active_delta" && config.active_query_topk > 0) {
-    base_topk = config.active_query_topk;
-  } else if (route.name == "frozen_delta" && config.frozen_query_topk > 0) {
-    base_topk = config.frozen_query_topk;
-  }
-  return std::max<uint32_t>(1u, base_topk);
+  return std::max<uint32_t>(1u, candidates);
 }
 
 struct OnlinePQRollup {
@@ -608,7 +592,7 @@ Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
 Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
                                uint32_t topk,
                                bool exact_rerank_enable,
-                               uint32_t rerank_candidates_per_route,
+                               const std::vector<uint32_t>& rerank_candidates_per_route,
                                Eigen::Ref<const Eigen::VectorXf> query_whitened,
                                const MatrixRM& base_whitened) {
   SearchResult out;
@@ -617,11 +601,15 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
   }
   std::unordered_map<DocId, Candidate> best_by_doc;
   uint64_t scanned = 0;
-  for (const auto& part : partial_results) {
+  for (size_t ri = 0; ri < partial_results.size(); ++ri) {
+    const auto& part = partial_results[ri];
     scanned += part.scanned_candidates;
     size_t route_take = part.topk.size();
     if (exact_rerank_enable) {
-      route_take = std::min(route_take, static_cast<size_t>(rerank_candidates_per_route));
+      const uint32_t route_cap = ri < rerank_candidates_per_route.size()
+                                     ? rerank_candidates_per_route[ri]
+                                     : static_cast<uint32_t>(route_take);
+      route_take = std::min(route_take, static_cast<size_t>(route_cap));
     }
     for (size_t i = 0; i < route_take; ++i) {
       const auto& cand = part.topk[i];
@@ -797,17 +785,17 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   const uint32_t nq = static_cast<uint32_t>(queries_raw.rows());
   const uint32_t route_count = static_cast<uint32_t>(routes.size());
   const bool enable_exact_rerank = config.exact_rerank_enable;
-  const uint32_t route_topk =
-      enable_exact_rerank
-          ? std::max(params.topk, config.exact_rerank_candidates_per_route)
-          : params.topk;
-  std::vector<uint32_t> route_nprobes(route_count, params.nprobe);
-  std::vector<uint32_t> route_topks(route_count, route_topk);
+  std::vector<uint32_t> route_nprobes(route_count, std::max<uint32_t>(1u, params.nprobe));
+  std::vector<uint32_t> route_topks(route_count, std::max<uint32_t>(1u, params.topk));
+  std::vector<uint32_t> route_rerank_candidates(route_count,
+                                                 std::max<uint32_t>(1u, params.topk));
   for (uint32_t ri = 0; ri < route_count; ++ri) {
-    route_nprobes[static_cast<size_t>(ri)] =
-        ResolveRouteNprobe(config, routes[static_cast<size_t>(ri)], params.nprobe);
-    route_topks[static_cast<size_t>(ri)] =
-        ResolveRouteTopK(config, routes[static_cast<size_t>(ri)], route_topk);
+    if (enable_exact_rerank) {
+      route_rerank_candidates[static_cast<size_t>(ri)] =
+          ResolveRouteExactRerankCandidates(config, routes[static_cast<size_t>(ri)]);
+      route_topks[static_cast<size_t>(ri)] =
+          std::max(params.topk, route_rerank_candidates[static_cast<size_t>(ri)]);
+    }
   }
   std::vector<std::vector<DocId>> predictions(nq);
   std::vector<double> whitening_ms(nq, 0.0);
@@ -916,7 +904,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     auto merged_res = MergeTopK(route_results[static_cast<size_t>(qi)],
                                 params.topk,
                                 enable_exact_rerank,
-                                config.exact_rerank_candidates_per_route,
+                                route_rerank_candidates,
                                 q,
                                 base_whitened);
     if (!merged_res.ok()) {
@@ -1451,12 +1439,9 @@ int main(int argc, char** argv) {
             << ", merge_assignment_gamma=" << config.merge_assignment_gamma
             << ", merge_assignment_hard_cap_ratio=" << config.merge_assignment_hard_cap_ratio
             << ", merge_assignment_lambda=" << config.merge_assignment_lambda
-            << ", main_query_nprobe=" << config.main_query_nprobe
-            << ", active_query_nprobe=" << config.active_query_nprobe
-            << ", frozen_query_nprobe=" << config.frozen_query_nprobe
-            << ", main_query_topk=" << config.main_query_topk
-            << ", active_query_topk=" << config.active_query_topk
-            << ", frozen_query_topk=" << config.frozen_query_topk
+            << ", main_exact_rerank_candidates=" << config.main_exact_rerank_candidates
+            << ", active_exact_rerank_candidates=" << config.active_exact_rerank_candidates
+            << ", frozen_exact_rerank_candidates=" << config.frozen_exact_rerank_candidates
             << ", stream_rows=" << total_stream_rows
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
@@ -2667,12 +2652,12 @@ int main(int argc, char** argv) {
     ofs << "    \"topk\": " << config.topk << ",\n";
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
-    ofs << "    \"main_query_nprobe\": " << config.main_query_nprobe << ",\n";
-    ofs << "    \"active_query_nprobe\": " << config.active_query_nprobe << ",\n";
-    ofs << "    \"frozen_query_nprobe\": " << config.frozen_query_nprobe << ",\n";
-    ofs << "    \"main_query_topk\": " << config.main_query_topk << ",\n";
-    ofs << "    \"active_query_topk\": " << config.active_query_topk << ",\n";
-    ofs << "    \"frozen_query_topk\": " << config.frozen_query_topk << ",\n";
+    ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
+        << ",\n";
+    ofs << "    \"active_exact_rerank_candidates\": " << config.active_exact_rerank_candidates
+        << ",\n";
+    ofs << "    \"frozen_exact_rerank_candidates\": " << config.frozen_exact_rerank_candidates
+        << ",\n";
     ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
     ofs << "  },\n";
     ofs << "  \"metrics\": {\n";
@@ -2783,12 +2768,12 @@ int main(int argc, char** argv) {
       << ",\n";
   ofs << "    \"exact_rerank_candidates_per_route\": "
       << config.exact_rerank_candidates_per_route << ",\n";
-  ofs << "    \"main_query_nprobe\": " << config.main_query_nprobe << ",\n";
-  ofs << "    \"active_query_nprobe\": " << config.active_query_nprobe << ",\n";
-  ofs << "    \"frozen_query_nprobe\": " << config.frozen_query_nprobe << ",\n";
-  ofs << "    \"main_query_topk\": " << config.main_query_topk << ",\n";
-  ofs << "    \"active_query_topk\": " << config.active_query_topk << ",\n";
-  ofs << "    \"frozen_query_topk\": " << config.frozen_query_topk << ",\n";
+  ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
+      << ",\n";
+  ofs << "    \"active_exact_rerank_candidates\": " << config.active_exact_rerank_candidates
+      << ",\n";
+  ofs << "    \"frozen_exact_rerank_candidates\": " << config.frozen_exact_rerank_candidates
+      << ",\n";
   ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
   ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
   ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";

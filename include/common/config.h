@@ -29,13 +29,11 @@ struct Config {
   bool enable_latency_debug{false};
   bool exact_rerank_enable{false};
   uint32_t exact_rerank_candidates_per_route{0};
-  // Route-specific query budgets. 0 falls back to the global setting.
-  uint32_t main_query_nprobe{0};
-  uint32_t active_query_nprobe{0};
-  uint32_t frozen_query_nprobe{0};
-  uint32_t main_query_topk{0};
-  uint32_t active_query_topk{0};
-  uint32_t frozen_query_topk{0};
+  // Route-specific exact-rerank candidate caps. 0 falls back to
+  // exact_rerank_candidates_per_route.
+  uint32_t main_exact_rerank_candidates{0};
+  uint32_t active_exact_rerank_candidates{0};
+  uint32_t frozen_exact_rerank_candidates{0};
   bool enable_streaming{false};
   uint32_t main_index_rows{0};
   uint32_t delta_train_window{1};

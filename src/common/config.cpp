@@ -73,12 +73,9 @@ std::string Config::ToString() const {
       << "enable_latency_debug=" << std::boolalpha << enable_latency_debug << ", "
       << "exact_rerank_enable=" << std::boolalpha << exact_rerank_enable << ", "
       << "exact_rerank_candidates_per_route=" << exact_rerank_candidates_per_route << ", "
-      << "main_query_nprobe=" << main_query_nprobe << ", "
-      << "active_query_nprobe=" << active_query_nprobe << ", "
-      << "frozen_query_nprobe=" << frozen_query_nprobe << ", "
-      << "main_query_topk=" << main_query_topk << ", "
-      << "active_query_topk=" << active_query_topk << ", "
-      << "frozen_query_topk=" << frozen_query_topk << ", "
+      << "main_exact_rerank_candidates=" << main_exact_rerank_candidates << ", "
+      << "active_exact_rerank_candidates=" << active_exact_rerank_candidates << ", "
+      << "frozen_exact_rerank_candidates=" << frozen_exact_rerank_candidates << ", "
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
@@ -153,12 +150,9 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text,
               "exact_rerank_candidates_per_route",
               &cfg.exact_rerank_candidates_per_route);
-  ExtractUint(text, "main_query_nprobe", &cfg.main_query_nprobe);
-  ExtractUint(text, "active_query_nprobe", &cfg.active_query_nprobe);
-  ExtractUint(text, "frozen_query_nprobe", &cfg.frozen_query_nprobe);
-  ExtractUint(text, "main_query_topk", &cfg.main_query_topk);
-  ExtractUint(text, "active_query_topk", &cfg.active_query_topk);
-  ExtractUint(text, "frozen_query_topk", &cfg.frozen_query_topk);
+  ExtractUint(text, "main_exact_rerank_candidates", &cfg.main_exact_rerank_candidates);
+  ExtractUint(text, "active_exact_rerank_candidates", &cfg.active_exact_rerank_candidates);
+  ExtractUint(text, "frozen_exact_rerank_candidates", &cfg.frozen_exact_rerank_candidates);
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
@@ -216,6 +210,11 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   if (cfg.exact_rerank_enable && cfg.exact_rerank_candidates_per_route < cfg.topk) {
     return Status::InvalidArgument(
         "exact_rerank_candidates_per_route must be >= topk when exact_rerank_enable=true");
+  }
+  if (cfg.exact_rerank_enable && cfg.main_exact_rerank_candidates > 0 &&
+      cfg.main_exact_rerank_candidates < cfg.topk) {
+    return Status::InvalidArgument(
+        "main_exact_rerank_candidates must be >= topk when exact_rerank_enable=true");
   }
   if (cfg.enable_rerank_source_diag && !cfg.exact_rerank_enable) {
     return Status::InvalidArgument(
