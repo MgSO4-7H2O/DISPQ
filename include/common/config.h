@@ -39,6 +39,12 @@ struct Config {
   uint32_t delta_train_window{1};
   // 0 means fallback to ivf_nlist.
   uint32_t delta_ivf_nlist{0};
+  // Partition merge score:
+  // score = alpha * growth_ratio + beta * avg_residual_dist.
+  // If score >= threshold, the partition is reclustered during merge.
+  double merge_score_alpha{1.0};
+  double merge_score_beta{1e-7};
+  double merge_score_threshold{10.0};
   // Merge trigger config is decoupled from delta training window.
   // mode:
   // - "rows": only row-based trigger

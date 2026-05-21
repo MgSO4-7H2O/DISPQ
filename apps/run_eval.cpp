@@ -37,9 +37,6 @@ namespace {
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
-constexpr double kMergeScoreAlphaDefault = 1.0;
-constexpr double kMergeScoreBetaDefault = 1e-7;
-constexpr double kMergeScoreThresholdDefault = 10.0;
 
 struct DistributionStats {
   double avg{0.0};
@@ -1439,6 +1436,9 @@ int main(int argc, char** argv) {
             << ", merge_assignment_gamma=" << config.merge_assignment_gamma
             << ", merge_assignment_hard_cap_ratio=" << config.merge_assignment_hard_cap_ratio
             << ", merge_assignment_lambda=" << config.merge_assignment_lambda
+            << ", merge_score_alpha=" << config.merge_score_alpha
+            << ", merge_score_beta=" << config.merge_score_beta
+            << ", merge_score_threshold=" << config.merge_score_threshold
             << ", main_exact_rerank_candidates=" << config.main_exact_rerank_candidates
             << ", active_exact_rerank_candidates=" << config.active_exact_rerank_candidates
             << ", frozen_exact_rerank_candidates=" << config.frozen_exact_rerank_candidates
@@ -1512,9 +1512,9 @@ int main(int argc, char** argv) {
   bool pending_active_train = false;
   uint32_t pending_active_train_begin = 0;
   MergeOptions merge_options;
-  merge_options.alpha = kMergeScoreAlphaDefault;
-  merge_options.beta = kMergeScoreBetaDefault;
-  merge_options.recluster_threshold = kMergeScoreThresholdDefault;
+  merge_options.alpha = config.merge_score_alpha;
+  merge_options.beta = config.merge_score_beta;
+  merge_options.recluster_threshold = config.merge_score_threshold;
   merge_options.assignment_mode = config.merge_assignment_mode;
   merge_options.assignment_top_r = config.merge_assignment_top_r;
   merge_options.assignment_gamma = config.merge_assignment_gamma;
@@ -2658,6 +2658,9 @@ int main(int argc, char** argv) {
         << ",\n";
     ofs << "    \"frozen_exact_rerank_candidates\": " << config.frozen_exact_rerank_candidates
         << ",\n";
+    ofs << "    \"merge_score_alpha\": " << config.merge_score_alpha << ",\n";
+    ofs << "    \"merge_score_beta\": " << config.merge_score_beta << ",\n";
+    ofs << "    \"merge_score_threshold\": " << config.merge_score_threshold << ",\n";
     ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
     ofs << "  },\n";
     ofs << "  \"metrics\": {\n";
@@ -2727,6 +2730,9 @@ int main(int argc, char** argv) {
   ofs << "    \"delta_train_rows\": " << delta_train_rows << ",\n";
   ofs << "    \"delta_ivf_nlist\": " << config.delta_ivf_nlist << ",\n";
   ofs << "    \"delta_ivf_nlist_resolved\": " << delta_ivf_nlist << ",\n";
+  ofs << "    \"merge_score_alpha\": " << config.merge_score_alpha << ",\n";
+  ofs << "    \"merge_score_beta\": " << config.merge_score_beta << ",\n";
+  ofs << "    \"merge_score_threshold\": " << config.merge_score_threshold << ",\n";
   ofs << "    \"merge_trigger_mode\": \"" << config.merge_trigger_mode << "\",\n";
   ofs << "    \"merge_trigger_rows\": " << config.merge_trigger_rows << ",\n";
   ofs << "    \"merge_trigger_rows_resolved\": " << merge_trigger_rows << ",\n";

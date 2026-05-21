@@ -80,6 +80,9 @@ std::string Config::ToString() const {
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
       << "delta_ivf_nlist=" << delta_ivf_nlist << ", "
+      << "merge_score_alpha=" << merge_score_alpha << ", "
+      << "merge_score_beta=" << merge_score_beta << ", "
+      << "merge_score_threshold=" << merge_score_threshold << ", "
       << "merge_trigger_mode=" << merge_trigger_mode << ", "
       << "merge_trigger_rows=" << merge_trigger_rows << ", "
       << "merge_trigger_qe_ratio=" << merge_trigger_qe_ratio << ", "
@@ -157,6 +160,9 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
   ExtractUint(text, "delta_ivf_nlist", &cfg.delta_ivf_nlist);
+  ExtractDouble(text, "merge_score_alpha", &cfg.merge_score_alpha);
+  ExtractDouble(text, "merge_score_beta", &cfg.merge_score_beta);
+  ExtractDouble(text, "merge_score_threshold", &cfg.merge_score_threshold);
   ExtractString(text, "merge_trigger_mode", &cfg.merge_trigger_mode);
   ExtractUint(text, "merge_trigger_rows", &cfg.merge_trigger_rows);
   ExtractDouble(text, "merge_trigger_qe_ratio", &cfg.merge_trigger_qe_ratio);
@@ -211,17 +217,21 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
     return Status::InvalidArgument(
         "exact_rerank_candidates_per_route must be >= topk when exact_rerank_enable=true");
   }
-  if (cfg.exact_rerank_enable && cfg.main_exact_rerank_candidates > 0 &&
-      cfg.main_exact_rerank_candidates < cfg.topk) {
-    return Status::InvalidArgument(
-        "main_exact_rerank_candidates must be >= topk when exact_rerank_enable=true");
-  }
   if (cfg.enable_rerank_source_diag && !cfg.exact_rerank_enable) {
     return Status::InvalidArgument(
         "enable_rerank_source_diag requires exact_rerank_enable=true");
   }
   if (cfg.enable_streaming && cfg.delta_train_window == 0) {
     return Status::InvalidArgument("delta_train_window must be > 0 when enable_streaming=true");
+  }
+  if (cfg.merge_score_alpha < 0.0) {
+    return Status::InvalidArgument("merge_score_alpha must be >= 0");
+  }
+  if (cfg.merge_score_beta < 0.0) {
+    return Status::InvalidArgument("merge_score_beta must be >= 0");
+  }
+  if (cfg.merge_score_threshold < 0.0) {
+    return Status::InvalidArgument("merge_score_threshold must be >= 0");
   }
   if (cfg.merge_trigger_mode != "rows" && cfg.merge_trigger_mode != "qe_ratio" &&
       cfg.merge_trigger_mode != "drift" && cfg.merge_trigger_mode != "imbalance" &&
