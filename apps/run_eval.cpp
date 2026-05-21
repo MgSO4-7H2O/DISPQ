@@ -257,6 +257,9 @@ struct EvalMetrics {
   double rerank_topk_delta_ratio{0.0};
   double rerank_topk_main_avg{0.0};
   double rerank_topk_delta_avg{0.0};
+  uint32_t main_route_queries{0};
+  uint32_t active_delta_route_queries{0};
+  uint32_t frozen_delta_route_queries{0};
   std::vector<std::string> worst_queries;
   std::optional<LatencyDebugMetrics> latency_debug;
 };
@@ -439,7 +442,36 @@ struct SearchRoute {
   VersionSet versions{};
   uint8_t from_new{0};
   std::string name;
+  uint32_t rows{0};
 };
+
+uint32_t ResolveRouteNprobe(const Config& config,
+                            const SearchRoute& route,
+                            uint32_t default_nprobe) {
+  uint32_t base_nprobe = default_nprobe;
+  if (route.name == "main" && config.main_query_nprobe > 0) {
+    base_nprobe = config.main_query_nprobe;
+  } else if (route.name == "active_delta" && config.active_query_nprobe > 0) {
+    base_nprobe = config.active_query_nprobe;
+  } else if (route.name == "frozen_delta" && config.frozen_query_nprobe > 0) {
+    base_nprobe = config.frozen_query_nprobe;
+  }
+  return std::max<uint32_t>(1u, base_nprobe);
+}
+
+uint32_t ResolveRouteTopK(const Config& config,
+                          const SearchRoute& route,
+                          uint32_t default_topk) {
+  uint32_t base_topk = default_topk;
+  if (route.name == "main" && config.main_query_topk > 0) {
+    base_topk = config.main_query_topk;
+  } else if (route.name == "active_delta" && config.active_query_topk > 0) {
+    base_topk = config.active_query_topk;
+  } else if (route.name == "frozen_delta" && config.frozen_query_topk > 0) {
+    base_topk = config.frozen_query_topk;
+  }
+  return std::max<uint32_t>(1u, base_topk);
+}
 
 struct OnlinePQRollup {
   uint32_t batches{0};
@@ -750,13 +782,15 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   }
 
   std::vector<SearchRoute> routes;
-  routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main"});
+  routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main", main_rows});
   if (!config.main_query_only) {
     if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
-      routes.push_back(SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1, "frozen_delta"});
+      routes.push_back(
+          SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1, "frozen_delta", frozen_delta->rows});
     }
     if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
-      routes.push_back(SearchRoute{active_delta->ivf, active_delta->versions, 1, "active_delta"});
+      routes.push_back(
+          SearchRoute{active_delta->ivf, active_delta->versions, 1, "active_delta", active_delta->rows});
     }
   }
 
@@ -767,6 +801,14 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       enable_exact_rerank
           ? std::max(params.topk, config.exact_rerank_candidates_per_route)
           : params.topk;
+  std::vector<uint32_t> route_nprobes(route_count, params.nprobe);
+  std::vector<uint32_t> route_topks(route_count, route_topk);
+  for (uint32_t ri = 0; ri < route_count; ++ri) {
+    route_nprobes[static_cast<size_t>(ri)] =
+        ResolveRouteNprobe(config, routes[static_cast<size_t>(ri)], params.nprobe);
+    route_topks[static_cast<size_t>(ri)] =
+        ResolveRouteTopK(config, routes[static_cast<size_t>(ri)], route_topk);
+  }
   std::vector<std::vector<DocId>> predictions(nq);
   std::vector<double> whitening_ms(nq, 0.0);
   std::vector<double> search_ms(nq, 0.0);
@@ -784,9 +826,11 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   std::vector<double> route_scanned_candidates(static_cast<size_t>(nq) * route_count, 0.0);
   std::vector<double> merge_topk_ms(nq, 0.0);
   std::vector<double> max_route_search_ms(nq, 0.0);
+  std::vector<double> route_wall_ms(route_count, 0.0);
+  double whitening_wall_ms = 0.0;
+  double merge_wall_ms = 0.0;
 
-  Timer wall_timer;
-
+  Timer whitening_wall_timer;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
@@ -809,30 +853,33 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     queries_whitened_runtime.row(i) = qbuf.transpose();
     whitening_ms[static_cast<size_t>(i)] = whiten_elapsed;
   }
+  whitening_wall_ms = whitening_wall_timer.ElapsedMillis();
 
   if (failed.load()) {
     return error_status;
   }
 
+  for (uint32_t ri = 0; ri < route_count; ++ri) {
+    Timer route_timer;
 #ifdef _OPENMP
-#pragma omp parallel for collapse(2) schedule(dynamic)
+#pragma omp parallel for schedule(dynamic)
 #endif
-  for (int64_t qi = 0; qi < static_cast<int64_t>(nq); ++qi) {
-    for (int64_t ri = 0; ri < static_cast<int64_t>(route_count); ++ri) {
+    for (int64_t qi = 0; qi < static_cast<int64_t>(nq); ++qi) {
       if (failed.load()) {
         continue;
       }
+      const size_t idx = static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri);
       Eigen::VectorXf q = queries_whitened_runtime.row(qi).transpose();
       Timer stimer;
       auto sres = routes[static_cast<size_t>(ri)].ivf->Search(
           q,
-          route_topk,
-          params.nprobe,
+          route_topks[static_cast<size_t>(ri)],
+          route_nprobes[static_cast<size_t>(ri)],
           routes[static_cast<size_t>(ri)].versions,
           routes[static_cast<size_t>(ri)].from_new,
           config.enable_miss_diag);
       const double elapsed = stimer.ElapsedMillis();
-      route_search_ms[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)] = elapsed;
+      route_search_ms[idx] = elapsed;
       if (!sres.ok()) {
         std::lock_guard<std::mutex> lock(error_mu);
         if (!failed.exchange(true)) {
@@ -841,15 +888,26 @@ Result<EvalMetrics> EvaluateState(const Config& config,
         continue;
       }
       route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] = sres.value();
-      route_scanned_candidates[static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri)] =
-          static_cast<double>(sres.value().scanned_candidates);
+      route_scanned_candidates[idx] = static_cast<double>(sres.value().scanned_candidates);
+    }
+    route_wall_ms[static_cast<size_t>(ri)] = route_timer.ElapsedMillis();
+    if (failed.load()) {
+      return error_status;
     }
   }
 
-  if (failed.load()) {
-    return error_status;
+  uint32_t main_route_queries = nq;
+  uint32_t active_delta_route_queries = 0;
+  uint32_t frozen_delta_route_queries = 0;
+  for (uint32_t ri = 1; ri < route_count; ++ri) {
+    if (routes[static_cast<size_t>(ri)].name == "active_delta") {
+      active_delta_route_queries = nq;
+    } else if (routes[static_cast<size_t>(ri)].name == "frozen_delta") {
+      frozen_delta_route_queries = nq;
+    }
   }
 
+  Timer merge_wall_timer;
   uint64_t rerank_topk_main_total = 0;
   uint64_t rerank_topk_delta_total = 0;
   for (uint32_t qi = 0; qi < nq; ++qi) {
@@ -892,6 +950,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     total_ms[static_cast<size_t>(qi)] = whitening_ms[static_cast<size_t>(qi)] + q_search_ms;
     scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
   }
+  merge_wall_ms = merge_wall_timer.ElapsedMillis();
 
   uint64_t gt_total = 0;
   uint64_t gt_probed = 0;
@@ -1067,7 +1126,12 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     }
   }
 
-  const double wall_elapsed_ms = wall_timer.ElapsedMillis();
+  const double slowest_route_wall_ms = route_wall_ms.empty()
+                                           ? 0.0
+                                           : *std::max_element(route_wall_ms.begin(),
+                                                               route_wall_ms.end());
+  const double wall_elapsed_no_merge_ms = whitening_wall_ms + slowest_route_wall_ms;
+  const double wall_elapsed_with_merge_ms = wall_elapsed_no_merge_ms + merge_wall_ms;
 
   auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
   if (!recall_res.ok()) {
@@ -1109,11 +1173,11 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     scanned_max = *std::max_element(scanned_counts.begin(), scanned_counts.end());
   }
 
-  const double query_qps = wall_elapsed_ms > 0.0
-                               ? (1000.0 * static_cast<double>(nq) / wall_elapsed_ms)
+  const double query_qps = wall_elapsed_with_merge_ms > 0.0
+                               ? (1000.0 * static_cast<double>(nq) / wall_elapsed_with_merge_ms)
                                : 0.0;
   const double avg_query_wall_ms =
-      nq > 0 ? (wall_elapsed_ms / static_cast<double>(nq)) : 0.0;
+      nq > 0 ? (wall_elapsed_no_merge_ms / static_cast<double>(nq)) : 0.0;
 
   EvalMetrics metrics;
   metrics.recall = recall_res.value();
@@ -1132,8 +1196,11 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.scanned_p50 = scanned_p50;
   metrics.scanned_p99 = scanned_p99;
   metrics.scanned_max = scanned_max;
-  metrics.query_eval_ms = wall_elapsed_ms;
+  metrics.query_eval_ms = wall_elapsed_with_merge_ms;
   metrics.query_count = nq;
+  metrics.main_route_queries = main_route_queries;
+  metrics.active_delta_route_queries = active_delta_route_queries;
+  metrics.frozen_delta_route_queries = frozen_delta_route_queries;
   if (config.enable_rerank_source_diag) {
     metrics.rerank_topk_main_total = rerank_topk_main_total;
     metrics.rerank_topk_delta_total = rerank_topk_delta_total;
@@ -1384,6 +1451,12 @@ int main(int argc, char** argv) {
             << ", merge_assignment_gamma=" << config.merge_assignment_gamma
             << ", merge_assignment_hard_cap_ratio=" << config.merge_assignment_hard_cap_ratio
             << ", merge_assignment_lambda=" << config.merge_assignment_lambda
+            << ", main_query_nprobe=" << config.main_query_nprobe
+            << ", active_query_nprobe=" << config.active_query_nprobe
+            << ", frozen_query_nprobe=" << config.frozen_query_nprobe
+            << ", main_query_topk=" << config.main_query_topk
+            << ", active_query_topk=" << config.active_query_topk
+            << ", frozen_query_topk=" << config.frozen_query_topk
             << ", stream_rows=" << total_stream_rows
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
@@ -2519,7 +2592,7 @@ int main(int argc, char** argv) {
             << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
             << ", rerank_candidates_per_route=" << config.exact_rerank_candidates_per_route
             << ")" << std::endl;
-  std::cout << "Latency(wall)=" << final_metrics.avg_query_ms << "ms; "
+  std::cout << "Latency(no_merge_wall)=" << final_metrics.avg_query_ms << "ms; "
             << "End-to-end overhead=" << final_metrics.end_to_end_overhead_ms << "ms; "
             << "Search p50=" << final_metrics.search_p50 << "ms, p99=" << final_metrics.search_p99
             << "ms; "
@@ -2550,6 +2623,9 @@ int main(int argc, char** argv) {
             << ", last_qe_ratio=" << online_pq_rollup.last_qe_ratio
             << ", avg_qe_ratio=" << online_avg_qe_ratio
             << ", avg_codebook_drift=" << online_avg_drift << std::endl;
+  std::cout << "[QUERY ROUTING] main_queries=" << final_metrics.main_route_queries
+            << ", frozen_delta_queries=" << final_metrics.frozen_delta_route_queries
+            << ", active_delta_queries=" << final_metrics.active_delta_route_queries << std::endl;
   if (config.enable_miss_diag) {
     std::cout << "[MISS DIAG] gt_probed_rate=" << final_metrics.gt_probed_rate
               << ", recall_on_probed_gt=" << final_metrics.recall_on_probed_gt
@@ -2591,6 +2667,12 @@ int main(int argc, char** argv) {
     ofs << "    \"topk\": " << config.topk << ",\n";
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+    ofs << "    \"main_query_nprobe\": " << config.main_query_nprobe << ",\n";
+    ofs << "    \"active_query_nprobe\": " << config.active_query_nprobe << ",\n";
+    ofs << "    \"frozen_query_nprobe\": " << config.frozen_query_nprobe << ",\n";
+    ofs << "    \"main_query_topk\": " << config.main_query_topk << ",\n";
+    ofs << "    \"active_query_topk\": " << config.active_query_topk << ",\n";
+    ofs << "    \"frozen_query_topk\": " << config.frozen_query_topk << ",\n";
     ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
     ofs << "  },\n";
     ofs << "  \"metrics\": {\n";
@@ -2599,6 +2681,11 @@ int main(int argc, char** argv) {
     ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
     ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
     ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
+    ofs << "  },\n";
+    ofs << "  \"route_execution\": {\n";
+    ofs << "    \"main_queries\": " << final_metrics.main_route_queries << ",\n";
+    ofs << "    \"frozen_delta_queries\": " << final_metrics.frozen_delta_route_queries << ",\n";
+    ofs << "    \"active_delta_queries\": " << final_metrics.active_delta_route_queries << "\n";
     ofs << "  },\n";
     ofs << "  \"global_rebuild_count\": " << global_rebuild_count << ",\n";
     ofs << "  \"merge_events\": [\n";
@@ -2620,7 +2707,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < snapshots.size(); ++i) {
       const auto& snap = snapshots[i];
       ofs << "    {\n";
-      ofs << "      \"snapshot_size\": " << snap.snapshot_rows << ",\n";
+      ofs << "      \"snapshot_size\": " << snap.base_rows << ",\n";
       ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
       ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
       ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
@@ -2696,6 +2783,12 @@ int main(int argc, char** argv) {
       << ",\n";
   ofs << "    \"exact_rerank_candidates_per_route\": "
       << config.exact_rerank_candidates_per_route << ",\n";
+  ofs << "    \"main_query_nprobe\": " << config.main_query_nprobe << ",\n";
+  ofs << "    \"active_query_nprobe\": " << config.active_query_nprobe << ",\n";
+  ofs << "    \"frozen_query_nprobe\": " << config.frozen_query_nprobe << ",\n";
+  ofs << "    \"main_query_topk\": " << config.main_query_topk << ",\n";
+  ofs << "    \"active_query_topk\": " << config.active_query_topk << ",\n";
+  ofs << "    \"frozen_query_topk\": " << config.frozen_query_topk << ",\n";
   ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
   ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
   ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";
@@ -2746,6 +2839,11 @@ int main(int argc, char** argv) {
   ofs << "    \"rerank_topk_delta_ratio\": " << final_metrics.rerank_topk_delta_ratio << ",\n";
   ofs << "    \"rerank_topk_main_avg\": " << final_metrics.rerank_topk_main_avg << ",\n";
   ofs << "    \"rerank_topk_delta_avg\": " << final_metrics.rerank_topk_delta_avg << "\n";
+  ofs << "  },\n";
+  ofs << "  \"route_execution\": {\n";
+  ofs << "    \"main_queries\": " << final_metrics.main_route_queries << ",\n";
+  ofs << "    \"frozen_delta_queries\": " << final_metrics.frozen_delta_route_queries << ",\n";
+  ofs << "    \"active_delta_queries\": " << final_metrics.active_delta_route_queries << "\n";
   ofs << "  },\n";
   ofs << "  \"pre_stream_metrics\": ";
   if (pre_stream_metrics.has_value()) {

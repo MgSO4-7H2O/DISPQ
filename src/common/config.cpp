@@ -73,6 +73,12 @@ std::string Config::ToString() const {
       << "enable_latency_debug=" << std::boolalpha << enable_latency_debug << ", "
       << "exact_rerank_enable=" << std::boolalpha << exact_rerank_enable << ", "
       << "exact_rerank_candidates_per_route=" << exact_rerank_candidates_per_route << ", "
+      << "main_query_nprobe=" << main_query_nprobe << ", "
+      << "active_query_nprobe=" << active_query_nprobe << ", "
+      << "frozen_query_nprobe=" << frozen_query_nprobe << ", "
+      << "main_query_topk=" << main_query_topk << ", "
+      << "active_query_topk=" << active_query_topk << ", "
+      << "frozen_query_topk=" << frozen_query_topk << ", "
       << "enable_streaming=" << std::boolalpha << enable_streaming << ", "
       << "main_index_rows=" << main_index_rows << ", "
       << "delta_train_window=" << delta_train_window << ", "
@@ -147,6 +153,12 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text,
               "exact_rerank_candidates_per_route",
               &cfg.exact_rerank_candidates_per_route);
+  ExtractUint(text, "main_query_nprobe", &cfg.main_query_nprobe);
+  ExtractUint(text, "active_query_nprobe", &cfg.active_query_nprobe);
+  ExtractUint(text, "frozen_query_nprobe", &cfg.frozen_query_nprobe);
+  ExtractUint(text, "main_query_topk", &cfg.main_query_topk);
+  ExtractUint(text, "active_query_topk", &cfg.active_query_topk);
+  ExtractUint(text, "frozen_query_topk", &cfg.frozen_query_topk);
   ExtractBool(text, "enable_streaming", &cfg.enable_streaming);
   ExtractUint(text, "main_index_rows", &cfg.main_index_rows);
   ExtractUint(text, "delta_train_window", &cfg.delta_train_window);
