@@ -19,6 +19,10 @@
 
 #include <Eigen/Dense>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "common/config.h"
 #include "common/dataset.h"
 #include "common/timer.h"
@@ -640,10 +644,16 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
   };
 
   if (exact_rerank_enable) {
-    for (auto& cand : merged) {
+    for (const auto& cand : merged) {
       if (cand.doc_id >= static_cast<DocId>(base_whitened.rows())) {
         return Status::InvalidArgument("MergeTopK: doc id out of range for exact rerank");
       }
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && merged.size() > 1)
+#endif
+    for (int64_t i = 0; i < static_cast<int64_t>(merged.size()); ++i) {
+      auto& cand = merged[static_cast<size_t>(i)];
       const Eigen::VectorXf diff =
           query_whitened - base_whitened.row(static_cast<Eigen::Index>(cand.doc_id)).transpose();
       cand.rerank_dist = diff.squaredNorm();
@@ -893,9 +903,15 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   }
 
   Timer merge_wall_timer;
-  uint64_t rerank_topk_main_total = 0;
-  uint64_t rerank_topk_delta_total = 0;
-  for (uint32_t qi = 0; qi < nq; ++qi) {
+  std::atomic<uint64_t> rerank_topk_main_total_atomic{0};
+  std::atomic<uint64_t> rerank_topk_delta_total_atomic{0};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int64_t qi = 0; qi < static_cast<int64_t>(nq); ++qi) {
+    if (failed.load()) {
+      continue;
+    }
     Eigen::VectorXf q = queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
     Timer merge_timer;
     auto merged_res = MergeTopK(route_results[static_cast<size_t>(qi)],
@@ -905,7 +921,11 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                 q,
                                 base_whitened);
     if (!merged_res.ok()) {
-      return merged_res.status();
+      std::lock_guard<std::mutex> lock(error_mu);
+      if (!failed.exchange(true)) {
+        error_status = merged_res.status();
+      }
+      continue;
     }
     SearchResult merged = merged_res.value();
     const double merge_elapsed = merge_timer.ElapsedMillis();
@@ -924,9 +944,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       row.push_back(cand.doc_id);
       if (config.enable_rerank_source_diag) {
         if (cand.from_new == 1) {
-          rerank_topk_delta_total++;
+          rerank_topk_delta_total_atomic.fetch_add(1, std::memory_order_relaxed);
         } else {
-          rerank_topk_main_total++;
+          rerank_topk_main_total_atomic.fetch_add(1, std::memory_order_relaxed);
         }
       }
     }
@@ -936,6 +956,13 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     scanned_counts[static_cast<size_t>(qi)] = static_cast<double>(merged.scanned_candidates);
   }
   merge_wall_ms = merge_wall_timer.ElapsedMillis();
+  if (failed.load()) {
+    return error_status;
+  }
+  const uint64_t rerank_topk_main_total =
+      rerank_topk_main_total_atomic.load(std::memory_order_relaxed);
+  const uint64_t rerank_topk_delta_total =
+      rerank_topk_delta_total_atomic.load(std::memory_order_relaxed);
 
   uint64_t gt_total = 0;
   uint64_t gt_probed = 0;
