@@ -2084,7 +2084,8 @@ int main(int argc, char** argv) {
   uint32_t last_snapshot_active_rows = stream_start_idx;
   std::optional<EvalMetrics> pre_stream_metrics;
 
-  auto evaluate_rows = [&](uint32_t active_rows) -> Result<EvalMetrics> {
+  uint64_t eval_seq = 0;
+  auto evaluate_rows = [&](uint32_t active_rows, const char* stage) -> Result<EvalMetrics> {
     auto res = EvaluateState(config,
                              X_whitened,
                              active_rows,
@@ -2103,6 +2104,10 @@ int main(int argc, char** argv) {
     }
     EvalMetrics m = res.value();
     m.rebuild_ms = rebuild_ms_total;
+    const uint64_t eval_id = ++eval_seq;
+    std::cout << "[EVAL] #" << eval_id << " stage=" << stage << ", base_rows=" << active_rows
+              << ", recall@" << config.topk << "=" << m.recall
+              << ", latency_ms=" << m.avg_query_ms << ", qps=" << m.query_qps << std::endl;
     return m;
   };
 
@@ -2193,7 +2198,7 @@ int main(int argc, char** argv) {
   double pending_update_ms = 0.0;
 
   if (config.enable_streaming && rows_after_main > 0) {
-    auto pre_res = evaluate_rows(stream_start_idx);
+    auto pre_res = evaluate_rows(stream_start_idx, "pre_stream");
     if (!pre_res.ok()) {
       std::cerr << pre_res.status().ToString() << std::endl;
       return 1;
@@ -2365,7 +2370,7 @@ int main(int argc, char** argv) {
 
       std::optional<EvalMetrics> batch_metrics;
       if (eval_after_each_minibatch) {
-        auto mres = evaluate_rows(next_insert_idx);
+        auto mres = evaluate_rows(next_insert_idx, "minibatch");
         if (!mres.ok()) {
           std::cerr << mres.status().ToString() << std::endl;
           return 1;
@@ -2432,7 +2437,7 @@ int main(int argc, char** argv) {
         if (batch_metrics.has_value()) {
           snapshot_metrics = batch_metrics.value();
         } else {
-          auto sres = evaluate_rows(next_insert_idx);
+          auto sres = evaluate_rows(next_insert_idx, "snapshot");
           if (!sres.ok()) {
             std::cerr << sres.status().ToString() << std::endl;
             return 1;
@@ -2571,7 +2576,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto final_res = evaluate_rows(next_insert_idx);
+  auto final_res = evaluate_rows(next_insert_idx, "final");
   if (!final_res.ok()) {
     std::cerr << final_res.status().ToString() << std::endl;
     return 1;
