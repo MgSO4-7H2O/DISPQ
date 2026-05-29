@@ -48,6 +48,7 @@ struct IndexData {
   uint32_t Ks{0};
   uint32_t dsub{0};
   MatrixRM routing_centroids;
+  Eigen::VectorXf routing_centroid_norms;
   std::vector<MatrixRM> pq_codebooks;
   std::vector<std::vector<uint8_t>> pq_codes_by_list;
   bool use_precomputed_table{false};
@@ -65,11 +66,23 @@ struct IndexData {
   double last_patch_pq_reencode_ms{0.0};
 };
 
+inline float SquaredL2FromNormDot(float a_norm, float b_norm, float dot) {
+  const float dist = a_norm + b_norm - 2.0f * dot;
+  return (dist >= 0.0f) ? dist : 0.0f;
+}
+
 int NearestCentroid(Eigen::Ref<const Eigen::VectorXf> vec, const IndexData& data) {
+  const float vec_norm = vec.squaredNorm();
+  const bool has_routing_norms =
+      data.routing_centroid_norms.size() == data.routing_centroids.rows();
   float best = std::numeric_limits<float>::max();
   int best_idx = 0;
   for (int i = 0; i < data.routing_centroids.rows(); ++i) {
-    const float dist = (data.routing_centroids.row(i).transpose() - vec).squaredNorm();
+    const float dot = data.routing_centroids.row(i).dot(vec);
+    const float centroid_norm =
+        has_routing_norms ? data.routing_centroid_norms(i)
+                          : data.routing_centroids.row(i).squaredNorm();
+    const float dist = SquaredL2FromNormDot(centroid_norm, vec_norm, dot);
     if (dist < best) {
       best = dist;
       best_idx = i;
@@ -357,10 +370,16 @@ SearchResult SearchSingleQuery(const IndexData& data,
       use_pq && data.use_precomputed_table &&
       data.pq_precomputed_table.size() == PrecomputedTableElementCount(data);
   const bool use_fast_scan = use_pq && data.M >= 4;
+  const bool has_routing_norms =
+      data.routing_centroid_norms.size() == data.routing_centroids.rows();
+  const float qw_norm = qw.squaredNorm();
   std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
   for (uint32_t i = 0; i < data.nlist; ++i) {
-    const float dist = (data.routing_centroids.row(static_cast<Eigen::Index>(i)).transpose() - qw)
-                           .squaredNorm();
+    const float dot = data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
+    const float centroid_norm =
+        has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i))
+                          : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+    const float dist = SquaredL2FromNormDot(centroid_norm, qw_norm, dot);
     centroid_dists[static_cast<size_t>(i)] = {dist, i};
   }
   std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
@@ -371,7 +390,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
   uint64_t scanned = 0;
   std::vector<DocId> scanned_doc_ids;
   std::vector<float> scanned_approx_dists;
-  const float qnorm = use_pq ? 0.0f : qw.squaredNorm();
+  const float qnorm = use_pq ? 0.0f : qw_norm;
   std::vector<float> distance_table;
   std::vector<float> query_term3_table;
   if (use_pq) {
@@ -541,6 +560,7 @@ class KMeansIVFIndex : public IVFIndex {
     data->dim = dim;
     data->nlist = nlist;
     data->routing_centroids = std::move(centroids);
+    data->routing_centroid_norms = data->routing_centroids.rowwise().squaredNorm();
     data->use_pq = p.pq.enable;
     data->pq_residual = p.pq.residual;
     if (data->use_pq) {
