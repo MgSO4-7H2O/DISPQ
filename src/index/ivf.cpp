@@ -25,6 +25,7 @@ namespace {
 constexpr uint32_t kDefaultKMeansIterations = 20;
 constexpr uint32_t kDefaultSeed = 42;
 constexpr double kDefaultNQEEps = 1e-6;
+constexpr size_t kPrecomputedTableMaxBytes = (static_cast<size_t>(2) << 30);  // 2GB
 
 struct ListEntry {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -48,6 +49,8 @@ struct IndexData {
   uint32_t dsub{0};
   MatrixRM routing_centroids;
   std::vector<MatrixRM> pq_codebooks;
+  bool use_precomputed_table{false};
+  std::vector<float> pq_precomputed_table;
   std::vector<std::vector<uint64_t>> pq_counts;
   double nqe_baseline{0.0};
   double nqe_ema{0.0};
@@ -196,6 +199,216 @@ uint32_t ClampTopCount(double ratio, uint32_t total) {
   const double r = std::clamp(ratio, 0.0, 1.0);
   const uint32_t k = static_cast<uint32_t>(std::ceil(r * static_cast<double>(total)));
   return std::max<uint32_t>(1, std::min<uint32_t>(k, total));
+}
+
+size_t PrecomputedTableElementCount(const IndexData& data) {
+  return static_cast<size_t>(data.nlist) * static_cast<size_t>(data.M) * static_cast<size_t>(data.Ks);
+}
+
+void BuildPrecomputedTable(IndexData* data) {
+  if (data == nullptr) {
+    return;
+  }
+  data->use_precomputed_table = false;
+  data->pq_precomputed_table.clear();
+  if (!data->use_pq || !data->pq_residual || data->M == 0 || data->Ks == 0 || data->dsub == 0) {
+    return;
+  }
+  if (data->pq_codebooks.size() != data->M || data->routing_centroids.rows() != data->nlist) {
+    return;
+  }
+
+  const size_t elem_count = PrecomputedTableElementCount(*data);
+  if (elem_count == 0) {
+    return;
+  }
+  const size_t bytes = elem_count * sizeof(float);
+  if (bytes > kPrecomputedTableMaxBytes) {
+    return;
+  }
+
+  data->pq_precomputed_table.resize(elem_count);
+  for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
+    for (uint32_t m = 0; m < data->M; ++m) {
+      const MatrixRM& codebook = data->pq_codebooks[static_cast<size_t>(m)];
+      if (codebook.rows() != static_cast<Eigen::Index>(data->Ks) ||
+          codebook.cols() != static_cast<Eigen::Index>(data->dsub)) {
+        data->pq_precomputed_table.clear();
+        return;
+      }
+      Eigen::Map<const Eigen::VectorXf> centroid_sub(
+          data->routing_centroids.row(static_cast<Eigen::Index>(list_id)).data() +
+              static_cast<Eigen::Index>(m * data->dsub),
+          static_cast<Eigen::Index>(data->dsub));
+      for (uint32_t k = 0; k < data->Ks; ++k) {
+        Eigen::Map<const Eigen::VectorXf> z(
+            codebook.row(static_cast<Eigen::Index>(k)).data(),
+            static_cast<Eigen::Index>(data->dsub));
+        const float precomputed = z.squaredNorm() + 2.0f * centroid_sub.dot(z);
+        const size_t idx = (static_cast<size_t>(list_id) * data->M + m) * data->Ks + k;
+        data->pq_precomputed_table[idx] = precomputed;
+      }
+    }
+  }
+  data->use_precomputed_table = true;
+}
+
+float AccumulateDistanceFastScan(const float* distance_table,
+                                 const uint8_t* code_ptr,
+                                 uint32_t M,
+                                 uint32_t Ks) {
+  float sum = 0.0f;
+  uint32_t m = 0;
+  const float* table_ptr = distance_table;
+  for (; m + 3 < M; m += 4) {
+    sum += table_ptr[code_ptr[0]];
+    sum += table_ptr[Ks + code_ptr[1]];
+    sum += table_ptr[2 * Ks + code_ptr[2]];
+    sum += table_ptr[3 * Ks + code_ptr[3]];
+    code_ptr += 4;
+    table_ptr += 4 * Ks;
+  }
+  for (; m < M; ++m) {
+    sum += table_ptr[*code_ptr++];
+    table_ptr += Ks;
+  }
+  return sum;
+}
+
+SearchResult SearchSingleQuery(const IndexData& data,
+                               Eigen::Ref<const Eigen::VectorXf> qw,
+                               uint32_t topk,
+                               uint32_t probes,
+                               uint8_t from_new,
+                               bool collect_scan_trace) {
+  auto heap_cmp = [](const Candidate& a, const Candidate& b) {
+    return a.approx_dist < b.approx_dist;
+  };
+
+  const bool use_pq = data.use_pq && data.M > 0 && data.Ks > 0 && data.dsub > 0 &&
+                      data.pq_codebooks.size() == data.M;
+  const bool use_precomputed_table =
+      use_pq && data.use_precomputed_table &&
+      data.pq_precomputed_table.size() == PrecomputedTableElementCount(data);
+  const bool use_fast_scan = use_pq && data.M >= 4;
+  std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
+  for (uint32_t i = 0; i < data.nlist; ++i) {
+    const float dist = (data.routing_centroids.row(static_cast<Eigen::Index>(i)).transpose() - qw)
+                           .squaredNorm();
+    centroid_dists[static_cast<size_t>(i)] = {dist, i};
+  }
+  std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  std::vector<Candidate> heap;
+  heap.reserve(topk);
+  uint64_t scanned = 0;
+  std::vector<DocId> scanned_doc_ids;
+  std::vector<float> scanned_approx_dists;
+  const float qnorm = use_pq ? 0.0f : qw.squaredNorm();
+  std::vector<float> distance_table;
+  std::vector<float> query_term3_table;
+  if (use_pq) {
+    distance_table.resize(static_cast<size_t>(data.M) * data.Ks);
+    if (use_precomputed_table) {
+      query_term3_table.resize(static_cast<size_t>(data.M) * data.Ks, 0.0f);
+      for (uint32_t m = 0; m < data.M; ++m) {
+        const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
+        Eigen::Map<const Eigen::VectorXf> qsub(
+            qw.data() + static_cast<Eigen::Index>(m * data.dsub),
+            static_cast<Eigen::Index>(data.dsub));
+        for (uint32_t k = 0; k < data.Ks; ++k) {
+          const float qz = qsub.dot(codebook.row(static_cast<Eigen::Index>(k)).transpose());
+          query_term3_table[static_cast<size_t>(m) * data.Ks + k] = -2.0f * qz;
+        }
+      }
+    }
+  }
+  for (uint32_t pi = 0; pi < probes; ++pi) {
+    const uint32_t list_id = centroid_dists[static_cast<size_t>(pi)].second;
+    const float coarse_dist = centroid_dists[static_cast<size_t>(pi)].first;
+    if (use_pq) {
+      if (use_precomputed_table) {
+        const size_t table_offset =
+            static_cast<size_t>(list_id) * static_cast<size_t>(data.M) * static_cast<size_t>(data.Ks);
+        for (size_t i = 0; i < distance_table.size(); ++i) {
+          distance_table[i] = data.pq_precomputed_table[table_offset + i] + query_term3_table[i];
+        }
+      } else {
+        Eigen::VectorXf qres = qw;
+        if (data.pq_residual) {
+          qres -= data.routing_centroids.row(static_cast<Eigen::Index>(list_id)).transpose();
+        }
+        for (uint32_t m = 0; m < data.M; ++m) {
+          const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
+          Eigen::Map<const Eigen::VectorXf> qsub(
+              qres.data() + static_cast<Eigen::Index>(m * data.dsub),
+              static_cast<Eigen::Index>(data.dsub));
+          for (uint32_t k = 0; k < data.Ks; ++k) {
+            const float dist =
+                (qsub - codebook.row(static_cast<Eigen::Index>(k)).transpose()).squaredNorm();
+            distance_table[static_cast<size_t>(m) * data.Ks + k] = dist;
+          }
+        }
+      }
+    }
+    for (const auto& entry : data.lists[static_cast<size_t>(list_id)]) {
+      ++scanned;
+      Candidate cand;
+      cand.doc_id = entry.doc_id;
+      if (use_pq) {
+        if (entry.pq_code.size() != data.M) {
+          continue;
+        }
+        float approx = use_fast_scan
+                           ? AccumulateDistanceFastScan(
+                                 distance_table.data(), entry.pq_code.data(), data.M, data.Ks)
+                           : 0.0f;
+        if (!use_fast_scan) {
+          for (uint32_t m = 0; m < data.M; ++m) {
+            const uint8_t code = entry.pq_code[static_cast<size_t>(m)];
+            approx += distance_table[static_cast<size_t>(m) * data.Ks + code];
+          }
+        }
+        if (use_precomputed_table) {
+          approx += coarse_dist;
+        }
+        cand.approx_dist = approx;
+      } else {
+        const float dot = entry.vector.dot(qw);
+        cand.approx_dist = qnorm + entry.norm - 2.0f * dot;
+      }
+      cand.rerank_dist = cand.approx_dist;
+      cand.versions = entry.versions;
+      cand.versions.index_version = data.version;
+      cand.from_new = from_new;
+      if (collect_scan_trace) {
+        scanned_doc_ids.push_back(cand.doc_id);
+        scanned_approx_dists.push_back(cand.approx_dist);
+      }
+      if (heap.size() < topk) {
+        heap.push_back(std::move(cand));
+        std::push_heap(heap.begin(), heap.end(), heap_cmp);
+      } else if (!heap.empty() && cand.approx_dist < heap.front().approx_dist) {
+        std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+        heap.back() = std::move(cand);
+        std::push_heap(heap.begin(), heap.end(), heap_cmp);
+      }
+    }
+  }
+
+  SearchResult result;
+  result.scanned_candidates = scanned;
+  if (!heap.empty()) {
+    std::sort(heap.begin(), heap.end(),
+              [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
+    result.topk = std::move(heap);
+  }
+  if (collect_scan_trace) {
+    result.scanned_doc_ids = std::move(scanned_doc_ids);
+    result.scanned_approx_dists = std::move(scanned_approx_dists);
+  }
+  return result;
 }
 
 class KMeansIVFIndex : public IVFIndex {
@@ -357,6 +570,7 @@ class KMeansIVFIndex : public IVFIndex {
       data->nqe_baseline =
           (p.fixed_pq_baseline_nqe > 0.0) ? p.fixed_pq_baseline_nqe : computed_baseline;
       data->nqe_ema = (p.fixed_pq_ema_nqe > 0.0) ? p.fixed_pq_ema_nqe : data->nqe_baseline;
+      BuildPrecomputedTable(data.get());
     }
 
     std::unique_lock lock(mu_);
@@ -792,6 +1006,9 @@ class KMeansIVFIndex : public IVFIndex {
       }
       stats.updated_codebook = stats.updated_codewords > 0;
       stats.codebook_drift_l2 = std::sqrt(drift_sq);
+      if (stats.updated_codebook) {
+        BuildPrecomputedTable(&data);
+      }
 
       if (stats.updated_codebook && options.reencode_batch_after_update) {
         for (size_t i = 0; i < recs.size(); ++i) {
@@ -843,107 +1060,42 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::InvalidArgument("Query dim mismatch");
     }
     const uint32_t probes = std::max<uint32_t>(1, std::min<uint32_t>(nprobe, data.nlist));
-    const bool use_pq = data.use_pq && data.M > 0 && data.Ks > 0 && data.dsub > 0 &&
-                        data.pq_codebooks.size() == data.M;
+    return SearchSingleQuery(data, qw, topk, probes, from_new, collect_scan_trace);
+  }
 
-    std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
-    for (uint32_t i = 0; i < data.nlist; ++i) {
-      const float dist = (data.routing_centroids.row(static_cast<Eigen::Index>(i)).transpose() - qw)
-                             .squaredNorm();
-      centroid_dists[static_cast<size_t>(i)] = {dist, i};
+  Result<std::vector<SearchResult>> SearchBatch(
+      Eigen::Ref<const MatrixRM> qw_batch,
+      uint32_t topk,
+      uint32_t nprobe,
+      const VersionSet& route_versions,
+      uint8_t from_new,
+      bool collect_scan_trace) const override {
+    if (topk == 0) {
+      return Status::InvalidArgument("topk must be positive");
     }
-    std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
-                      [](const auto& a, const auto& b) { return a.first < b.first; });
-
-    auto heap_cmp = [](const Candidate& a, const Candidate& b) {
-      return a.approx_dist < b.approx_dist;
-    };
-    std::vector<Candidate> heap;
-    heap.reserve(topk);
-    uint64_t scanned = 0;
-    std::vector<DocId> scanned_doc_ids;
-    std::vector<float> scanned_approx_dists;
-    const float qnorm = use_pq ? 0.0f : qw.squaredNorm();
-    std::vector<float> distance_table;
-    if (use_pq) {
-      distance_table.resize(static_cast<size_t>(data.M) * data.Ks);
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
     }
-    for (uint32_t pi = 0; pi < probes; ++pi) {
-      const uint32_t list_id = centroid_dists[static_cast<size_t>(pi)].second;
-      Eigen::VectorXf qres = qw;
-      if (use_pq && data.pq_residual) {
-        qres -= data.routing_centroids.row(static_cast<Eigen::Index>(list_id)).transpose();
-      }
-      if (use_pq) {
-        for (uint32_t m = 0; m < data.M; ++m) {
-          const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
-          Eigen::Map<const Eigen::VectorXf> qsub(
-              qres.data() + static_cast<Eigen::Index>(m * data.dsub),
-              static_cast<Eigen::Index>(data.dsub));
-          for (uint32_t k = 0; k < data.Ks; ++k) {
-            const float dist =
-                (qsub - codebook.row(static_cast<Eigen::Index>(k)).transpose()).squaredNorm();
-            distance_table[static_cast<size_t>(m) * data.Ks + k] = dist;
-          }
-        }
-      }
-      for (const auto& entry : data.lists[static_cast<size_t>(list_id)]) {
-        ++scanned;
-        Candidate cand;
-        cand.doc_id = entry.doc_id;
-        if (use_pq) {
-          if (entry.pq_code.size() != data.M) {
-            continue;
-          }
-          float approx = 0.0f;
-          for (uint32_t m = 0; m < data.M; ++m) {
-            const uint8_t code = entry.pq_code[static_cast<size_t>(m)];
-            approx += distance_table[static_cast<size_t>(m) * data.Ks + code];
-          }
-          cand.approx_dist = approx;
-        } else {
-          const float dot = entry.vector.dot(qw);
-          cand.approx_dist = qnorm + entry.norm - 2.0f * dot;
-        }
-        cand.rerank_dist = cand.approx_dist;
-        cand.versions = entry.versions;
-        cand.versions.index_version = data.version;
-        cand.from_new = from_new;
-        if (collect_scan_trace) {
-          scanned_doc_ids.push_back(cand.doc_id);
-          scanned_approx_dists.push_back(cand.approx_dist);
-        }
-        if (heap.size() < topk) {
-          heap.push_back(std::move(cand));
-          std::push_heap(heap.begin(), heap.end(), heap_cmp);
-        } else if (!heap.empty() && cand.approx_dist < heap.front().approx_dist) {
-          std::pop_heap(heap.begin(), heap.end(), heap_cmp);
-          heap.back() = std::move(cand);
-          std::push_heap(heap.begin(), heap.end(), heap_cmp);
-        }
-      }
+    const IndexData& data = *it->second;
+    if (qw_batch.cols() != static_cast<Eigen::Index>(data.dim)) {
+      return Status::InvalidArgument("Query dim mismatch");
     }
-
-    if (heap.empty()) {
-      SearchResult result;
-      result.scanned_candidates = scanned;
-      if (collect_scan_trace) {
-        result.scanned_doc_ids = std::move(scanned_doc_ids);
-        result.scanned_approx_dists = std::move(scanned_approx_dists);
-      }
-      return result;
+    std::vector<SearchResult> out(static_cast<size_t>(qw_batch.rows()));
+    if (qw_batch.rows() == 0) {
+      return out;
     }
-
-    std::sort(heap.begin(), heap.end(),
-              [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
-    SearchResult result;
-    result.topk = std::move(heap);
-    result.scanned_candidates = scanned;
-    if (collect_scan_trace) {
-      result.scanned_doc_ids = std::move(scanned_doc_ids);
-      result.scanned_approx_dists = std::move(scanned_approx_dists);
+    const uint32_t probes = std::max<uint32_t>(1, std::min<uint32_t>(nprobe, data.nlist));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int64_t qi = 0; qi < static_cast<int64_t>(qw_batch.rows()); ++qi) {
+      Eigen::VectorXf q = qw_batch.row(static_cast<Eigen::Index>(qi)).transpose();
+      out[static_cast<size_t>(qi)] =
+          SearchSingleQuery(data, q, topk, probes, from_new, collect_scan_trace);
     }
-    return result;
+    return out;
   }
 
   Result<MatrixRM> GetRoutingCentroids(const VersionSet& route_versions) const override {

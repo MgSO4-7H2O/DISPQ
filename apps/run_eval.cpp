@@ -856,38 +856,30 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 
   for (uint32_t ri = 0; ri < route_count; ++ri) {
     Timer route_timer;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-    for (int64_t qi = 0; qi < static_cast<int64_t>(nq); ++qi) {
-      if (failed.load()) {
-        continue;
-      }
-      const size_t idx = static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri);
-      Eigen::VectorXf q = queries_whitened_runtime.row(qi).transpose();
-      Timer stimer;
-      auto sres = routes[static_cast<size_t>(ri)].ivf->Search(
-          q,
-          route_topks[static_cast<size_t>(ri)],
-          route_nprobes[static_cast<size_t>(ri)],
-          routes[static_cast<size_t>(ri)].versions,
-          routes[static_cast<size_t>(ri)].from_new,
-          config.enable_miss_diag);
-      const double elapsed = stimer.ElapsedMillis();
-      route_search_ms[idx] = elapsed;
-      if (!sres.ok()) {
-        std::lock_guard<std::mutex> lock(error_mu);
-        if (!failed.exchange(true)) {
-          error_status = sres.status();
-        }
-        continue;
-      }
-      route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] = sres.value();
-      route_scanned_candidates[idx] = static_cast<double>(sres.value().scanned_candidates);
-    }
+    auto sres_batch = routes[static_cast<size_t>(ri)].ivf->SearchBatch(
+        queries_whitened_runtime,
+        route_topks[static_cast<size_t>(ri)],
+        route_nprobes[static_cast<size_t>(ri)],
+        routes[static_cast<size_t>(ri)].versions,
+        routes[static_cast<size_t>(ri)].from_new,
+        config.enable_miss_diag);
     route_wall_ms[static_cast<size_t>(ri)] = route_timer.ElapsedMillis();
-    if (failed.load()) {
-      return error_status;
+    if (!sres_batch.ok()) {
+      return sres_batch.status();
+    }
+    std::vector<SearchResult> route_batch = std::move(sres_batch.value());
+    if (route_batch.size() != static_cast<size_t>(nq)) {
+      return Status::InvalidArgument("EvaluateState: route batch result size mismatch");
+    }
+    const double per_query_route_ms =
+        nq > 0 ? (route_wall_ms[static_cast<size_t>(ri)] / static_cast<double>(nq)) : 0.0;
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+      const size_t idx = static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri);
+      route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] =
+          std::move(route_batch[static_cast<size_t>(qi)]);
+      route_scanned_candidates[idx] = static_cast<double>(
+          route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)].scanned_candidates);
+      route_search_ms[idx] = per_query_route_ms;
     }
   }
 
@@ -1423,10 +1415,6 @@ int main(int argc, char** argv) {
   } else {
     nq = (config.max_queries > 0) ? config.max_queries : 8;
     Q = GenerateRandom(nq, config.dim, config.seed + 1);
-  }
-
-  if (config.max_queries > 0 && nq > config.max_queries) {
-    Q = Q.topRows(config.max_queries);
   }
 
   const uint32_t main_rows_initial = ResolveMainRows(config, nx);
