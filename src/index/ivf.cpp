@@ -354,12 +354,13 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   flat.resize(last * data->M);
 }
 
-SearchResult SearchSingleQuery(const IndexData& data,
-                               Eigen::Ref<const Eigen::VectorXf> qw,
-                               uint32_t topk,
-                               uint32_t probes,
-                               uint8_t from_new,
-                               bool collect_scan_trace) {
+SearchResult SearchSingleQueryFromCentroidDists(
+    const IndexData& data,
+    Eigen::Ref<const Eigen::VectorXf> qw,
+    uint32_t topk,
+    uint8_t from_new,
+    bool collect_scan_trace,
+    const std::vector<std::pair<float, uint32_t>>& centroid_dists) {
   auto heap_cmp = [](const Candidate& a, const Candidate& b) {
     return a.approx_dist < b.approx_dist;
   };
@@ -370,20 +371,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
       use_pq && data.use_precomputed_table &&
       data.pq_precomputed_table.size() == PrecomputedTableElementCount(data);
   const bool use_fast_scan = use_pq && data.M >= 4;
-  const bool has_routing_norms =
-      data.routing_centroid_norms.size() == data.routing_centroids.rows();
   const float qw_norm = qw.squaredNorm();
-  std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
-  for (uint32_t i = 0; i < data.nlist; ++i) {
-    const float dot = data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
-    const float centroid_norm =
-        has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i))
-                          : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
-    const float dist = SquaredL2FromNormDot(centroid_norm, qw_norm, dot);
-    centroid_dists[static_cast<size_t>(i)] = {dist, i};
-  }
-  std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
-                    [](const auto& a, const auto& b) { return a.first < b.first; });
 
   std::vector<Candidate> heap;
   heap.reserve(topk);
@@ -409,7 +397,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
       }
     }
   }
-  for (uint32_t pi = 0; pi < probes; ++pi) {
+  for (size_t pi = 0; pi < centroid_dists.size(); ++pi) {
     const uint32_t list_id = centroid_dists[static_cast<size_t>(pi)].second;
     const float coarse_dist = centroid_dists[static_cast<size_t>(pi)].first;
     if (use_pq) {
@@ -504,6 +492,31 @@ SearchResult SearchSingleQuery(const IndexData& data,
     result.scanned_approx_dists = std::move(scanned_approx_dists);
   }
   return result;
+}
+
+SearchResult SearchSingleQuery(const IndexData& data,
+                               Eigen::Ref<const Eigen::VectorXf> qw,
+                               uint32_t topk,
+                               uint32_t probes,
+                               uint8_t from_new,
+                               bool collect_scan_trace) {
+  const bool has_routing_norms =
+      data.routing_centroid_norms.size() == data.routing_centroids.rows();
+  const float qw_norm = qw.squaredNorm();
+  std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
+  for (uint32_t i = 0; i < data.nlist; ++i) {
+    const float dot = data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
+    const float centroid_norm =
+        has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i))
+                          : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+    const float dist = SquaredL2FromNormDot(centroid_norm, qw_norm, dot);
+    centroid_dists[static_cast<size_t>(i)] = {dist, i};
+  }
+  std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+  centroid_dists.resize(probes);
+  return SearchSingleQueryFromCentroidDists(
+      data, qw, topk, from_new, collect_scan_trace, centroid_dists);
 }
 
 class KMeansIVFIndex : public IVFIndex {
@@ -1187,13 +1200,33 @@ class KMeansIVFIndex : public IVFIndex {
       return out;
     }
     const uint32_t probes = std::max<uint32_t>(1, std::min<uint32_t>(nprobe, data.nlist));
+    const bool has_routing_norms =
+        data.routing_centroid_norms.size() == data.routing_centroids.rows();
+    const Eigen::VectorXf query_norms = qw_batch.rowwise().squaredNorm();
+    const MatrixRM centroid_dots = qw_batch * data.routing_centroids.transpose();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
     for (int64_t qi = 0; qi < static_cast<int64_t>(qw_batch.rows()); ++qi) {
+      std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
+      const float qnorm = query_norms(static_cast<Eigen::Index>(qi));
+      for (uint32_t ci = 0; ci < data.nlist; ++ci) {
+        const float centroid_norm =
+            has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(ci))
+                              : data.routing_centroids.row(static_cast<Eigen::Index>(ci)).squaredNorm();
+        const float dot =
+            centroid_dots(static_cast<Eigen::Index>(qi), static_cast<Eigen::Index>(ci));
+        const float dist = SquaredL2FromNormDot(centroid_norm, qnorm, dot);
+        centroid_dists[static_cast<size_t>(ci)] = {dist, ci};
+      }
+      std::partial_sort(
+          centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
+          [](const auto& a, const auto& b) { return a.first < b.first; });
+      centroid_dists.resize(probes);
       Eigen::VectorXf q = qw_batch.row(static_cast<Eigen::Index>(qi)).transpose();
       out[static_cast<size_t>(qi)] =
-          SearchSingleQuery(data, q, topk, probes, from_new, collect_scan_trace);
+          SearchSingleQueryFromCentroidDists(
+              data, q, topk, from_new, collect_scan_trace, centroid_dists);
     }
     return out;
   }
