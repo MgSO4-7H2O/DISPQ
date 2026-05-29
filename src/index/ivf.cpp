@@ -49,6 +49,7 @@ struct IndexData {
   uint32_t dsub{0};
   MatrixRM routing_centroids;
   std::vector<MatrixRM> pq_codebooks;
+  std::vector<std::vector<uint8_t>> pq_codes_by_list;
   bool use_precomputed_table{false};
   std::vector<float> pq_precomputed_table;
   std::vector<std::vector<uint64_t>> pq_counts;
@@ -275,6 +276,71 @@ float AccumulateDistanceFastScan(const float* distance_table,
   return sum;
 }
 
+bool HasContiguousPQCodesForList(const IndexData& data, uint32_t list_id) {
+  if (!data.use_pq || data.M == 0) {
+    return false;
+  }
+  if (list_id >= data.lists.size() || list_id >= data.pq_codes_by_list.size()) {
+    return false;
+  }
+  const auto& flat = data.pq_codes_by_list[static_cast<size_t>(list_id)];
+  return flat.size() == data.lists[static_cast<size_t>(list_id)].size() * data.M;
+}
+
+void RebuildListPQCodes(IndexData* data, uint32_t list_id) {
+  if (data == nullptr || !data->use_pq || data->M == 0) {
+    return;
+  }
+  if (list_id >= data->lists.size()) {
+    return;
+  }
+  if (data->pq_codes_by_list.size() != data->lists.size()) {
+    data->pq_codes_by_list.resize(data->lists.size());
+  }
+  const auto& list = data->lists[static_cast<size_t>(list_id)];
+  auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
+  flat.clear();
+  flat.reserve(list.size() * data->M);
+  for (const auto& entry : list) {
+    if (entry.pq_code.size() != data->M) {
+      flat.clear();
+      return;
+    }
+    flat.insert(flat.end(), entry.pq_code.begin(), entry.pq_code.end());
+  }
+}
+
+void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
+  if (data == nullptr || !data->use_pq || data->M == 0) {
+    return;
+  }
+  if (!HasContiguousPQCodesForList(*data, list_id)) {
+    RebuildListPQCodes(data, list_id);
+  }
+  if (list_id >= data->pq_codes_by_list.size()) {
+    return;
+  }
+  auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
+  if (flat.size() % data->M != 0) {
+    RebuildListPQCodes(data, list_id);
+  }
+  size_t rows = flat.size() / data->M;
+  if (pos >= rows) {
+    RebuildListPQCodes(data, list_id);
+    rows = flat.size() / data->M;
+    if (flat.size() % data->M != 0 || pos >= rows) {
+      return;
+    }
+  }
+  const size_t last = rows - 1;
+  if (pos != last) {
+    std::copy_n(flat.data() + last * data->M,
+                data->M,
+                flat.data() + pos * data->M);
+  }
+  flat.resize(last * data->M);
+}
+
 SearchResult SearchSingleQuery(const IndexData& data,
                                Eigen::Ref<const Eigen::VectorXf> qw,
                                uint32_t topk,
@@ -352,21 +418,31 @@ SearchResult SearchSingleQuery(const IndexData& data,
         }
       }
     }
-    for (const auto& entry : data.lists[static_cast<size_t>(list_id)]) {
+    const auto& list = data.lists[static_cast<size_t>(list_id)];
+    const bool use_contiguous_codes = use_pq && HasContiguousPQCodesForList(data, list_id);
+    const uint8_t* contiguous_codes =
+        use_contiguous_codes ? data.pq_codes_by_list[static_cast<size_t>(list_id)].data() : nullptr;
+    for (size_t li = 0; li < list.size(); ++li) {
+      const auto& entry = list[li];
       ++scanned;
       Candidate cand;
       cand.doc_id = entry.doc_id;
       if (use_pq) {
-        if (entry.pq_code.size() != data.M) {
+        const uint8_t* code_ptr = nullptr;
+        if (use_contiguous_codes) {
+          code_ptr = contiguous_codes + li * data.M;
+        } else if (entry.pq_code.size() == data.M) {
+          code_ptr = entry.pq_code.data();
+        }
+        if (code_ptr == nullptr) {
           continue;
         }
         float approx = use_fast_scan
-                           ? AccumulateDistanceFastScan(
-                                 distance_table.data(), entry.pq_code.data(), data.M, data.Ks)
+                           ? AccumulateDistanceFastScan(distance_table.data(), code_ptr, data.M, data.Ks)
                            : 0.0f;
         if (!use_fast_scan) {
           for (uint32_t m = 0; m < data.M; ++m) {
-            const uint8_t code = entry.pq_code[static_cast<size_t>(m)];
+            const uint8_t code = code_ptr[m];
             approx += distance_table[static_cast<size_t>(m) * data.Ks + code];
           }
         }
@@ -482,6 +558,10 @@ class KMeansIVFIndex : public IVFIndex {
     }
     data->lists.clear();
     data->lists.resize(nlist);
+    data->pq_codes_by_list.clear();
+    if (data->use_pq) {
+      data->pq_codes_by_list.resize(nlist);
+    }
     data->doc_ids.clear();
     data->doc_to_list.clear();
     data->ntotal = 0;
@@ -1311,6 +1391,7 @@ class KMeansIVFIndex : public IVFIndex {
       }
       if (data.use_pq) {
         pq_reencode_ms += pq_reencode_timer.ElapsedMillis();
+        RebuildListPQCodes(&data, partition_id);
       }
     }
 
@@ -1420,6 +1501,9 @@ class KMeansIVFIndex : public IVFIndex {
         r.entry = std::move(list[pos]);
         removed->push_back(std::move(r));
       }
+      if (data->use_pq) {
+        SwapEraseListPQCode(data, list_id, pos);
+      }
       if (pos != list.size() - 1) {
         list[pos] = std::move(list.back());
         data->doc_to_list[list[pos].doc_id] = list_id;
@@ -1437,11 +1521,28 @@ class KMeansIVFIndex : public IVFIndex {
   void CommitPendingLocked(IndexData* data,
                            const std::vector<int>& centroids,
                            AlignedVector<ListEntry>* entries) {
+    if (data->use_pq && data->pq_codes_by_list.size() != data->lists.size()) {
+      data->pq_codes_by_list.resize(data->lists.size());
+    }
     for (size_t i = 0; i < entries->size(); ++i) {
       data->doc_ids.insert((*entries)[i].doc_id);
       const uint32_t list_id = static_cast<uint32_t>(centroids[i]);
-      data->lists[static_cast<size_t>(list_id)].push_back(std::move((*entries)[i]));
-      data->doc_to_list[data->lists[static_cast<size_t>(list_id)].back().doc_id] = list_id;
+      auto& list = data->lists[static_cast<size_t>(list_id)];
+      list.push_back(std::move((*entries)[i]));
+      data->doc_to_list[list.back().doc_id] = list_id;
+      if (data->use_pq) {
+        auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
+        if (list.back().pq_code.size() == data->M) {
+          const size_t expected_before_push = (list.size() - 1) * data->M;
+          if (flat.size() == expected_before_push) {
+            flat.insert(flat.end(), list.back().pq_code.begin(), list.back().pq_code.end());
+          } else {
+            RebuildListPQCodes(data, list_id);
+          }
+        } else {
+          flat.clear();
+        }
+      }
       ++data->ntotal;
     }
   }
