@@ -1,11 +1,19 @@
 #include "index/merge.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "common/timer.h"
 
 namespace ann {
 namespace {
@@ -687,25 +695,54 @@ Result<PartitionPatch> prepare_partition_patch(
   }
 
   PartitionPatch patch;
+  std::vector<uint32_t> active_partitions;
+  active_partitions.reserve(assignments.size());
   for (uint32_t p = 0; p < static_cast<uint32_t>(assignments.size()); ++p) {
-    const auto& delta_bucket = assignments[static_cast<size_t>(p)];
-    if (delta_bucket.empty()) {
+    if (!assignments[static_cast<size_t>(p)].empty()) {
+      active_partitions.push_back(p);
+    }
+  }
+  patch.partition_ids = active_partitions;
+  patch.replacement_records.resize(active_partitions.size());
+  if (active_partitions.empty()) {
+    return patch;
+  }
+
+  std::atomic<bool> failed{false};
+  std::mutex err_mu;
+  Status first_error = Status::OK();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int64_t i = 0; i < static_cast<int64_t>(active_partitions.size()); ++i) {
+    if (failed.load(std::memory_order_relaxed)) {
       continue;
     }
+    const uint32_t p = active_partitions[static_cast<size_t>(i)];
+    const auto& delta_bucket = assignments[static_cast<size_t>(p)];
     auto main_records_res = main_ivf->GetPartitionRecords(main_versions, p);
     if (!main_records_res.ok()) {
-      return main_records_res.status();
+      std::lock_guard<std::mutex> lock(err_mu);
+      if (!failed.exchange(true)) {
+        first_error = main_records_res.status();
+      }
+      continue;
     }
     Result<AlignedVector<VectorRecord>> merged_res =
         recluster_flags[static_cast<size_t>(p)] != 0
-            ? merge_partition_recluster(
-                  p, main_records_res.value(), delta_bucket, options)
+            ? merge_partition_recluster(p, main_records_res.value(), delta_bucket, options)
             : merge_partition_append(p, main_records_res.value(), delta_bucket);
     if (!merged_res.ok()) {
-      return merged_res.status();
+      std::lock_guard<std::mutex> lock(err_mu);
+      if (!failed.exchange(true)) {
+        first_error = merged_res.status();
+      }
+      continue;
     }
-    patch.partition_ids.push_back(p);
-    patch.replacement_records.push_back(std::move(merged_res.value()));
+    patch.replacement_records[static_cast<size_t>(i)] = std::move(merged_res.value());
+  }
+  if (failed.load(std::memory_order_relaxed)) {
+    return first_error;
   }
   return patch;
 }
@@ -726,6 +763,7 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
+  Timer merge_compute_timer;
   auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
   if (!centroids_res.ok()) {
     return centroids_res.status();
@@ -754,6 +792,7 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   if (!patch_res.ok()) {
     return patch_res.status();
   }
+  const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
   Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value());
   if (!commit.ok()) {
     return commit;
@@ -768,6 +807,7 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   report.patch_partitions = static_cast<uint32_t>(patch_res.value().partition_ids.size());
   report.append_partitions = static_cast<uint32_t>(score_res.value().append_partitions.size());
   report.recluster_partitions = static_cast<uint32_t>(score_res.value().recluster_partitions.size());
+  report.merge_compute_ms = merge_compute_ms;
   report.codebook_rebuild_ms = codebook_ms_res.value();
   report.moved_delta_ratio = assignment_diag.moved_delta_ratio;
   report.avg_assignment_dist_ratio = assignment_diag.avg_assignment_dist_ratio;

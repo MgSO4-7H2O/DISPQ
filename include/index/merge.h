@@ -68,6 +68,7 @@ struct MergeReport {
   uint32_t patch_partitions{0};
   uint32_t append_partitions{0};
   uint32_t recluster_partitions{0};
+  double merge_compute_ms{0.0};
   double codebook_rebuild_ms{0.0};
   double moved_delta_ratio{0.0};
   double avg_assignment_dist_ratio{1.0};

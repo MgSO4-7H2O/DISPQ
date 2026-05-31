@@ -310,8 +310,11 @@ struct SnapshotRecord {
   double query_qps{0.0};
   double update_ms{0.0};
   double query_eval_ms{0.0};
+  double merge_compute_ms{0.0};
+  double global_rebuild_ms{0.0};
   double snapshot_total_ms{0.0};
   double update_throughput_vecps{0.0};
+  double amortized_update_throughput_vecps{0.0};
   double nqe_batch{0.0};
   double qe_ratio{1.0};
   double codebook_drift{0.0};
@@ -371,6 +374,7 @@ struct MergeEventRecord {
   uint32_t trigger_active_non_empty_lists{0};
   uint32_t trigger_active_max_list{0};
   double trigger_active_avg_non_empty_list{0.0};
+  double merge_compute_ms{0.0};
   double merge_ms{0.0};
   double codebook_rebuild_ms{0.0};
 };
@@ -1653,6 +1657,12 @@ int main(int argc, char** argv) {
     return Status::OK();
   };
   double rebuild_ms_total = init_timer.ElapsedMillis();
+  double total_update_ms = 0.0;
+  double pending_update_ms = 0.0;
+  double total_merge_compute_ms = 0.0;
+  double pending_merge_compute_ms = 0.0;
+  double total_global_rebuild_ms = 0.0;
+  double pending_global_rebuild_ms = 0.0;
 
   OnlinePQUpdateOptions online_pq_options;
   online_pq_options.enable = config.online_pq_enable && config.pq_enable && config.pq_residual;
@@ -2005,6 +2015,8 @@ int main(int argc, char** argv) {
 
     const double total_ms = total_timer.ElapsedMillis();
     rebuild_ms_total += total_ms;
+    total_global_rebuild_ms += total_ms;
+    pending_global_rebuild_ms += total_ms;
     global_rebuild_count++;
     last_global_rebuild_rows = seen_rows;
     last_global_rebuild_main_rows = main_rows_current;
@@ -2071,6 +2083,7 @@ int main(int argc, char** argv) {
   std::vector<MergeEventRecord> merge_events;
   uint32_t last_snapshot_active_rows = stream_start_idx;
   std::optional<EvalMetrics> pre_stream_metrics;
+  uint32_t inserted_rows = 0;
 
   uint64_t eval_seq = 0;
   auto evaluate_rows = [&](uint32_t active_rows, const char* stage) -> Result<EvalMetrics> {
@@ -2124,10 +2137,21 @@ int main(int argc, char** argv) {
     snap.query_qps = metrics.query_qps;
     snap.update_ms = update_ms;
     snap.query_eval_ms = metrics.query_eval_ms;
-    snap.snapshot_total_ms = update_ms;
+    snap.merge_compute_ms = pending_merge_compute_ms;
+    snap.global_rebuild_ms = pending_global_rebuild_ms;
+    snap.snapshot_total_ms =
+        snap.update_ms + snap.merge_compute_ms + snap.global_rebuild_ms;
     snap.update_throughput_vecps =
         (snap.snapshot_rows > 0 && snap.snapshot_total_ms > 0.0)
             ? (static_cast<double>(snap.snapshot_rows) / (snap.snapshot_total_ms / 1000.0))
+            : 0.0;
+    const uint32_t streamed_rows =
+        active_rows >= stream_start_idx ? active_rows - stream_start_idx : 0;
+    const double cumulative_maintenance_ms =
+        total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
+    snap.amortized_update_throughput_vecps =
+        (streamed_rows > 0 && cumulative_maintenance_ms > 0.0)
+            ? (1000.0 * static_cast<double>(streamed_rows) / cumulative_maintenance_ms)
             : 0.0;
     snap.nqe_batch = pq_stats.nqe_batch;
     snap.qe_ratio = pq_stats.qe_ratio;
@@ -2176,14 +2200,19 @@ int main(int argc, char** argv) {
       }
     }
     snap.minibatches = std::move(minibatches);
+    std::cout << "[SNAPSHOT] base_rows=" << snap.base_rows
+              << ", snapshot_rows=" << snap.snapshot_rows
+              << ", recall@" << config.topk << "=" << snap.recall
+              << ", latency_ms=" << snap.latency_ms
+              << ", qps=" << snap.query_qps
+              << ", throughput=" << snap.update_throughput_vecps
+              << ", maintenance_ms=" << snap.snapshot_total_ms
+              << ", amortized_update_throughput="
+              << snap.amortized_update_throughput_vecps << std::endl;
     snapshots.push_back(std::move(snap));
     last_snapshot_active_rows = active_rows;
     return Status::OK();
   };
-
-  uint32_t inserted_rows = 0;
-  double total_update_ms = 0.0;
-  double pending_update_ms = 0.0;
 
   if (config.enable_streaming && rows_after_main > 0) {
     auto pre_res = evaluate_rows(stream_start_idx, "pre_stream");
@@ -2420,35 +2449,8 @@ int main(int argc, char** argv) {
           next_snapshot_target += snapshot_span;
         }
       }
-      if (hit_periodic_snapshot || hit_final_snapshot) {
-        EvalMetrics snapshot_metrics;
-        if (batch_metrics.has_value()) {
-          snapshot_metrics = batch_metrics.value();
-        } else {
-          auto sres = evaluate_rows(next_insert_idx, "snapshot");
-          if (!sres.ok()) {
-            std::cerr << sres.status().ToString() << std::endl;
-            return 1;
-          }
-          snapshot_metrics = sres.value();
-        }
-        const Status ws = write_snapshot(next_insert_idx,
-                                         snapshot_metrics,
-                                         pending_update_ms,
-                                         last_online_pq_stats,
-                                         active_window_ready,
-                                         should_commit_merge,
-                                         eval_after_each_minibatch
-                                             ? std::move(snapshot_minibatches)
-                                             : std::vector<MinibatchRecord>{});
-        if (!ws.ok()) {
-          std::cerr << ws.ToString() << std::endl;
-          return 1;
-        }
-        snapshot_minibatches.clear();
-        pending_update_ms = 0.0;
-      }
 
+      bool snapshot_state_changed = false;
       if (should_commit_merge) {
         Timer merge_commit_timer;
         auto merge_res = merge_frozen_delta_into_main(main_ivf,
@@ -2461,6 +2463,8 @@ int main(int argc, char** argv) {
           return 1;
         }
         const double merge_commit_ms = merge_commit_timer.ElapsedMillis();
+        total_merge_compute_ms += merge_res.value().merge_compute_ms;
+        pending_merge_compute_ms += merge_res.value().merge_compute_ms;
         rebuild_ms_total += merge_commit_ms;
         main_rows_current = std::min<uint32_t>(
             next_insert_idx, main_rows_current + merge_res.value().frozen_records);
@@ -2517,6 +2521,7 @@ int main(int argc, char** argv) {
         } else {
           merge_event.trigger_reason = "unknown";
         }
+        merge_event.merge_compute_ms = merge_res.value().merge_compute_ms;
         merge_event.merge_ms = merge_commit_ms;
         merge_event.codebook_rebuild_ms = merge_res.value().codebook_rebuild_ms;
         merge_events.push_back(merge_event);
@@ -2531,10 +2536,12 @@ int main(int argc, char** argv) {
                   << ", imbalance_after=" << merge_res.value().imbalance_after
                   << ", main_imbalance_after_real=" << merge_event.main_imbalance_after_real
                   << ", trigger_reason=" << merge_event.trigger_reason
+                  << ", merge_compute_ms=" << merge_res.value().merge_compute_ms
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
         frozen_delta.reset();
         frozen_trigger_decision.reset();
+        snapshot_state_changed = true;
       }
 
       if (config.enable_global_rebuild && next_insert_idx < nx) {
@@ -2559,7 +2566,39 @@ int main(int argc, char** argv) {
             std::cerr << rebuild_status.ToString() << std::endl;
             return 1;
           }
+          snapshot_state_changed = true;
         }
+      }
+
+      if (hit_periodic_snapshot || hit_final_snapshot) {
+        EvalMetrics snapshot_metrics;
+        if (batch_metrics.has_value() && !snapshot_state_changed) {
+          snapshot_metrics = batch_metrics.value();
+        } else {
+          auto sres = evaluate_rows(next_insert_idx, "snapshot");
+          if (!sres.ok()) {
+            std::cerr << sres.status().ToString() << std::endl;
+            return 1;
+          }
+          snapshot_metrics = sres.value();
+        }
+        const Status ws = write_snapshot(next_insert_idx,
+                                         snapshot_metrics,
+                                         pending_update_ms,
+                                         last_online_pq_stats,
+                                         active_window_ready,
+                                         should_commit_merge,
+                                         eval_after_each_minibatch
+                                             ? std::move(snapshot_minibatches)
+                                             : std::vector<MinibatchRecord>{});
+        if (!ws.ok()) {
+          std::cerr << ws.ToString() << std::endl;
+          return 1;
+        }
+        snapshot_minibatches.clear();
+        pending_update_ms = 0.0;
+        pending_merge_compute_ms = 0.0;
+        pending_global_rebuild_ms = 0.0;
       }
     }
   }
@@ -2570,10 +2609,11 @@ int main(int argc, char** argv) {
     return 1;
   }
   EvalMetrics final_metrics = final_res.value();
-  const double online_update_total_ms = total_update_ms + rebuild_ms_total;
-  final_metrics.update_total_ms = total_update_ms;
+  const double online_update_total_ms =
+      total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
+  final_metrics.update_total_ms = online_update_total_ms;
   final_metrics.update_per_vector_ms =
-      inserted_rows > 0 ? total_update_ms / static_cast<double>(inserted_rows) : 0.0;
+      inserted_rows > 0 ? online_update_total_ms / static_cast<double>(inserted_rows) : 0.0;
   final_metrics.update_throughput_vecps =
       (inserted_rows > 0 && online_update_total_ms > 0.0)
           ? (1000.0 * static_cast<double>(inserted_rows) / online_update_total_ms)
@@ -2604,8 +2644,11 @@ int main(int argc, char** argv) {
             << "Total p50=" << final_metrics.total_p50 << "ms, p99=" << final_metrics.total_p99
             << "ms; "
             << "Build/Rebuild=" << rebuild_ms_total << "ms; "
-            << "Update total=" << final_metrics.update_total_ms
-            << "ms, per_vec=" << final_metrics.update_per_vector_ms << "ms; "
+            << "Update maintenance total=" << final_metrics.update_total_ms
+            << "ms (apply=" << total_update_ms
+            << ", merge_compute=" << total_merge_compute_ms
+            << ", global_rebuild=" << total_global_rebuild_ms
+            << "), per_vec=" << final_metrics.update_per_vector_ms << "ms; "
             << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
             << "; Query QPS=" << final_metrics.query_qps
@@ -2688,6 +2731,9 @@ int main(int argc, char** argv) {
     ofs << "    \"latency_ms\": " << final_metrics.avg_query_ms << ",\n";
     ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
     ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
+    ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
+    ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
+    ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
     ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
     ofs << "  },\n";
     ofs << "  \"route_execution\": {\n";
@@ -2702,6 +2748,7 @@ int main(int argc, char** argv) {
       ofs << "    {\n";
       ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
       ofs << "      \"frozen_rows\": " << ev.frozen_rows << ",\n";
+      ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
       ofs << "      \"merge_ms\": " << ev.merge_ms << ",\n";
       ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << "\n";
       ofs << "    }";
@@ -2720,7 +2767,13 @@ int main(int argc, char** argv) {
       ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
       ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
       ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
-      ofs << "      \"throughput\": " << snap.update_throughput_vecps << "\n";
+      ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+      ofs << "      \"merge_compute_ms\": " << snap.merge_compute_ms << ",\n";
+      ofs << "      \"global_rebuild_ms\": " << snap.global_rebuild_ms << ",\n";
+      ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
+      ofs << "      \"throughput\": " << snap.update_throughput_vecps << ",\n";
+      ofs << "      \"amortized_update_throughput_vecps\": "
+          << snap.amortized_update_throughput_vecps << "\n";
       ofs << "    }";
       if (i + 1 < snapshots.size()) {
         ofs << ",";
@@ -2833,6 +2886,9 @@ int main(int argc, char** argv) {
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
   ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
+  ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
+  ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
+  ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
   ofs << "    \"update_throughput_vecps\": " << final_metrics.update_throughput_vecps << ",\n";
   ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << ",\n";
@@ -2958,6 +3014,7 @@ int main(int argc, char** argv) {
     ofs << "      \"trigger_active_max_list\": " << ev.trigger_active_max_list << ",\n";
     ofs << "      \"trigger_active_avg_non_empty_list\": "
         << ev.trigger_active_avg_non_empty_list << ",\n";
+    ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
     ofs << "      \"codebook_rebuild_ms\": " << ev.codebook_rebuild_ms << ",\n";
     ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
     ofs << "    }";
@@ -3024,9 +3081,13 @@ int main(int argc, char** argv) {
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
     ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
     ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+    ofs << "      \"merge_compute_ms\": " << snap.merge_compute_ms << ",\n";
+    ofs << "      \"global_rebuild_ms\": " << snap.global_rebuild_ms << ",\n";
     ofs << "      \"query_eval_ms\": " << snap.query_eval_ms << ",\n";
     ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
     ofs << "      \"update_throughput_vecps\": " << snap.update_throughput_vecps << ",\n";
+    ofs << "      \"amortized_update_throughput_vecps\": "
+        << snap.amortized_update_throughput_vecps << ",\n";
     ofs << "      \"nqe_batch\": " << snap.nqe_batch << ",\n";
     ofs << "      \"qe_ratio\": " << snap.qe_ratio << ",\n";
     ofs << "      \"codebook_drift\": " << snap.codebook_drift << ",\n";
