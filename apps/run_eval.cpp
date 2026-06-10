@@ -151,6 +151,28 @@ MatrixRM GenerateRandom(uint32_t rows, uint32_t cols, uint32_t seed) {
   return m;
 }
 
+void NormalizeRowsL2(MatrixRM* X) {
+  if (X == nullptr) {
+    return;
+  }
+  for (Eigen::Index i = 0; i < X->rows(); ++i) {
+    const float norm = X->row(i).norm();
+    if (norm > 0.0f) {
+      X->row(i) /= norm;
+    }
+  }
+}
+
+void NormalizeVectorL2(Eigen::VectorXf* x) {
+  if (x == nullptr) {
+    return;
+  }
+  const float norm = x->norm();
+  if (norm > 0.0f) {
+    *x /= norm;
+  }
+}
+
 uint32_t ResolveMainRows(const Config& config, uint32_t total_rows) {
   if (total_rows == 0) {
     return 0;
@@ -849,6 +871,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       }
       continue;
     }
+    if (config.use_cosine) {
+      NormalizeVectorL2(&qbuf);
+    }
     queries_whitened_runtime.row(i) = qbuf.transpose();
     whitening_ms[static_cast<size_t>(i)] = whiten_elapsed;
   }
@@ -1508,6 +1533,12 @@ int main(int argc, char** argv) {
     return 1;
   }
   Q_whitened = qb_res.value();
+  if (config.use_cosine) {
+    NormalizeRowsL2(&X_whitened);
+    NormalizeRowsL2(&Q_whitened);
+    std::cout << "[INFO] Cosine mode enabled: normalized whitened base/query rows"
+              << std::endl;
+  }
 
   std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
   std::iota(main_ids.begin(), main_ids.end(), 0);
@@ -1938,6 +1969,10 @@ int main(int argc, char** argv) {
     }
     MatrixRM new_x_whitened = xb_res.value();
     MatrixRM new_q_whitened = qb_res.value();
+    if (config.use_cosine) {
+      NormalizeRowsL2(&new_x_whitened);
+      NormalizeRowsL2(&new_q_whitened);
+    }
     const double whitening_transform_ms = transform_timer.ElapsedMillis();
 
     auto new_main_ivf = CreateIVFIndex();
@@ -2715,6 +2750,7 @@ int main(int argc, char** argv) {
     ofs << "    \"topk\": " << config.topk << ",\n";
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+    ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
     ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
         << ",\n";
     ofs << "    \"active_exact_rerank_candidates\": " << config.active_exact_rerank_candidates
@@ -2794,6 +2830,7 @@ int main(int argc, char** argv) {
   ofs << "    \"topk\": " << config.topk << ",\n";
   ofs << "    \"nprobe\": " << params.nprobe << ",\n";
   ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+  ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
   ofs << "    \"main_query_only\": " << (config.main_query_only ? "true" : "false") << ",\n";
   ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
   ofs << "    \"main_index_rows_initial\": " << main_rows_initial << ",\n";

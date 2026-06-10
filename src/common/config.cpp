@@ -58,6 +58,7 @@ std::string Config::ToString() const {
       << "topk=" << topk << ", "
       << "nprobe=" << nprobe << ", "
       << "use_whitening=" << std::boolalpha << use_whitening << ", "
+      << "use_cosine=" << std::boolalpha << use_cosine << ", "
       << "enable_dual_route=" << std::boolalpha << enable_dual_route << ", "
       << "main_query_only=" << std::boolalpha << main_query_only << ", "
       << "dim=" << dim << ", "
@@ -138,6 +139,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "dim", &cfg.dim);
   ExtractUint(text, "seed", &cfg.seed);
   ExtractBool(text, "use_whitening", &cfg.use_whitening);
+  ExtractBool(text, "use_cosine", &cfg.use_cosine);
   ExtractBool(text, "enable_dual_route", &cfg.enable_dual_route);
   ExtractBool(text, "main_query_only", &cfg.main_query_only);
   ExtractBool(text, "pq_enable", &cfg.pq_enable);

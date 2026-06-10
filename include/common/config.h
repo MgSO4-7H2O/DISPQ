@@ -12,6 +12,7 @@ struct Config {
   uint32_t topk{10};
   uint32_t nprobe{8};
   bool use_whitening{true};
+  bool use_cosine{false};
   bool enable_dual_route{true};
   // When true, query only main index route and skip delta routes.
   bool main_query_only{false};
