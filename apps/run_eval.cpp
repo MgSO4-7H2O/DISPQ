@@ -40,7 +40,7 @@ namespace {
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
-constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
+constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(128) << 20;
 
 struct DistributionStats {
   double avg{0.0};
