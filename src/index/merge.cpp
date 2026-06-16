@@ -100,7 +100,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
         "assign_delta_to_main_centroids_for_merge: main_partition_sizes size mismatch");
   }
 
-  AssignmentDiagnostics diag;
+AssignmentDiagnostics diag;
   diag.imbalance_before = ComputeImbalanceRatio(main_partition_sizes);
 
   const uint32_t nlist = static_cast<uint32_t>(main_centroids.rows());
@@ -229,6 +229,55 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     *diag_out = diag;
   }
   return assigned;
+}
+
+Status AppendVectorRecordFromStore(DocId doc_id,
+                                   const VersionSet& versions,
+                                   uint32_t ivf_id,
+                                   const MatrixRM& vector_store,
+                                   AlignedVector<VectorRecord>* out) {
+  if (out == nullptr) {
+    return Status::InvalidArgument("AppendVectorRecordFromStore: null output");
+  }
+  if (static_cast<Eigen::Index>(doc_id) >= vector_store.rows()) {
+    return Status::InvalidArgument("AppendVectorRecordFromStore: doc_id out of vector store range");
+  }
+  VectorRecord rec;
+  rec.doc_id = doc_id;
+  rec.dim = static_cast<uint32_t>(vector_store.cols());
+  rec.versions = versions;
+  rec.ivf_id = ivf_id;
+  rec.x = vector_store.row(static_cast<Eigen::Index>(doc_id)).transpose();
+  out->push_back(std::move(rec));
+  return Status::OK();
+}
+
+Result<AlignedVector<VectorRecord>> FetchPartitionRecordsForMerge(
+    const std::shared_ptr<IVFIndex>& ivf,
+    const VersionSet& versions,
+    uint32_t partition_id,
+    const MatrixRM* vector_store) {
+  if (!ivf) {
+    return Status::InvalidArgument("FetchPartitionRecordsForMerge: ivf is null");
+  }
+  if (vector_store == nullptr) {
+    return ivf->GetPartitionRecords(versions, partition_id);
+  }
+
+  auto doc_ids_res = ivf->GetPartitionDocIds(versions, partition_id);
+  if (!doc_ids_res.ok()) {
+    return doc_ids_res.status();
+  }
+  AlignedVector<VectorRecord> records;
+  records.reserve(doc_ids_res.value().size());
+  for (DocId doc_id : doc_ids_res.value()) {
+    Status append = AppendVectorRecordFromStore(
+        doc_id, versions, partition_id, *vector_store, &records);
+    if (!append.ok()) {
+      return append;
+    }
+  }
+  return records;
 }
 
 std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
@@ -407,6 +456,20 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
 
 }  // namespace
 
+Result<PartitionPatch> PreparePartitionPatchImpl(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const MatrixRM* base_vectors,
+    const MergeOptions& options);
+
+Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const FrozenDelta& frozen_delta,
+                                                 const MatrixRM* base_vectors,
+                                                 const MergeOptions& options);
+
 Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
                                  const VersionSet& delta_versions) {
   if (!delta_ivf) {
@@ -418,6 +481,27 @@ Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
   }
   FrozenDelta out;
   out.records = std::move(snapshot_res.value());
+  return out;
+}
+
+Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
+                                 const VersionSet& delta_versions,
+                                 const MatrixRM& base_vectors) {
+  if (!delta_ivf) {
+    return Status::InvalidArgument("freeze_delta: delta_ivf is null");
+  }
+  auto doc_ids_res = delta_ivf->SnapshotDocIds(delta_versions);
+  if (!doc_ids_res.ok()) {
+    return doc_ids_res.status();
+  }
+  FrozenDelta out;
+  out.records.reserve(doc_ids_res.value().size());
+  for (DocId doc_id : doc_ids_res.value()) {
+    Status append = AppendVectorRecordFromStore(doc_id, delta_versions, 0, base_vectors, &out.records);
+    if (!append.ok()) {
+      return append;
+    }
+  }
   return out;
 }
 
@@ -611,6 +695,28 @@ Result<PartitionPatch> prepare_partition_patch(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MergeOptions& options) {
+  return PreparePartitionPatchImpl(
+      main_ivf, main_versions, assignments, score_result, nullptr, options);
+}
+
+Result<PartitionPatch> prepare_partition_patch(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const MatrixRM& base_vectors,
+    const MergeOptions& options) {
+  return PreparePartitionPatchImpl(
+      main_ivf, main_versions, assignments, score_result, &base_vectors, options);
+}
+
+Result<PartitionPatch> PreparePartitionPatchImpl(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const MatrixRM* base_vectors,
+    const MergeOptions& options) {
   if (!main_ivf) {
     return Status::InvalidArgument("prepare_partition_patch: main_ivf is null");
   }
@@ -661,7 +767,8 @@ Result<PartitionPatch> prepare_partition_patch(
       std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
       neighborhood_main_records.reserve(active_neighborhood.size());
       for (uint32_t part : active_neighborhood) {
-        auto main_records_res = main_ivf->GetPartitionRecords(main_versions, part);
+        auto main_records_res =
+            FetchPartitionRecordsForMerge(main_ivf, main_versions, part, base_vectors);
         if (!main_records_res.ok()) {
           return main_records_res.status();
         }
@@ -720,7 +827,8 @@ Result<PartitionPatch> prepare_partition_patch(
     }
     const uint32_t p = active_partitions[static_cast<size_t>(i)];
     const auto& delta_bucket = assignments[static_cast<size_t>(p)];
-    auto main_records_res = main_ivf->GetPartitionRecords(main_versions, p);
+    auto main_records_res =
+        FetchPartitionRecordsForMerge(main_ivf, main_versions, p, base_vectors);
     if (!main_records_res.ok()) {
       std::lock_guard<std::mutex> lock(err_mu);
       if (!failed.exchange(true)) {
@@ -760,6 +868,24 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const VersionSet& main_versions,
                                                  const FrozenDelta& frozen_delta,
                                                  const MergeOptions& options) {
+  return MergeFrozenDeltaIntoMainImpl(
+      main_ivf, main_versions, frozen_delta, nullptr, options);
+}
+
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const FrozenDelta& frozen_delta,
+                                                 const MatrixRM& base_vectors,
+                                                 const MergeOptions& options) {
+  return MergeFrozenDeltaIntoMainImpl(
+      main_ivf, main_versions, frozen_delta, &base_vectors, options);
+}
+
+Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const FrozenDelta& frozen_delta,
+                                                 const MatrixRM* base_vectors,
+                                                 const MergeOptions& options) {
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
@@ -787,8 +913,8 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   if (!score_res.ok()) {
     return score_res.status();
   }
-  auto patch_res = prepare_partition_patch(
-      main_ivf, main_versions, assign_res.value(), score_res.value(), options);
+  auto patch_res = PreparePartitionPatchImpl(
+      main_ivf, main_versions, assign_res.value(), score_res.value(), base_vectors, options);
   if (!patch_res.ok()) {
     return patch_res.status();
   }
@@ -849,6 +975,20 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
     return frozen_res.status();
   }
   return merge_frozen_delta_into_main(main_ivf, main_versions, frozen_res.value(), options);
+}
+
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const std::shared_ptr<IVFIndex>& delta_ivf,
+                                                 const VersionSet& delta_versions,
+                                                 const MatrixRM& base_vectors,
+                                                 const MergeOptions& options) {
+  auto frozen_res = freeze_delta(delta_ivf, delta_versions, base_vectors);
+  if (!frozen_res.ok()) {
+    return frozen_res.status();
+  }
+  return merge_frozen_delta_into_main(
+      main_ivf, main_versions, frozen_res.value(), base_vectors, options);
 }
 
 }  // namespace ann

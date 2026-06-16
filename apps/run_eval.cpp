@@ -591,7 +591,22 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQSlidingWindow(
     rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
     records.push_back(std::move(rec));
   }
-  return ivf->AddWithOnlinePQSlidingWindow(records, delete_doc_ids, options);
+  AlignedVector<VectorRecord> delete_records;
+  delete_records.reserve(delete_doc_ids.size());
+  for (DocId doc_id : delete_doc_ids) {
+    if (static_cast<Eigen::Index>(doc_id) >= x_whitened.rows()) {
+      return Status::InvalidArgument(
+          "AddRangeToIndexWithOnlinePQSlidingWindow: delete doc_id out of range");
+    }
+    VectorRecord rec;
+    rec.doc_id = doc_id;
+    rec.dim = dim;
+    rec.versions = versions;
+    rec.ivf_id = 0;
+    rec.x = x_whitened.row(static_cast<Eigen::Index>(doc_id)).transpose();
+    delete_records.push_back(std::move(rec));
+  }
+  return ivf->AddWithOnlinePQSlidingWindowRecords(records, delete_records, options);
 }
 
 Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
@@ -2592,6 +2607,7 @@ int main(int argc, char** argv) {
                                                       main_versions,
                                                       frozen_delta->ivf,
                                                       frozen_delta->versions,
+                                                      X_whitened,
                                                       merge_options);
         if (!merge_res.ok()) {
           std::cerr << merge_res.status().ToString() << std::endl;

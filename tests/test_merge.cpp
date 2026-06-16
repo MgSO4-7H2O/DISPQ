@@ -53,7 +53,29 @@ struct Fixture {
   VersionSet main_versions{};
   std::shared_ptr<IVFIndex> delta_ivf;
   VersionSet delta_versions{};
+  MatrixRM vector_store;
 };
+
+AlignedVector<VectorRecord> MakePartitionRecordsFromStore(const std::shared_ptr<IVFIndex>& ivf,
+                                                          const VersionSet& versions,
+                                                          uint32_t partition_id,
+                                                          const MatrixRM& vector_store) {
+  auto ids_res = ivf->GetPartitionDocIds(versions, partition_id);
+  assert(ids_res.ok());
+  AlignedVector<VectorRecord> out;
+  out.reserve(ids_res.value().size());
+  for (DocId doc_id : ids_res.value()) {
+    assert(static_cast<Eigen::Index>(doc_id) < vector_store.rows());
+    VectorRecord rec;
+    rec.doc_id = doc_id;
+    rec.dim = static_cast<uint32_t>(vector_store.cols());
+    rec.versions = versions;
+    rec.ivf_id = partition_id;
+    rec.x = vector_store.row(static_cast<Eigen::Index>(doc_id)).transpose();
+    out.push_back(std::move(rec));
+  }
+  return out;
+}
 
 Fixture BuildFixture() {
   constexpr uint32_t kDim = 4;
@@ -114,6 +136,15 @@ Fixture BuildFixture() {
   fx.main_versions = main_versions;
   fx.delta_ivf = delta_ivf;
   fx.delta_versions = delta_versions;
+  fx.vector_store = MatrixRM::Zero(103, kDim);
+  for (int64_t i = 0; i < main_docs.rows(); ++i) {
+    fx.vector_store.row(static_cast<Eigen::Index>(main_doc_ids[static_cast<size_t>(i)])) =
+        main_docs.row(i);
+  }
+  for (int64_t i = 0; i < delta_docs.rows(); ++i) {
+    fx.vector_store.row(static_cast<Eigen::Index>(delta_doc_ids[static_cast<size_t>(i)])) =
+        delta_docs.row(i);
+  }
   return fx;
 }
 
@@ -168,6 +199,12 @@ Fixture BuildHealthierNeighborFixture() {
   fx.main_versions = main_versions;
   fx.delta_ivf = delta_ivf;
   fx.delta_versions = delta_versions;
+  fx.vector_store = MatrixRM::Zero(201, kDim);
+  for (int64_t i = 0; i < main_docs.rows(); ++i) {
+    fx.vector_store.row(static_cast<Eigen::Index>(main_doc_ids[static_cast<size_t>(i)])) =
+        main_docs.row(i);
+  }
+  fx.vector_store.row(static_cast<Eigen::Index>(delta_doc_ids[0])) = delta_docs.row(0);
   return fx;
 }
 
@@ -177,7 +214,7 @@ int main() {
   Fixture fx = BuildFixture();
 
   // 1) Delta -> Main centroid assignment + freeze.
-  auto frozen_res = freeze_delta(fx.delta_ivf, fx.delta_versions);
+  auto frozen_res = freeze_delta(fx.delta_ivf, fx.delta_versions, fx.vector_store);
   assert(frozen_res.ok());
   const FrozenDelta frozen = frozen_res.value();
   assert(frozen.records.size() == 3);
@@ -217,11 +254,11 @@ int main() {
   assert(score.recluster_partitions[0] == 1);
 
   // 3) append merge path.
-  auto p0_main_res = fx.main_ivf->GetPartitionRecords(fx.main_versions, 0);
-  assert(p0_main_res.ok());
-  auto append_res = merge_partition_append(0, p0_main_res.value(), assignments[0]);
+  auto p0_main_records =
+      MakePartitionRecordsFromStore(fx.main_ivf, fx.main_versions, 0, fx.vector_store);
+  auto append_res = merge_partition_append(0, p0_main_records, assignments[0]);
   assert(append_res.ok());
-  assert(append_res.value().size() == p0_main_res.value().size() + assignments[0].size());
+  assert(append_res.value().size() == p0_main_records.size() + assignments[0].size());
   {
     bool has_100 = false;
     for (const auto& rec : append_res.value()) {
@@ -233,17 +270,17 @@ int main() {
   }
 
   // 4) local recluster merge path.
-  auto p1_main_res = fx.main_ivf->GetPartitionRecords(fx.main_versions, 1);
-  assert(p1_main_res.ok());
+  auto p1_main_records =
+      MakePartitionRecordsFromStore(fx.main_ivf, fx.main_versions, 1, fx.vector_store);
   MergeOptions options;
   options.alpha = 1.0;
   options.beta = 0.0;
   options.recluster_threshold = 1.0;
   options.local_recluster_k = 2;
   options.local_kmeans_iterations = 5;
-  auto recluster_res = merge_partition_recluster(1, p1_main_res.value(), assignments[1], options);
+  auto recluster_res = merge_partition_recluster(1, p1_main_records, assignments[1], options);
   assert(recluster_res.ok());
-  assert(recluster_res.value().size() == p1_main_res.value().size() + assignments[1].size());
+  assert(recluster_res.value().size() == p1_main_records.size() + assignments[1].size());
   {
     std::unordered_set<DocId> docs;
     for (const auto& rec : recluster_res.value()) {
@@ -259,7 +296,8 @@ int main() {
   assert(delta_code_before.ok());
 
   auto patch_res =
-      prepare_partition_patch(fx.main_ivf, fx.main_versions, assignments, score, options);
+      prepare_partition_patch(
+          fx.main_ivf, fx.main_versions, assignments, score, fx.vector_store, options);
   assert(patch_res.ok());
   assert(patch_res.value().partition_ids.size() == 3);
   {
@@ -285,7 +323,8 @@ int main() {
   // 6) unified entry: freeze + assign/stats/score + patch + commit.
   Fixture fx2 = BuildFixture();
   auto report_res =
-      merge_frozen_delta_into_main(fx2.main_ivf, fx2.main_versions, fx2.delta_ivf, fx2.delta_versions, options);
+      merge_frozen_delta_into_main(
+          fx2.main_ivf, fx2.main_versions, fx2.delta_ivf, fx2.delta_versions, fx2.vector_store, options);
   assert(report_res.ok());
   assert(report_res.value().frozen_records == 3);
   assert(report_res.value().patch_partitions == 3);
@@ -310,7 +349,12 @@ int main() {
   constrained_options.assignment_hard_cap_ratio = 1.5;
   constrained_options.assignment_lambda = 0.0;
   auto constrained_merge_res = merge_frozen_delta_into_main(
-      fx3.main_ivf, fx3.main_versions, fx3.delta_ivf, fx3.delta_versions, constrained_options);
+      fx3.main_ivf,
+      fx3.main_versions,
+      fx3.delta_ivf,
+      fx3.delta_versions,
+      fx3.vector_store,
+      constrained_options);
   assert(constrained_merge_res.ok());
   assert(constrained_merge_res.value().patch_partitions == 2);
   auto constrained_sizes_res = fx3.main_ivf->GetPartitionSizes(fx3.main_versions);
