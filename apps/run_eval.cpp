@@ -30,7 +30,6 @@
 #include "eval/metrics.h"
 #include "index/ivf.h"
 #include "index/merge.h"
-#include "search/exact_search.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
 
@@ -41,6 +40,7 @@ namespace {
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
+constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
 
 struct DistributionStats {
   double avg{0.0};
@@ -616,6 +616,119 @@ Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
   return shard;
 }
 
+struct ExactDocCandidate {
+  float dist{0.0f};
+  DocId doc_id{0};
+};
+
+bool ExactDocBetter(const ExactDocCandidate& a, const ExactDocCandidate& b) {
+  if (a.dist != b.dist) {
+    return a.dist < b.dist;
+  }
+  return a.doc_id < b.doc_id;
+}
+
+size_t ResolveGroundTruthBlockRows(Eigen::Index nq, Eigen::Index dim, size_t total_docs) {
+  if (total_docs == 0) {
+    return 0;
+  }
+  const size_t nq_size = std::max<size_t>(1, static_cast<size_t>(nq));
+  const size_t dim_size = std::max<size_t>(1, static_cast<size_t>(dim));
+  const size_t bytes_per_row = (nq_size + dim_size + 1) * sizeof(float);
+  const size_t rows_by_budget =
+      std::max<size_t>(1, kGroundTruthBlockTargetBytes / std::max<size_t>(1, bytes_per_row));
+  return std::min(total_docs, rows_by_budget);
+}
+
+Result<std::vector<std::vector<DocId>>> ExactSearchDocIdsBlockwise(
+    Eigen::Ref<const MatrixRM> queries,
+    Eigen::Ref<const MatrixRM> database,
+    const std::vector<DocId>& doc_ids,
+    uint32_t topk) {
+  if (queries.cols() == 0 || database.cols() == 0) {
+    return Status::InvalidArgument("ExactSearchDocIdsBlockwise: empty matrices");
+  }
+  if (queries.cols() != database.cols()) {
+    return Status::InvalidArgument("ExactSearchDocIdsBlockwise: dimension mismatch");
+  }
+  if (queries.rows() == 0) {
+    return Status::InvalidArgument("ExactSearchDocIdsBlockwise: no queries");
+  }
+  if (doc_ids.empty()) {
+    return Status::InvalidArgument("ExactSearchDocIdsBlockwise: no searchable docs");
+  }
+  if (topk == 0) {
+    return Status::InvalidArgument("ExactSearchDocIdsBlockwise: topk must be positive");
+  }
+
+  const size_t limit = std::min<size_t>(topk, doc_ids.size());
+  std::vector<std::vector<ExactDocCandidate>> heaps(static_cast<size_t>(queries.rows()));
+  for (auto& heap : heaps) {
+    heap.reserve(limit);
+  }
+  const Eigen::VectorXf query_norms = queries.rowwise().squaredNorm();
+  const size_t block_rows =
+      ResolveGroundTruthBlockRows(queries.rows(), queries.cols(), doc_ids.size());
+
+  for (size_t block_begin = 0; block_begin < doc_ids.size(); block_begin += block_rows) {
+    const size_t block_count = std::min(block_rows, doc_ids.size() - block_begin);
+    MatrixRM block(static_cast<Eigen::Index>(block_count), database.cols());
+    Eigen::VectorXf block_norms(static_cast<Eigen::Index>(block_count));
+    for (size_t bi = 0; bi < block_count; ++bi) {
+      const DocId doc_id = doc_ids[block_begin + bi];
+      if (static_cast<Eigen::Index>(doc_id) >= database.rows()) {
+        return Status::InvalidArgument("ExactSearchDocIdsBlockwise: doc_id out of database range");
+      }
+      block.row(static_cast<Eigen::Index>(bi)) =
+          database.row(static_cast<Eigen::Index>(doc_id));
+      block_norms(static_cast<Eigen::Index>(bi)) =
+          block.row(static_cast<Eigen::Index>(bi)).squaredNorm();
+    }
+
+    const MatrixRM dots = queries * block.transpose();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t qi = 0; qi < static_cast<int64_t>(queries.rows()); ++qi) {
+      auto& heap = heaps[static_cast<size_t>(qi)];
+      const float qnorm = query_norms(static_cast<Eigen::Index>(qi));
+      for (size_t bi = 0; bi < block_count; ++bi) {
+        float dist = qnorm + block_norms(static_cast<Eigen::Index>(bi)) -
+                     2.0f * dots(static_cast<Eigen::Index>(qi),
+                                  static_cast<Eigen::Index>(bi));
+        if (dist < 0.0f) {
+          dist = 0.0f;
+        }
+        ExactDocCandidate cand{dist, doc_ids[block_begin + bi]};
+        if (heap.size() < limit) {
+          heap.push_back(cand);
+          std::push_heap(heap.begin(), heap.end(), ExactDocBetter);
+        } else if (ExactDocBetter(cand, heap.front())) {
+          std::pop_heap(heap.begin(), heap.end(), ExactDocBetter);
+          heap.back() = cand;
+          std::push_heap(heap.begin(), heap.end(), ExactDocBetter);
+        }
+      }
+    }
+  }
+
+  std::vector<std::vector<DocId>> all_ids(static_cast<size_t>(queries.rows()));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t qi = 0; qi < static_cast<int64_t>(queries.rows()); ++qi) {
+    auto& heap = heaps[static_cast<size_t>(qi)];
+    std::sort(heap.begin(), heap.end(), ExactDocBetter);
+    std::vector<DocId> ids;
+    ids.reserve(heap.size());
+    for (const auto& cand : heap) {
+      ids.push_back(cand.doc_id);
+    }
+    all_ids[static_cast<size_t>(qi)] = std::move(ids);
+  }
+  return all_ids;
+}
+
 Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
                                uint32_t topk,
                                bool exact_rerank_enable,
@@ -731,49 +844,49 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return Status::InvalidArgument("EvaluateState: main index is null");
   }
 
-  auto main_records_res = main_ivf->SnapshotRecords(main_versions);
-  if (!main_records_res.ok()) {
-    return main_records_res.status();
+  auto main_doc_ids_res = main_ivf->SnapshotDocIds(main_versions);
+  if (!main_doc_ids_res.ok()) {
+    return main_doc_ids_res.status();
   }
 
   std::vector<DocId> searchable_doc_ids;
-  searchable_doc_ids.reserve(main_records_res.value().size() +
+  searchable_doc_ids.reserve(main_doc_ids_res.value().size() +
                              (frozen_delta.has_value() ? frozen_delta->rows : 0u) +
                              (active_delta.has_value() ? active_delta->rows : 0u));
   std::unordered_set<DocId> searchable_seen;
   searchable_seen.reserve(searchable_doc_ids.capacity() * 2 + 1);
-  auto append_unique = [&](const AlignedVector<VectorRecord>& records) -> Status {
-    for (const auto& rec : records) {
-      if (rec.doc_id >= seen_rows) {
+  auto append_unique = [&](const std::vector<DocId>& doc_ids) -> Status {
+    for (DocId doc_id : doc_ids) {
+      if (doc_id >= seen_rows) {
         return Status::InvalidArgument("EvaluateState: route doc_id exceeds seen_rows");
       }
-      if (searchable_seen.insert(rec.doc_id).second) {
-        searchable_doc_ids.push_back(rec.doc_id);
+      if (searchable_seen.insert(doc_id).second) {
+        searchable_doc_ids.push_back(doc_id);
       }
     }
     return Status::OK();
   };
 
-  Status append_main = append_unique(main_records_res.value());
+  Status append_main = append_unique(main_doc_ids_res.value());
   if (!append_main.ok()) {
     return append_main;
   }
   if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
-    auto frozen_records_res = frozen_delta->ivf->SnapshotRecords(frozen_delta->versions);
-    if (!frozen_records_res.ok()) {
-      return frozen_records_res.status();
+    auto frozen_doc_ids_res = frozen_delta->ivf->SnapshotDocIds(frozen_delta->versions);
+    if (!frozen_doc_ids_res.ok()) {
+      return frozen_doc_ids_res.status();
     }
-    Status append_frozen = append_unique(frozen_records_res.value());
+    Status append_frozen = append_unique(frozen_doc_ids_res.value());
     if (!append_frozen.ok()) {
       return append_frozen;
     }
   }
   if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
-    auto active_records_res = active_delta->ivf->SnapshotRecords(active_delta->versions);
-    if (!active_records_res.ok()) {
-      return active_records_res.status();
+    auto active_doc_ids_res = active_delta->ivf->SnapshotDocIds(active_delta->versions);
+    if (!active_doc_ids_res.ok()) {
+      return active_doc_ids_res.status();
     }
-    Status append_active = append_unique(active_records_res.value());
+    Status append_active = append_unique(active_doc_ids_res.value());
     if (!append_active.ok()) {
       return append_active;
     }
@@ -782,25 +895,12 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return Status::InvalidArgument("EvaluateState: no searchable docs");
   }
 
-  MatrixRM searchable_db(searchable_doc_ids.size(), base_whitened.cols());
-  for (size_t i = 0; i < searchable_doc_ids.size(); ++i) {
-    searchable_db.row(static_cast<Eigen::Index>(i)) =
-        base_whitened.row(static_cast<Eigen::Index>(searchable_doc_ids[i]));
-  }
-
-  auto gt_res = ExactSearchBatch(queries_whitened, searchable_db, config.topk);
+  auto gt_res = ExactSearchDocIdsBlockwise(
+      queries_whitened, base_whitened, searchable_doc_ids, config.topk);
   if (!gt_res.ok()) {
     return gt_res.status();
   }
-  std::vector<std::vector<DocId>> ground_truth = gt_res.value();
-  for (auto& row : ground_truth) {
-    for (auto& did : row) {
-      const size_t idx = static_cast<size_t>(did);
-      if (idx < searchable_doc_ids.size()) {
-        did = searchable_doc_ids[idx];
-      }
-    }
-  }
+  std::vector<std::vector<DocId>> ground_truth = std::move(gt_res.value());
 
   std::vector<SearchRoute> routes;
   routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main", main_rows});

@@ -127,6 +127,8 @@ class IVFIndex {
   virtual Result<PQRuntimeState> GetPQRuntimeState(const VersionSet& route_versions) const = 0;
   virtual Result<std::vector<uint8_t>> GetDocPQCode(const VersionSet& route_versions,
                                                     DocId doc_id) const = 0;
+  virtual Result<std::vector<DocId>> SnapshotDocIds(
+      const VersionSet& route_versions) const = 0;
   virtual Result<AlignedVector<VectorRecord>> SnapshotRecords(
       const VersionSet& route_versions) const = 0;
   virtual Result<AlignedVector<VectorRecord>> GetPartitionRecords(

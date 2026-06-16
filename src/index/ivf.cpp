@@ -1250,6 +1250,24 @@ class KMeansIVFIndex : public IVFIndex {
     return Status::NotFound("doc_id not found");
   }
 
+  Result<std::vector<DocId>> SnapshotDocIds(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    const IndexData& data = *it->second;
+    std::vector<DocId> out;
+    out.reserve(static_cast<size_t>(data.ntotal));
+    for (const auto& list : data.lists) {
+      for (const auto& entry : list) {
+        out.push_back(entry.doc_id);
+      }
+    }
+    return out;
+  }
+
   Result<AlignedVector<VectorRecord>> SnapshotRecords(
       const VersionSet& route_versions) const override {
     std::shared_lock lock(mu_);
