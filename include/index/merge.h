@@ -84,6 +84,9 @@ struct MergeReport {
 
 Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
                                  const VersionSet& delta_versions);
+Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
+                                 const VersionSet& delta_versions,
+                                 const MatrixRM& base_vectors);
 
 Result<PartitionAssignments> assign_delta_to_main_centroids(
     const FrozenDelta& frozen_delta,
@@ -115,6 +118,13 @@ Result<PartitionPatch> prepare_partition_patch(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MergeOptions& options);
+Result<PartitionPatch> prepare_partition_patch(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const MatrixRM& base_vectors,
+    const MergeOptions& options);
 
 Status commit_partition_patch(const std::shared_ptr<IVFIndex>& main_ivf,
                               const VersionSet& main_versions,
@@ -124,11 +134,22 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const VersionSet& main_versions,
                                                  const FrozenDelta& frozen_delta,
                                                  const MergeOptions& options);
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const FrozenDelta& frozen_delta,
+                                                 const MatrixRM& base_vectors,
+                                                 const MergeOptions& options);
 
 Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
                                                  const std::shared_ptr<IVFIndex>& delta_ivf,
                                                  const VersionSet& delta_versions,
+                                                 const MergeOptions& options);
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const std::shared_ptr<IVFIndex>& delta_ivf,
+                                                 const VersionSet& delta_versions,
+                                                 const MatrixRM& base_vectors,
                                                  const MergeOptions& options);
 
 }  // namespace ann

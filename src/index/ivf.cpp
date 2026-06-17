@@ -706,7 +706,6 @@ class KMeansIVFIndex : public IVFIndex {
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
-      entry.vector = rec.x;
       if (data.use_pq) {
         entry.pq_code.resize(data.M);
         Eigen::VectorXf residual = rec.x;
@@ -743,6 +742,26 @@ class KMeansIVFIndex : public IVFIndex {
       const AlignedVector<VectorRecord>& recs,
       const std::vector<DocId>& delete_doc_ids,
       const OnlinePQUpdateOptions& options) override {
+    return AddWithOnlinePQSlidingWindowImpl(recs, delete_doc_ids, nullptr, options);
+  }
+
+  Result<OnlinePQUpdateStats> AddWithOnlinePQSlidingWindowRecords(
+      const AlignedVector<VectorRecord>& recs,
+      const AlignedVector<VectorRecord>& delete_recs,
+      const OnlinePQUpdateOptions& options) override {
+    std::vector<DocId> delete_doc_ids;
+    delete_doc_ids.reserve(delete_recs.size());
+    for (const auto& rec : delete_recs) {
+      delete_doc_ids.push_back(rec.doc_id);
+    }
+    return AddWithOnlinePQSlidingWindowImpl(recs, delete_doc_ids, &delete_recs, options);
+  }
+
+  Result<OnlinePQUpdateStats> AddWithOnlinePQSlidingWindowImpl(
+      const AlignedVector<VectorRecord>& recs,
+      const std::vector<DocId>& delete_doc_ids,
+      const AlignedVector<VectorRecord>* delete_recs,
+      const OnlinePQUpdateOptions& options) {
     if (options.ema_alpha <= 0.0 || options.ema_alpha > 1.0) {
       return Status::InvalidArgument("ema_alpha must be in (0,1]");
     }
@@ -782,6 +801,27 @@ class KMeansIVFIndex : public IVFIndex {
     if (!validate_deletes.ok()) {
       return validate_deletes;
     }
+    std::unordered_map<DocId, size_t> delete_rec_pos;
+    if (delete_recs != nullptr) {
+      if (delete_recs->size() != delete_doc_ids.size()) {
+        return Status::InvalidArgument("delete record/doc_id size mismatch");
+      }
+      delete_rec_pos.reserve(delete_recs->size() * 2 + 1);
+      for (size_t i = 0; i < delete_recs->size(); ++i) {
+        const auto& rec = (*delete_recs)[i];
+        if (static_cast<uint32_t>(rec.x.size()) != data.dim) {
+          return Status::InvalidArgument("delete record dim mismatch");
+        }
+        if (!delete_rec_pos.emplace(rec.doc_id, i).second) {
+          return Status::InvalidArgument("duplicate delete record doc_id");
+        }
+      }
+      for (DocId doc_id : delete_doc_ids) {
+        if (delete_rec_pos.find(doc_id) == delete_rec_pos.end()) {
+          return Status::InvalidArgument("delete doc_id missing external vector");
+        }
+      }
+    }
     if (recs.empty() && delete_doc_ids.empty()) {
       stats.use_online_pq = data.use_pq && data.pq_residual;
       stats.nqe_baseline = data.nqe_baseline;
@@ -809,7 +849,6 @@ class KMeansIVFIndex : public IVFIndex {
         entry.doc_id = rec.doc_id;
         entry.versions = rec.versions;
         entry.versions.index_version = data.version;
-        entry.vector = rec.x;
         if (data.use_pq) {
           entry.pq_code.resize(data.M);
           Eigen::VectorXf residual = rec.x;
@@ -872,11 +911,19 @@ class KMeansIVFIndex : public IVFIndex {
         return remove_status;
       }
       for (const auto& removed : removed_docs) {
-        if (removed.entry.pq_code.size() != data.M ||
-            static_cast<uint32_t>(removed.entry.vector.size()) != data.dim) {
+        const Eigen::VectorXf* removed_vector = nullptr;
+        if (static_cast<uint32_t>(removed.entry.vector.size()) == data.dim) {
+          removed_vector = &removed.entry.vector;
+        } else if (delete_recs != nullptr) {
+          auto vec_it = delete_rec_pos.find(removed.doc_id);
+          if (vec_it != delete_rec_pos.end()) {
+            removed_vector = &(*delete_recs)[vec_it->second].x;
+          }
+        }
+        if (removed.entry.pq_code.size() != data.M || removed_vector == nullptr) {
           continue;
         }
-        Eigen::VectorXf residual = removed.entry.vector;
+        Eigen::VectorXf residual = *removed_vector;
         if (data.pq_residual) {
           residual -= data.routing_centroids
                           .row(static_cast<Eigen::Index>(removed.list_id))
@@ -1133,7 +1180,6 @@ class KMeansIVFIndex : public IVFIndex {
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
-      entry.vector = rec.x;
       entry.pq_code = std::move(codes_for_insert[static_cast<size_t>(i)]);
       entries[i] = std::move(entry);
     }
@@ -1276,6 +1322,9 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::NotFound("Index version not built");
     }
     const IndexData& data = *it->second;
+    if (data.use_pq) {
+      return Status::InvalidArgument("SnapshotRecords: full vectors are not stored for PQ IVF");
+    }
     AlignedVector<VectorRecord> out;
     out.reserve(static_cast<size_t>(data.ntotal));
     for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
@@ -1306,6 +1355,9 @@ class KMeansIVFIndex : public IVFIndex {
     if (partition_id >= data.nlist) {
       return Status::InvalidArgument("partition_id out of range");
     }
+    if (data.use_pq) {
+      return Status::InvalidArgument("GetPartitionRecords: full vectors are not stored for PQ IVF");
+    }
     const auto& list = data.lists[static_cast<size_t>(partition_id)];
     AlignedVector<VectorRecord> out;
     out.reserve(list.size());
@@ -1318,6 +1370,27 @@ class KMeansIVFIndex : public IVFIndex {
       rec.ivf_id = partition_id;
       rec.x = entry.vector;
       out.push_back(std::move(rec));
+    }
+    return out;
+  }
+
+  Result<std::vector<DocId>> GetPartitionDocIds(
+      const VersionSet& route_versions,
+      uint32_t partition_id) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    const IndexData& data = *it->second;
+    if (partition_id >= data.nlist) {
+      return Status::InvalidArgument("partition_id out of range");
+    }
+    const auto& list = data.lists[static_cast<size_t>(partition_id)];
+    std::vector<DocId> out;
+    out.reserve(list.size());
+    for (const auto& entry : list) {
+      out.push_back(entry.doc_id);
     }
     return out;
   }
@@ -1406,7 +1479,6 @@ class KMeansIVFIndex : public IVFIndex {
         entry.doc_id = rec.doc_id;
         entry.versions = rec.versions;
         entry.versions.index_version = data.version;
-        entry.vector = rec.x;
         if (data.use_pq) {
           entry.pq_code.resize(data.M);
           Eigen::VectorXf residual = rec.x;
@@ -1420,10 +1492,11 @@ class KMeansIVFIndex : public IVFIndex {
                 residual.data() + static_cast<Eigen::Index>(m * data.dsub),
                 static_cast<Eigen::Index>(data.dsub));
             entry.pq_code[static_cast<size_t>(m)] =
-                static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
+              static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
           }
         } else {
-          entry.norm = rec.x.squaredNorm();
+          entry.vector = rec.x;
+          entry.norm = entry.vector.squaredNorm();
         }
         dst.push_back(std::move(entry));
       }

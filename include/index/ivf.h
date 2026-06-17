@@ -106,6 +106,12 @@ class IVFIndex {
       const std::vector<DocId>& delete_doc_ids,
       const OnlinePQUpdateOptions& options) = 0;
 
+  // NTS: Sliding-window OnlinePQ step with external vectors for deleted records.
+  virtual Result<OnlinePQUpdateStats> AddWithOnlinePQSlidingWindowRecords(
+      const AlignedVector<VectorRecord>& recs,
+      const AlignedVector<VectorRecord>& delete_recs,
+      const OnlinePQUpdateOptions& options) = 0;
+
   // TS: Searches specified versions using whitened query.
   virtual Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> qw,
                                       uint32_t topk,
@@ -132,6 +138,9 @@ class IVFIndex {
   virtual Result<AlignedVector<VectorRecord>> SnapshotRecords(
       const VersionSet& route_versions) const = 0;
   virtual Result<AlignedVector<VectorRecord>> GetPartitionRecords(
+      const VersionSet& route_versions,
+      uint32_t partition_id) const = 0;
+  virtual Result<std::vector<DocId>> GetPartitionDocIds(
       const VersionSet& route_versions,
       uint32_t partition_id) const = 0;
   virtual Result<std::vector<uint32_t>> GetPartitionSizes(
