@@ -1,6 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 project(ann LANGUAGES CXX)
 
+option(ANN_ENABLE_PROFILING "Enable profiling-friendly compiler options" OFF)
+
+if(ANN_ENABLE_PROFILING)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+    )
+    add_link_options(
+      -fno-omit-frame-pointer
+    )
+  endif()
+endif()
+
 include(cmake/Options.cmake)
 
 find_package(Eigen3 REQUIRED)
@@ -32,6 +45,10 @@ ann_set_warnings(build_index)
 add_executable(run_eval apps/run_eval.cpp)
 target_link_libraries(run_eval PRIVATE ann)
 ann_set_warnings(run_eval)
+
+add_executable(run_eval_ms apps/run_eval_ms.cpp)
+target_link_libraries(run_eval_ms PRIVATE ann)
+ann_set_warnings(run_eval_ms)
 
 add_executable(test_interfaces tests/test_interfaces.cpp)
 target_link_libraries(test_interfaces PRIVATE ann)

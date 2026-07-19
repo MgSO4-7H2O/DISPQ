@@ -26,6 +26,117 @@ constexpr uint32_t kDefaultKMeansIterations = 20;
 constexpr uint32_t kDefaultSeed = 42;
 constexpr double kDefaultNQEEps = 1e-6;
 constexpr size_t kPrecomputedTableMaxBytes = (static_cast<size_t>(2) << 30);  // 2GB
+constexpr uint32_t kInvalidListId = std::numeric_limits<uint32_t>::max();
+constexpr size_t kDenseDocCompactMinGaps = 65536;
+
+struct DenseDocListMap {
+  DocId base{0};
+  std::vector<uint32_t> list_ids;
+  size_t leading_invalid{0};
+
+  bool Get(DocId doc_id, uint32_t* list_id) const {
+    if (list_ids.empty() || doc_id < base) {
+      return false;
+    }
+    const size_t offset = static_cast<size_t>(doc_id - base);
+    if (offset >= list_ids.size() || list_ids[offset] == kInvalidListId) {
+      return false;
+    }
+    if (list_id != nullptr) {
+      *list_id = list_ids[offset];
+    }
+    return true;
+  }
+
+  bool Contains(DocId doc_id) const { return Get(doc_id, nullptr); }
+
+  void Clear() {
+    base = 0;
+    list_ids.clear();
+    leading_invalid = 0;
+  }
+
+  void EnsureRange(DocId min_doc_id, DocId max_doc_id) {
+    if (min_doc_id > max_doc_id) {
+      return;
+    }
+    if (list_ids.empty()) {
+      base = min_doc_id;
+      list_ids.assign(static_cast<size_t>(max_doc_id - min_doc_id) + 1, kInvalidListId);
+      leading_invalid = list_ids.size();
+      return;
+    }
+
+    const DocId old_end = base + static_cast<DocId>(list_ids.size() - 1);
+    const DocId new_base = std::min(base, min_doc_id);
+    const DocId new_end = std::max(old_end, max_doc_id);
+    if (new_base == base) {
+      const size_t new_size = static_cast<size_t>(new_end - base) + 1;
+      if (new_size > list_ids.size()) {
+        list_ids.resize(new_size, kInvalidListId);
+      }
+      return;
+    }
+
+    std::vector<uint32_t> expanded(
+        static_cast<size_t>(new_end - new_base) + 1, kInvalidListId);
+    std::copy(list_ids.begin(), list_ids.end(),
+              expanded.begin() + static_cast<size_t>(base - new_base));
+    leading_invalid += static_cast<size_t>(base - new_base);
+    base = new_base;
+    list_ids.swap(expanded);
+  }
+
+  void Set(DocId doc_id, uint32_t list_id) {
+    if (!list_ids.empty() && doc_id >= base) {
+      const size_t offset = static_cast<size_t>(doc_id - base);
+      if (offset < list_ids.size()) {
+        list_ids[offset] = list_id;
+        if (offset < leading_invalid) {
+          leading_invalid = offset;
+        }
+        return;
+      }
+    }
+    EnsureRange(doc_id, doc_id);
+    const size_t offset = static_cast<size_t>(doc_id - base);
+    list_ids[offset] = list_id;
+    if (offset < leading_invalid) {
+      leading_invalid = offset;
+    }
+  }
+
+  void Erase(DocId doc_id) {
+    if (list_ids.empty() || doc_id < base) {
+      return;
+    }
+    const size_t offset = static_cast<size_t>(doc_id - base);
+    if (offset < list_ids.size()) {
+      list_ids[offset] = kInvalidListId;
+      if (offset == leading_invalid) {
+        while (leading_invalid < list_ids.size() &&
+               list_ids[leading_invalid] == kInvalidListId) {
+          ++leading_invalid;
+        }
+      }
+    }
+  }
+
+  void MaybeCompact() {
+    if (leading_invalid == list_ids.size()) {
+      Clear();
+      return;
+    }
+    if (leading_invalid < kDenseDocCompactMinGaps ||
+        leading_invalid < (list_ids.size() + 3) / 4) {
+      return;
+    }
+    std::vector<uint32_t> compacted(list_ids.begin() + leading_invalid, list_ids.end());
+    base += static_cast<DocId>(leading_invalid);
+    list_ids.swap(compacted);
+    leading_invalid = 0;
+  }
+};
 
 struct ListEntry {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -56,12 +167,14 @@ struct IndexData {
   std::vector<std::vector<uint64_t>> pq_counts;
   double nqe_baseline{0.0};
   double nqe_ema{0.0};
+  bool defer_pq_stats_to_add{false};
   uint64_t online_pq_batch_count{0};
   double warmup_nqe_sum{0.0};
   uint32_t warmup_seen_batches{0};
   std::vector<AlignedVector<ListEntry>> lists;
-  std::unordered_set<DocId> doc_ids;
-  std::unordered_map<DocId, uint32_t> doc_to_list;
+  DenseDocListMap doc_to_list;
+  double deferred_nqe_sum{0.0};
+  uint64_t deferred_nqe_count{0};
   uint64_t ntotal{0};
   double last_patch_pq_reencode_ms{0.0};
 };
@@ -582,8 +695,7 @@ class KMeansIVFIndex : public IVFIndex {
     if (data->use_pq) {
       data->pq_codes_by_list.resize(nlist);
     }
-    data->doc_ids.clear();
-    data->doc_to_list.clear();
+    data->doc_to_list.Clear();
     data->ntotal = 0;
 
     if (data->use_pq) {
@@ -627,33 +739,6 @@ class KMeansIVFIndex : public IVFIndex {
         }
       }
 
-      std::vector<std::vector<uint64_t>> computed_counts(
-          data->M, std::vector<uint64_t>(data->Ks, 0));
-      double nqe_sum = 0.0;
-      for (int64_t i = 0; i < Xw.rows(); ++i) {
-        const Eigen::VectorXf vec = Xw.row(i).transpose();
-        const int centroid = NearestCentroid(vec, *data);
-        Eigen::VectorXf residual = vec;
-        if (data->pq_residual) {
-          residual -= data->routing_centroids.row(centroid).transpose();
-        }
-        double err2 = 0.0;
-        double r2 = 0.0;
-        for (uint32_t m = 0; m < data->M; ++m) {
-          Eigen::Map<const Eigen::VectorXf> sub(
-              residual.data() + static_cast<Eigen::Index>(m * data->dsub),
-              static_cast<Eigen::Index>(data->dsub));
-          float best_dist = 0.0f;
-          const uint32_t k =
-              NearestCodeword(sub, data->pq_codebooks[static_cast<size_t>(m)], &best_dist);
-          computed_counts[static_cast<size_t>(m)][static_cast<size_t>(k)]++;
-          err2 += static_cast<double>(best_dist);
-          r2 += static_cast<double>(sub.squaredNorm());
-        }
-        nqe_sum += err2 / (r2 + kDefaultNQEEps);
-      }
-      const double computed_baseline = nqe_sum / static_cast<double>(Xw.rows());
-
       bool use_fixed_counts = false;
       if (!p.fixed_pq_counts.empty()) {
         if (p.fixed_pq_counts.size() != data->M) {
@@ -666,10 +751,47 @@ class KMeansIVFIndex : public IVFIndex {
         }
         use_fixed_counts = true;
       }
-      data->pq_counts = use_fixed_counts ? p.fixed_pq_counts : computed_counts;
-      data->nqe_baseline =
-          (p.fixed_pq_baseline_nqe > 0.0) ? p.fixed_pq_baseline_nqe : computed_baseline;
-      data->nqe_ema = (p.fixed_pq_ema_nqe > 0.0) ? p.fixed_pq_ema_nqe : data->nqe_baseline;
+
+      const bool can_defer_stats = p.defer_pq_stats_to_add && !use_fixed_counts &&
+                                   p.fixed_pq_baseline_nqe <= 0.0 &&
+                                   p.fixed_pq_ema_nqe <= 0.0;
+      if (can_defer_stats) {
+        data->pq_counts.assign(data->M, std::vector<uint64_t>(data->Ks, 0));
+        data->nqe_baseline = 0.0;
+        data->nqe_ema = 0.0;
+        data->defer_pq_stats_to_add = true;
+      } else {
+        std::vector<std::vector<uint64_t>> computed_counts(
+            data->M, std::vector<uint64_t>(data->Ks, 0));
+        double nqe_sum = 0.0;
+        for (int64_t i = 0; i < Xw.rows(); ++i) {
+          const Eigen::VectorXf vec = Xw.row(i).transpose();
+          const int centroid = NearestCentroid(vec, *data);
+          Eigen::VectorXf residual = vec;
+          if (data->pq_residual) {
+            residual -= data->routing_centroids.row(centroid).transpose();
+          }
+          double err2 = 0.0;
+          double r2 = 0.0;
+          for (uint32_t m = 0; m < data->M; ++m) {
+            Eigen::Map<const Eigen::VectorXf> sub(
+                residual.data() + static_cast<Eigen::Index>(m * data->dsub),
+                static_cast<Eigen::Index>(data->dsub));
+            float best_dist = 0.0f;
+            const uint32_t k =
+                NearestCodeword(sub, data->pq_codebooks[static_cast<size_t>(m)], &best_dist);
+            computed_counts[static_cast<size_t>(m)][static_cast<size_t>(k)]++;
+            err2 += static_cast<double>(best_dist);
+            r2 += static_cast<double>(sub.squaredNorm());
+          }
+          nqe_sum += err2 / (r2 + kDefaultNQEEps);
+        }
+        const double computed_baseline = nqe_sum / static_cast<double>(Xw.rows());
+        data->pq_counts = use_fixed_counts ? p.fixed_pq_counts : computed_counts;
+        data->nqe_baseline =
+            (p.fixed_pq_baseline_nqe > 0.0) ? p.fixed_pq_baseline_nqe : computed_baseline;
+        data->nqe_ema = (p.fixed_pq_ema_nqe > 0.0) ? p.fixed_pq_ema_nqe : data->nqe_baseline;
+      }
       BuildPrecomputedTable(data.get());
     }
 
@@ -682,6 +804,11 @@ class KMeansIVFIndex : public IVFIndex {
   }
 
   Status Add(const AlignedVector<VectorRecord>& recs) override {
+    return AddBatch(recs, true);
+  }
+
+  Status AddBatch(const AlignedVector<VectorRecord>& recs,
+                  bool finalize_deferred_stats) override {
     std::unique_lock lock(mu_);
     if (latest_version_ == 0) {
       return Status::InvalidArgument("Index not built");
@@ -698,8 +825,17 @@ class KMeansIVFIndex : public IVFIndex {
 
     std::vector<int> centroids(recs.size(), 0);
     AlignedVector<ListEntry> entries(recs.size());
+    const bool collect_initial_pq_stats = data.use_pq && data.defer_pq_stats_to_add;
+    std::vector<double> per_record_nqe;
+    if (collect_initial_pq_stats) {
+      per_record_nqe.assign(recs.size(), 0.0);
+    }
 
-    for (size_t i = 0; i < recs.size(); ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       const auto& rec = recs[i];
       ListEntry entry;
       const int centroid = NearestCentroid(rec.x, data);
@@ -712,13 +848,25 @@ class KMeansIVFIndex : public IVFIndex {
         if (data.pq_residual) {
           residual -= data.routing_centroids.row(centroid).transpose();
         }
+        double err2 = 0.0;
+        double r2 = 0.0;
         for (uint32_t m = 0; m < data.M; ++m) {
           const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
           Eigen::Map<const Eigen::VectorXf> sub(
               residual.data() + static_cast<Eigen::Index>(m * data.dsub),
               static_cast<Eigen::Index>(data.dsub));
-          entry.pq_code[static_cast<size_t>(m)] =
-              static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
+          float best_dist = 0.0f;
+          const uint32_t k = collect_initial_pq_stats
+                                 ? NearestCodeword(sub, codebook, &best_dist)
+                                 : NearestCodeword(sub, codebook, nullptr);
+          entry.pq_code[static_cast<size_t>(m)] = static_cast<uint8_t>(k);
+          if (collect_initial_pq_stats) {
+            err2 += static_cast<double>(best_dist);
+            r2 += static_cast<double>(sub.squaredNorm());
+          }
+        }
+        if (collect_initial_pq_stats) {
+          per_record_nqe[i] = err2 / (r2 + kDefaultNQEEps);
         }
       } else {
         entry.vector = rec.x;
@@ -726,6 +874,27 @@ class KMeansIVFIndex : public IVFIndex {
       }
       centroids[i] = centroid;
       entries[i] = std::move(entry);
+    }
+
+    if (collect_initial_pq_stats) {
+      for (size_t i = 0; i < entries.size(); ++i) {
+        data.deferred_nqe_sum += per_record_nqe[i];
+        data.deferred_nqe_count++;
+        for (uint32_t m = 0; m < data.M; ++m) {
+          const uint32_t k = static_cast<uint32_t>(entries[i].pq_code[static_cast<size_t>(m)]);
+          if (k < data.Ks) {
+            data.pq_counts[static_cast<size_t>(m)][static_cast<size_t>(k)]++;
+          }
+        }
+      }
+      if (finalize_deferred_stats && data.deferred_nqe_count > 0) {
+        data.nqe_baseline =
+            data.deferred_nqe_sum / static_cast<double>(data.deferred_nqe_count);
+        data.nqe_ema = data.nqe_baseline;
+        data.defer_pq_stats_to_add = false;
+        data.deferred_nqe_sum = 0.0;
+        data.deferred_nqe_count = 0;
+      }
     }
 
     CommitPendingLocked(&data, centroids, &entries);
@@ -835,14 +1004,21 @@ class KMeansIVFIndex : public IVFIndex {
                             data.pq_counts.size() == data.M;
     if (!can_online) {
       if (!delete_doc_ids.empty()) {
+        Timer delete_timer;
         Status remove_status = RemoveDocsLocked(&data, delete_doc_ids, nullptr);
         if (!remove_status.ok()) {
           return remove_status;
         }
+        stats.delete_ms += delete_timer.ElapsedMillis();
       }
       std::vector<int> centroids(recs.size(), 0);
       AlignedVector<ListEntry> entries(recs.size());
-      for (size_t i = 0; i < recs.size(); ++i) {
+      Timer encode_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
         const auto& rec = recs[i];
         ListEntry entry;
         const int centroid = NearestCentroid(rec.x, data);
@@ -870,7 +1046,12 @@ class KMeansIVFIndex : public IVFIndex {
         centroids[i] = centroid;
         entries[i] = std::move(entry);
       }
+      stats.insert_encode_ms += encode_timer.ElapsedMillis();
+      Timer commit_timer;
       CommitPendingLocked(&data, centroids, &entries);
+      stats.insert_commit_ms += commit_timer.ElapsedMillis();
+      stats.insert_ms += stats.insert_encode_ms + stats.insert_commit_ms;
+      stats.maintenance_ms += stats.delete_ms;
       return stats;
     }
 
@@ -880,10 +1061,12 @@ class KMeansIVFIndex : public IVFIndex {
     const uint32_t n = static_cast<uint32_t>(recs.size());
 
     std::vector<int> centroids(recs.size(), 0);
-    AlignedVector<Eigen::VectorXf> residuals;
-    residuals.reserve(recs.size());
-    std::vector<std::vector<uint8_t>> codes_before(
-        recs.size(), std::vector<uint8_t>(data.M, 0));
+    MatrixRM residuals(static_cast<Eigen::Index>(recs.size()),
+                       static_cast<Eigen::Index>(data.dim));
+    std::vector<uint8_t> codes_before(recs.size() * static_cast<size_t>(data.M), 0);
+    std::vector<float> best_dists(recs.size() * static_cast<size_t>(data.M), 0.0f);
+    std::vector<float> sub_energies(recs.size() * static_cast<size_t>(data.M), 0.0f);
+    std::vector<double> nqe_by_record(recs.size(), 0.0);
     std::vector<std::vector<uint32_t>> batch_cnt(
         data.M, std::vector<uint32_t>(data.Ks, 0));
     std::vector<MatrixRM> sum_vec;
@@ -906,6 +1089,7 @@ class KMeansIVFIndex : public IVFIndex {
 
     std::vector<RemovedDoc> removed_docs;
     if (!delete_doc_ids.empty()) {
+      Timer delete_timer;
       Status remove_status = RemoveDocsLocked(&data, delete_doc_ids, &removed_docs);
       if (!remove_status.ok()) {
         return remove_status;
@@ -942,44 +1126,68 @@ class KMeansIVFIndex : public IVFIndex {
               sub.transpose();
         }
       }
+      stats.delete_ms += delete_timer.ElapsedMillis();
     }
 
-    double nqe_sum = 0.0;
-    for (size_t i = 0; i < recs.size(); ++i) {
+    Timer encode_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       const auto& rec = recs[i];
       const int centroid = NearestCentroid(rec.x, data);
       centroids[i] = centroid;
 
-      Eigen::VectorXf residual = rec.x;
+      residuals.row(static_cast<Eigen::Index>(i)) = rec.x.transpose();
       if (data.pq_residual) {
-        residual -= data.routing_centroids.row(centroid).transpose();
+        residuals.row(static_cast<Eigen::Index>(i)) -=
+            data.routing_centroids.row(static_cast<Eigen::Index>(centroid));
       }
-      residuals.push_back(residual);
 
       double err2 = 0.0;
       double r2 = 0.0;
+      const float* residual_ptr = residuals.row(static_cast<Eigen::Index>(i)).data();
       for (uint32_t m = 0; m < data.M; ++m) {
         const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
         Eigen::Map<const Eigen::VectorXf> sub(
-            residual.data() + static_cast<Eigen::Index>(m * data.dsub),
+            residual_ptr + static_cast<Eigen::Index>(m * data.dsub),
             static_cast<Eigen::Index>(data.dsub));
         float best_dist = 0.0f;
         const uint32_t best_idx = NearestCodeword(sub, codebook, &best_dist);
-        codes_before[i][static_cast<size_t>(m)] = static_cast<uint8_t>(best_idx);
+        const size_t code_offset = i * static_cast<size_t>(data.M) + static_cast<size_t>(m);
+        codes_before[code_offset] = static_cast<uint8_t>(best_idx);
+        best_dists[code_offset] = best_dist;
+        sub_energies[code_offset] = sub.squaredNorm();
+        err2 += static_cast<double>(best_dist);
+        r2 += static_cast<double>(sub_energies[code_offset]);
+      }
+      nqe_by_record[i] = err2 / (r2 + eps);
+    }
+    stats.insert_encode_ms += encode_timer.ElapsedMillis();
+
+    Timer onlinepq_stats_timer;
+    double nqe_sum = 0.0;
+    for (size_t i = 0; i < recs.size(); ++i) {
+      const float* residual_ptr = residuals.row(static_cast<Eigen::Index>(i)).data();
+      for (uint32_t m = 0; m < data.M; ++m) {
+        const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
+        const size_t code_offset = i * static_cast<size_t>(data.M) + static_cast<size_t>(m);
+        const uint32_t best_idx = static_cast<uint32_t>(codes_before[code_offset]);
+        Eigen::Map<const Eigen::VectorXf> sub(
+            residual_ptr + static_cast<Eigen::Index>(m * data.dsub),
+            static_cast<Eigen::Index>(data.dsub));
         batch_cnt[static_cast<size_t>(m)][static_cast<size_t>(best_idx)]++;
         sum_vec[static_cast<size_t>(m)].row(static_cast<Eigen::Index>(best_idx)) +=
             sub.transpose();
         sum_err[static_cast<size_t>(m)].row(static_cast<Eigen::Index>(best_idx)) +=
             (sub - codebook.row(static_cast<Eigen::Index>(best_idx)).transpose()).transpose();
-
-        const double e2 = static_cast<double>(best_dist);
-        const double en = static_cast<double>(sub.squaredNorm());
-        err2 += e2;
-        r2 += en;
+        const double e2 = static_cast<double>(best_dists[code_offset]);
+        const double en = static_cast<double>(sub_energies[code_offset]);
         sub_err_sum[static_cast<size_t>(m)] += e2;
         sub_energy_sum[static_cast<size_t>(m)] += en;
       }
-      nqe_sum += err2 / (r2 + eps);
+      nqe_sum += nqe_by_record[i];
     }
 
     stats.nqe_batch = (n > 0) ? (nqe_sum / static_cast<double>(n)) : data.nqe_ema;
@@ -1017,8 +1225,11 @@ class KMeansIVFIndex : public IVFIndex {
       stats.warmup_batches_left = 0;
     }
 
-    std::vector<std::vector<uint8_t>> codes_for_insert = codes_before;
+    stats.onlinepq_stats_ms += onlinepq_stats_timer.ElapsedMillis();
+
+    std::vector<uint8_t> codes_for_insert = codes_before;
     if (stats.trigger_update) {
+      Timer codebook_update_timer;
       std::vector<uint8_t> subspace_selected(data.M, 1);
       if (options.partial_top_alpha) {
         std::fill(subspace_selected.begin(), subspace_selected.end(), 0);
@@ -1156,34 +1367,55 @@ class KMeansIVFIndex : public IVFIndex {
       if (stats.updated_codebook) {
         BuildPrecomputedTable(&data);
       }
+      stats.codebook_update_ms += codebook_update_timer.ElapsedMillis();
 
       if (stats.updated_codebook && options.reencode_batch_after_update) {
-        for (size_t i = 0; i < recs.size(); ++i) {
-          const Eigen::VectorXf& residual = residuals[static_cast<size_t>(i)];
+        Timer reencode_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+        for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          const float* residual_ptr = residuals.row(static_cast<Eigen::Index>(i)).data();
           for (uint32_t m = 0; m < data.M; ++m) {
             const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
             Eigen::Map<const Eigen::VectorXf> sub(
-                residual.data() + static_cast<Eigen::Index>(m * data.dsub),
+                residual_ptr + static_cast<Eigen::Index>(m * data.dsub),
                 static_cast<Eigen::Index>(data.dsub));
-            codes_for_insert[static_cast<size_t>(i)][static_cast<size_t>(m)] =
+            codes_for_insert[static_cast<size_t>(i) * static_cast<size_t>(data.M) +
+                             static_cast<size_t>(m)] =
                 static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
           }
         }
+        stats.reencode_ms += reencode_timer.ElapsedMillis();
         stats.reencoded_batch = true;
       }
     }
 
     AlignedVector<ListEntry> entries(recs.size());
-    for (size_t i = 0; i < recs.size(); ++i) {
+    Timer entry_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       const auto& rec = recs[i];
       ListEntry entry;
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
-      entry.pq_code = std::move(codes_for_insert[static_cast<size_t>(i)]);
+      const uint8_t* code_begin =
+          codes_for_insert.data() + i * static_cast<size_t>(data.M);
+      entry.pq_code.assign(code_begin, code_begin + data.M);
       entries[i] = std::move(entry);
     }
+    stats.insert_entry_ms += entry_timer.ElapsedMillis();
+    Timer commit_timer;
     CommitPendingLocked(&data, centroids, &entries);
+    stats.insert_commit_ms += commit_timer.ElapsedMillis();
+    stats.insert_ms += stats.insert_encode_ms + stats.insert_entry_ms + stats.insert_commit_ms;
+    stats.maintenance_ms += stats.delete_ms + stats.onlinepq_stats_ms +
+                            stats.codebook_update_ms + stats.reencode_ms;
     return stats;
   }
 
@@ -1283,14 +1515,16 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::NotFound("Index version not built");
     }
     const IndexData& data = *it->second;
-    for (const auto& list : data.lists) {
-      for (const auto& entry : list) {
-        if (entry.doc_id == doc_id) {
-          if (entry.pq_code.empty()) {
-            return Status::NotFound("doc has no pq code");
-          }
-          return entry.pq_code;
+    uint32_t list_id = 0;
+    if (!data.doc_to_list.Get(doc_id, &list_id) || list_id >= data.lists.size()) {
+      return Status::NotFound("doc_id not found");
+    }
+    for (const auto& entry : data.lists[static_cast<size_t>(list_id)]) {
+      if (entry.doc_id == doc_id) {
+        if (entry.pq_code.empty()) {
+          return Status::NotFound("doc has no pq code");
         }
+        return entry.pq_code;
       }
     }
     return Status::NotFound("doc_id not found");
@@ -1425,31 +1659,23 @@ class KMeansIVFIndex : public IVFIndex {
     }
     IndexData& data = *it->second;
     data.last_patch_pq_reencode_ms = 0.0;
-    std::unordered_set<uint32_t> patch_partitions;
-    patch_partitions.reserve(patch.partition_ids.size());
+    std::vector<uint8_t> patch_partitions(data.nlist, 0);
     for (uint32_t partition_id : patch.partition_ids) {
       if (partition_id >= data.nlist) {
         return Status::InvalidArgument("CommitPartitionPatch: partition_id out of range");
       }
-      if (!patch_partitions.insert(partition_id).second) {
+      if (patch_partitions[static_cast<size_t>(partition_id)] != 0) {
         return Status::InvalidArgument("CommitPartitionPatch: duplicate partition_id");
       }
-    }
-
-    std::unordered_set<DocId> unaffected_doc_ids;
-    unaffected_doc_ids.reserve(data.doc_ids.size());
-    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
-      if (patch_partitions.find(list_id) != patch_partitions.end()) {
-        continue;
-      }
-      const auto& list = data.lists[static_cast<size_t>(list_id)];
-      for (const auto& entry : list) {
-        unaffected_doc_ids.insert(entry.doc_id);
-      }
+      patch_partitions[static_cast<size_t>(partition_id)] = 1;
     }
 
     std::unordered_set<DocId> patch_doc_ids;
-    patch_doc_ids.reserve(data.doc_ids.size());
+    size_t patch_record_count = 0;
+    for (const auto& records : patch.replacement_records) {
+      patch_record_count += records.size();
+    }
+    patch_doc_ids.reserve(patch_record_count);
     for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
       const auto& records = patch.replacement_records[i];
       for (const auto& rec : records) {
@@ -1459,7 +1685,9 @@ class KMeansIVFIndex : public IVFIndex {
         if (!patch_doc_ids.insert(rec.doc_id).second) {
           return Status::AlreadyExists("CommitPartitionPatch: duplicate doc_id in patch");
         }
-        if (unaffected_doc_ids.find(rec.doc_id) != unaffected_doc_ids.end()) {
+        uint32_t existing_list = 0;
+        if (data.doc_to_list.Get(rec.doc_id, &existing_list) &&
+            patch_partitions[static_cast<size_t>(existing_list)] == 0) {
           return Status::AlreadyExists(
               "CommitPartitionPatch: doc_id collides with unaffected partitions");
         }
@@ -1506,17 +1734,7 @@ class KMeansIVFIndex : public IVFIndex {
       }
     }
 
-    data.doc_ids.clear();
-    data.doc_to_list.clear();
-    data.ntotal = 0;
-    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
-      const auto& list = data.lists[static_cast<size_t>(list_id)];
-      for (const auto& entry : list) {
-        data.doc_ids.insert(entry.doc_id);
-        data.doc_to_list[entry.doc_id] = list_id;
-        ++data.ntotal;
-      }
-    }
+    RebuildDocMapLocked(&data);
     data.last_patch_pq_reencode_ms = pq_reencode_ms;
     return Status::OK();
   }
@@ -1542,6 +1760,38 @@ class KMeansIVFIndex : public IVFIndex {
     ListEntry entry;
   };
 
+  void RebuildDocMapLocked(IndexData* data) {
+    data->doc_to_list.Clear();
+    data->ntotal = 0;
+
+    bool has_docs = false;
+    DocId min_doc_id = 0;
+    DocId max_doc_id = 0;
+    for (const auto& list : data->lists) {
+      for (const auto& entry : list) {
+        if (!has_docs) {
+          min_doc_id = entry.doc_id;
+          max_doc_id = entry.doc_id;
+          has_docs = true;
+        } else {
+          min_doc_id = std::min(min_doc_id, entry.doc_id);
+          max_doc_id = std::max(max_doc_id, entry.doc_id);
+        }
+      }
+    }
+    if (!has_docs) {
+      return;
+    }
+
+    data->doc_to_list.EnsureRange(min_doc_id, max_doc_id);
+    for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
+      for (const auto& entry : data->lists[static_cast<size_t>(list_id)]) {
+        data->doc_to_list.Set(entry.doc_id, list_id);
+        ++data->ntotal;
+      }
+    }
+  }
+
   Status ValidateRecordsForInsertLocked(const IndexData& data,
                                         const AlignedVector<VectorRecord>& recs) const {
     std::unordered_set<DocId> batch_ids;
@@ -1550,7 +1800,7 @@ class KMeansIVFIndex : public IVFIndex {
       if (static_cast<uint32_t>(rec.x.size()) != data.dim) {
         return Status::InvalidArgument("Record dim mismatch");
       }
-      if (data.doc_ids.find(rec.doc_id) != data.doc_ids.end()) {
+      if (data.doc_to_list.Contains(rec.doc_id)) {
         return Status::AlreadyExists("doc_id already present in IVF");
       }
       if (!batch_ids.insert(rec.doc_id).second) {
@@ -1568,7 +1818,7 @@ class KMeansIVFIndex : public IVFIndex {
       if (!seen.insert(doc_id).second) {
         return Status::InvalidArgument("duplicate delete doc_id in batch");
       }
-      if (data.doc_ids.find(doc_id) == data.doc_ids.end()) {
+      if (!data.doc_to_list.Contains(doc_id)) {
         return Status::NotFound("delete doc_id not found in IVF");
       }
     }
@@ -1586,11 +1836,10 @@ class KMeansIVFIndex : public IVFIndex {
       removed->reserve(doc_ids.size());
     }
     for (DocId doc_id : doc_ids) {
-      auto map_it = data->doc_to_list.find(doc_id);
-      if (map_it == data->doc_to_list.end()) {
+      uint32_t list_id = 0;
+      if (!data->doc_to_list.Get(doc_id, &list_id)) {
         return Status::NotFound("delete doc_id list mapping not found");
       }
-      const uint32_t list_id = map_it->second;
       if (list_id >= data->lists.size()) {
         return Status::InvalidArgument("delete list_id out of range");
       }
@@ -1617,15 +1866,15 @@ class KMeansIVFIndex : public IVFIndex {
       }
       if (pos != list.size() - 1) {
         list[pos] = std::move(list.back());
-        data->doc_to_list[list[pos].doc_id] = list_id;
+        data->doc_to_list.Set(list[pos].doc_id, list_id);
       }
       list.pop_back();
-      data->doc_ids.erase(doc_id);
-      data->doc_to_list.erase(doc_id);
+      data->doc_to_list.Erase(doc_id);
       if (data->ntotal > 0) {
         --data->ntotal;
       }
     }
+    data->doc_to_list.MaybeCompact();
     return Status::OK();
   }
 
@@ -1635,12 +1884,20 @@ class KMeansIVFIndex : public IVFIndex {
     if (data->use_pq && data->pq_codes_by_list.size() != data->lists.size()) {
       data->pq_codes_by_list.resize(data->lists.size());
     }
+    if (!entries->empty()) {
+      DocId min_doc_id = (*entries)[0].doc_id;
+      DocId max_doc_id = min_doc_id;
+      for (const auto& entry : *entries) {
+        min_doc_id = std::min(min_doc_id, entry.doc_id);
+        max_doc_id = std::max(max_doc_id, entry.doc_id);
+      }
+      data->doc_to_list.EnsureRange(min_doc_id, max_doc_id);
+    }
     for (size_t i = 0; i < entries->size(); ++i) {
-      data->doc_ids.insert((*entries)[i].doc_id);
       const uint32_t list_id = static_cast<uint32_t>(centroids[i]);
       auto& list = data->lists[static_cast<size_t>(list_id)];
       list.push_back(std::move((*entries)[i]));
-      data->doc_to_list[list.back().doc_id] = list_id;
+      data->doc_to_list.Set(list.back().doc_id, list_id);
       if (data->use_pq) {
         auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
         if (list.back().pq_code.size() == data->M) {

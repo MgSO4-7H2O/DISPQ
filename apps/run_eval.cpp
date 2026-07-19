@@ -11,6 +11,7 @@
 #include <optional>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,7 +41,25 @@ namespace {
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
-constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(128) << 20;
+constexpr uint32_t kAddBlockRows = 65536;
+constexpr uint32_t kWhitenedMinGrowthRows = 65536;
+constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
+
+void EnsureWhitenedCapacity(MatrixRM* matrix,
+                            uint32_t required_rows,
+                            uint32_t max_rows,
+                            uint32_t dim) {
+  if (matrix == nullptr || required_rows <= static_cast<uint32_t>(matrix->rows())) {
+    return;
+  }
+  const uint32_t current_rows = static_cast<uint32_t>(matrix->rows());
+  const uint64_t growth = std::max<uint64_t>(current_rows / 2, kWhitenedMinGrowthRows);
+  const uint64_t grown_rows = static_cast<uint64_t>(current_rows) + growth;
+  const uint32_t new_rows = static_cast<uint32_t>(std::min<uint64_t>(
+      max_rows, std::max<uint64_t>(required_rows, grown_rows)));
+  matrix->conservativeResize(static_cast<Eigen::Index>(new_rows),
+                             static_cast<Eigen::Index>(dim));
+}
 
 struct DistributionStats {
   double avg{0.0};
@@ -77,6 +96,59 @@ DistributionStats SummarizeDistribution(const std::vector<double>& values) {
   stats.p99 = Percentile(values, 0.99);
   stats.max = *std::max_element(values.begin(), values.end());
   return stats;
+}
+
+struct SeriesStats {
+  double avg{0.0};
+  double p5{0.0};
+  double p50{0.0};
+  double p95{0.0};
+  double p99{0.0};
+  double min{0.0};
+  double max{0.0};
+};
+
+SeriesStats SummarizeSeries(const std::vector<double>& values) {
+  SeriesStats stats;
+  if (values.empty()) {
+    return stats;
+  }
+  stats.avg =
+      std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+  stats.p5 = Percentile(values, 0.05);
+  stats.p50 = Percentile(values, 0.50);
+  stats.p95 = Percentile(values, 0.95);
+  stats.p99 = Percentile(values, 0.99);
+  stats.min = *std::min_element(values.begin(), values.end());
+  stats.max = *std::max_element(values.begin(), values.end());
+  return stats;
+}
+
+uint64_t ReadProcStatusBytes(const std::string& key) {
+  std::ifstream ifs("/proc/self/status");
+  if (!ifs) {
+    return 0;
+  }
+  std::string line;
+  while (std::getline(ifs, line)) {
+    if (line.rfind(key, 0) != 0) {
+      continue;
+    }
+    std::istringstream iss(line.substr(key.size()));
+    uint64_t kb = 0;
+    std::string unit;
+    iss >> kb >> unit;
+    return kb * 1024ull;
+  }
+  return 0;
+}
+
+uint32_t RuntimeMaxThreads() {
+#ifdef _OPENMP
+  return static_cast<uint32_t>(std::max(1, omp_get_max_threads()));
+#else
+  return 1;
+#endif
 }
 
 struct RouteDebugStats {
@@ -246,6 +318,13 @@ struct DeltaShard {
 
 struct EvalMetrics {
   double recall{0.0};
+  double recall_new{0.0};
+  double recall_old{0.0};
+  double gt_new_ratio{0.0};
+  uint64_t gt_new_total{0};
+  uint64_t gt_old_total{0};
+  uint64_t hit_new_total{0};
+  uint64_t hit_old_total{0};
   double whitening_p50{0.0};
   double whitening_p99{0.0};
   double avg_whiten_ms{0.0};
@@ -287,6 +366,65 @@ struct EvalMetrics {
   std::optional<LatencyDebugMetrics> latency_debug;
 };
 
+
+struct RecallAgeMetrics {
+  double recall_new{0.0};
+  double recall_old{0.0};
+  double gt_new_ratio{0.0};
+  uint64_t gt_new_total{0};
+  uint64_t gt_old_total{0};
+  uint64_t hit_new_total{0};
+  uint64_t hit_old_total{0};
+};
+
+RecallAgeMetrics ComputeRecallByRecentInsert(const std::vector<std::vector<DocId>>& gt,
+                                             const std::vector<std::vector<DocId>>& pred,
+                                             uint32_t new_begin,
+                                             uint32_t new_end,
+                                             uint32_t seen_rows) {
+  RecallAgeMetrics out;
+  if (new_begin > new_end || new_end > seen_rows) {
+    new_begin = seen_rows;
+    new_end = seen_rows;
+  }
+  const size_t nq = std::min(gt.size(), pred.size());
+  for (size_t qi = 0; qi < nq; ++qi) {
+    std::unordered_set<DocId> pred_set;
+    pred_set.reserve(pred[qi].size() * 2 + 1);
+    for (DocId doc : pred[qi]) {
+      pred_set.insert(doc);
+    }
+    for (DocId doc : gt[qi]) {
+      if (doc >= seen_rows) {
+        continue;
+      }
+      const bool is_new = doc >= new_begin && doc < new_end;
+      const bool hit = pred_set.find(doc) != pred_set.end();
+      if (is_new) {
+        out.gt_new_total++;
+        if (hit) out.hit_new_total++;
+      } else {
+        out.gt_old_total++;
+        if (hit) out.hit_old_total++;
+      }
+    }
+  }
+  const uint64_t gt_total = out.gt_new_total + out.gt_old_total;
+  out.recall_new = out.gt_new_total > 0
+                       ? static_cast<double>(out.hit_new_total) /
+                             static_cast<double>(out.gt_new_total)
+                       : 0.0;
+  out.recall_old = out.gt_old_total > 0
+                       ? static_cast<double>(out.hit_old_total) /
+                             static_cast<double>(out.gt_old_total)
+                       : 0.0;
+  out.gt_new_ratio = gt_total > 0
+                         ? static_cast<double>(out.gt_new_total) /
+                               static_cast<double>(gt_total)
+                         : 0.0;
+  return out;
+}
+
 struct MinibatchRecord {
   uint32_t batch_id{0};
   uint32_t base_rows{0};
@@ -294,12 +432,28 @@ struct MinibatchRecord {
   uint32_t batch_rows{0};
   uint32_t snapshot_rows_total{0};
   double recall{0.0};
+  double recall_new{0.0};
+  double recall_old{0.0};
+  double gt_new_ratio{0.0};
+  uint64_t gt_new_total{0};
+  uint64_t gt_old_total{0};
+  uint64_t hit_new_total{0};
+  uint64_t hit_old_total{0};
   double latency_ms{0.0};
   double end_to_end_overhead_ms{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
   double query_qps{0.0};
   double update_ms{0.0};
+  double update_whitening_ms{0.0};
+  double update_insert_ms{0.0};
+  double update_record_build_ms{0.0};
+  double update_insert_encode_ms{0.0};
+  double update_insert_commit_ms{0.0};
+  double update_onlinepq_maintenance_ms{0.0};
+  double update_delete_ms{0.0};
+  double update_codebook_update_ms{0.0};
+  double update_reencode_ms{0.0};
   double update_throughput_vecps{0.0};
   double query_eval_ms{0.0};
   double nqe_batch{0.0};
@@ -325,12 +479,28 @@ struct SnapshotRecord {
   uint32_t active_delta_docs{0};
   uint32_t snapshot_rows{0};
   double recall{0.0};
+  double recall_new{0.0};
+  double recall_old{0.0};
+  double gt_new_ratio{0.0};
+  uint64_t gt_new_total{0};
+  uint64_t gt_old_total{0};
+  uint64_t hit_new_total{0};
+  uint64_t hit_old_total{0};
   double latency_ms{0.0};
   double end_to_end_overhead_ms{0.0};
   double avg_search_ms{0.0};
   double avg_scanned{0.0};
   double query_qps{0.0};
   double update_ms{0.0};
+  double update_whitening_ms{0.0};
+  double update_insert_ms{0.0};
+  double update_record_build_ms{0.0};
+  double update_insert_encode_ms{0.0};
+  double update_insert_commit_ms{0.0};
+  double update_onlinepq_maintenance_ms{0.0};
+  double update_delete_ms{0.0};
+  double update_codebook_update_ms{0.0};
+  double update_reencode_ms{0.0};
   double query_eval_ms{0.0};
   double merge_compute_ms{0.0};
   double global_rebuild_ms{0.0};
@@ -461,6 +631,7 @@ struct GlobalRebuildEventRecord {
   double main_add_ms{0.0};
   double delta_seed_ms{0.0};
   double total_ms{0.0};
+  double wall_total_ms{0.0};
   std::string reason;
 };
 
@@ -517,18 +688,27 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
     return Status::OK();
   }
 
-  AlignedVector<VectorRecord> records;
-  records.reserve(static_cast<size_t>(end - begin));
-  for (uint32_t i = begin; i < end; ++i) {
-    VectorRecord rec;
-    rec.doc_id = i;
-    rec.dim = dim;
-    rec.versions = versions;
-    rec.ivf_id = 0;
-    rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
-    records.push_back(std::move(rec));
+  for (uint32_t block_begin = begin; block_begin < end;) {
+    const uint32_t block_end =
+        block_begin + std::min<uint32_t>(kAddBlockRows, end - block_begin);
+    AlignedVector<VectorRecord> records;
+    records.reserve(static_cast<size_t>(block_end - block_begin));
+    for (uint32_t i = block_begin; i < block_end; ++i) {
+      VectorRecord rec;
+      rec.doc_id = i;
+      rec.dim = dim;
+      rec.versions = versions;
+      rec.ivf_id = 0;
+      rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
+      records.push_back(std::move(rec));
+    }
+    const Status add_status = ivf->AddBatch(records, block_end == end);
+    if (!add_status.ok()) {
+      return add_status;
+    }
+    block_begin = block_end;
   }
-  return ivf->Add(records);
+  return Status::OK();
 }
 
 Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
@@ -551,17 +731,30 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
   }
 
   AlignedVector<VectorRecord> records;
-  records.reserve(static_cast<size_t>(end - begin));
-  for (uint32_t i = begin; i < end; ++i) {
+  records.resize(static_cast<size_t>(end - begin));
+  Timer record_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t offset = 0; offset < static_cast<int64_t>(records.size()); ++offset) {
+    const uint32_t i = begin + static_cast<uint32_t>(offset);
     VectorRecord rec;
     rec.doc_id = i;
     rec.dim = dim;
     rec.versions = versions;
     rec.ivf_id = 0;
     rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
-    records.push_back(std::move(rec));
+    records[static_cast<size_t>(offset)] = std::move(rec);
   }
-  return ivf->AddWithOnlinePQ(records, options);
+  const double record_build_ms = record_timer.ElapsedMillis();
+  auto add_res = ivf->AddWithOnlinePQ(records, options);
+  if (!add_res.ok()) {
+    return add_res.status();
+  }
+  OnlinePQUpdateStats stats = add_res.value();
+  stats.record_build_ms += record_build_ms;
+  stats.insert_ms += record_build_ms;
+  return stats;
 }
 
 Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQSlidingWindow(
@@ -581,16 +774,22 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQSlidingWindow(
   }
 
   AlignedVector<VectorRecord> records;
-  records.reserve(static_cast<size_t>(end - begin));
-  for (uint32_t i = begin; i < end; ++i) {
+  records.resize(static_cast<size_t>(end - begin));
+  Timer record_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t offset = 0; offset < static_cast<int64_t>(records.size()); ++offset) {
+    const uint32_t i = begin + static_cast<uint32_t>(offset);
     VectorRecord rec;
     rec.doc_id = i;
     rec.dim = dim;
     rec.versions = versions;
     rec.ivf_id = 0;
     rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
-    records.push_back(std::move(rec));
+    records[static_cast<size_t>(offset)] = std::move(rec);
   }
+  const double record_build_ms = record_timer.ElapsedMillis();
   AlignedVector<VectorRecord> delete_records;
   delete_records.reserve(delete_doc_ids.size());
   for (DocId doc_id : delete_doc_ids) {
@@ -606,7 +805,14 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQSlidingWindow(
     rec.x = x_whitened.row(static_cast<Eigen::Index>(doc_id)).transpose();
     delete_records.push_back(std::move(rec));
   }
-  return ivf->AddWithOnlinePQSlidingWindowRecords(records, delete_records, options);
+  auto add_res = ivf->AddWithOnlinePQSlidingWindowRecords(records, delete_records, options);
+  if (!add_res.ok()) {
+    return add_res.status();
+  }
+  OnlinePQUpdateStats stats = add_res.value();
+  stats.record_build_ms += record_build_ms;
+  stats.insert_ms += record_build_ms;
+  return stats;
 }
 
 Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
@@ -839,6 +1045,8 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
 Result<EvalMetrics> EvaluateState(const Config& config,
                                   const MatrixRM& base_whitened,
                                   uint32_t seen_rows,
+                                  uint32_t new_begin,
+                                  uint32_t new_end,
                                   uint32_t main_rows,
                                   const MatrixRM& queries_raw,
                                   const MatrixRM& queries_whitened,
@@ -1285,6 +1493,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   if (!recall_res.ok()) {
     return recall_res.status();
   }
+  const RecallAgeMetrics age_metrics =
+      ComputeRecallByRecentInsert(ground_truth, predictions, new_begin, new_end, seen_rows);
   auto whiten_summary = SummarizeLatencies(whitening_ms);
   if (!whiten_summary.ok()) {
     return whiten_summary.status();
@@ -1329,6 +1539,13 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 
   EvalMetrics metrics;
   metrics.recall = recall_res.value();
+  metrics.recall_new = age_metrics.recall_new;
+  metrics.recall_old = age_metrics.recall_old;
+  metrics.gt_new_ratio = age_metrics.gt_new_ratio;
+  metrics.gt_new_total = age_metrics.gt_new_total;
+  metrics.gt_old_total = age_metrics.gt_old_total;
+  metrics.hit_new_total = age_metrics.hit_new_total;
+  metrics.hit_old_total = age_metrics.hit_old_total;
   metrics.whitening_p50 = whiten_summary.value().p50_ms;
   metrics.whitening_p99 = whiten_summary.value().p99_ms;
   metrics.avg_whiten_ms = avg_whiten;
@@ -1618,6 +1835,7 @@ int main(int argc, char** argv) {
   ivf_params.pq.M = config.pq_m;
   ivf_params.pq.nbits = config.pq_nbits;
   ivf_params.pq.residual = config.pq_residual;
+  ivf_params.defer_pq_stats_to_add = true;
 
   auto whitening = CreateWhiteningModel();
   auto main_ivf = CreateIVFIndex();
@@ -1628,28 +1846,36 @@ int main(int argc, char** argv) {
   uint32_t main_rows_current = main_rows_initial;
   uint32_t next_insert_idx = stream_start_idx;
 
-  Timer init_timer;
+  Timer init_total_timer;
+  Timer init_fit_timer;
   auto whiten_version_res = whitening->Fit(X.topRows(main_rows_initial));
   if (!whiten_version_res.ok()) {
     std::cerr << whiten_version_res.status().ToString() << std::endl;
     return 1;
   }
   whiten_version = whiten_version_res.value();
+  const double init_whitening_ms = init_fit_timer.ElapsedMillis();
 
-  auto xb_res = whitening->TransformBatch(X, whiten_version);
+  const uint32_t init_visible_rows = std::min<uint32_t>(nx, stream_start_idx);
+  Timer init_transform_timer;
+  auto xb_res = whitening->TransformBatch(X.topRows(init_visible_rows), whiten_version);
   if (!xb_res.ok()) {
     std::cerr << xb_res.status().ToString() << std::endl;
     return 1;
   }
-  X_whitened = xb_res.value();
+  X_whitened = std::move(xb_res.value());
+  if (config.use_cosine) {
+    NormalizeRowsL2(&X_whitened);
+  }
+  const double init_whitening_transform_ms = init_transform_timer.ElapsedMillis();
+
   auto qb_res = whitening->TransformBatch(Q, whiten_version);
   if (!qb_res.ok()) {
     std::cerr << qb_res.status().ToString() << std::endl;
     return 1;
   }
-  Q_whitened = qb_res.value();
+  Q_whitened = std::move(qb_res.value());
   if (config.use_cosine) {
-    NormalizeRowsL2(&X_whitened);
     NormalizeRowsL2(&Q_whitened);
     std::cout << "[INFO] Cosine mode enabled: normalized whitened base/query rows"
               << std::endl;
@@ -1657,19 +1883,34 @@ int main(int argc, char** argv) {
 
   std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
   std::iota(main_ids.begin(), main_ids.end(), 0);
-  MatrixRM main_train = X_whitened.topRows(main_rows_initial);
-  auto main_version_res = main_ivf->Build(main_train, main_ids, ivf_params, 0);
+  Timer init_build_timer;
+  auto main_version_res = main_ivf->Build(X_whitened.topRows(main_rows_initial),
+                                          main_ids,
+                                          ivf_params,
+                                          0);
   if (!main_version_res.ok()) {
     std::cerr << main_version_res.status().ToString() << std::endl;
     return 1;
   }
+  const double init_main_build_ms = init_build_timer.ElapsedMillis();
   main_versions = VersionSet{whiten_version, main_version_res.value()};
+  Timer init_add_timer;
   Status add_main =
       AddRangeToIndex(main_ivf, X_whitened, 0, main_rows_initial, config.dim, main_versions);
   if (!add_main.ok()) {
     std::cerr << add_main.ToString() << std::endl;
     return 1;
   }
+  const double init_main_add_ms = init_add_timer.ElapsedMillis();
+  const double init_rebuild_ms = init_whitening_ms + init_whitening_transform_ms +
+                                 init_main_build_ms + init_main_add_ms;
+  const double init_total_wall_ms = init_total_timer.ElapsedMillis();
+  std::cout << "[INIT BUILD] whitening_ms=" << init_whitening_ms
+            << ", whitening_transform_ms=" << init_whitening_transform_ms
+            << ", main_build_ms=" << init_main_build_ms
+            << ", main_add_ms=" << init_main_add_ms
+            << ", aligned_ms=" << init_rebuild_ms
+            << ", wall_ms=" << init_total_wall_ms << std::endl;
   std::optional<DeltaShard> active_delta;
   std::optional<DeltaShard> frozen_delta;
   std::deque<DocId> sliding_window_doc_ids;
@@ -1687,7 +1928,7 @@ int main(int argc, char** argv) {
   merge_options.assignment_lambda = config.merge_assignment_lambda;
   if (config.enable_streaming && rows_after_main > 0) {
     // Train delta with the reserved window, then preload the same window as existing delta docs.
-    MatrixRM delta_train = X_whitened.middleRows(main_rows_initial, delta_train_rows);
+    auto delta_train = X_whitened.middleRows(main_rows_initial, delta_train_rows);
     IVFParams delta_params = ivf_params;
     delta_params.nlist = std::max(1u, delta_ivf_nlist);
     delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
@@ -1710,27 +1951,27 @@ int main(int argc, char** argv) {
     active_delta->rows = delta_train_rows;
   }
 
-  auto ActivatePendingDeltaFromSubsequentWindow = [&](uint32_t end_row) -> Status {
+  auto ActivatePendingDeltaFromSubsequentWindow = [&](uint32_t end_row) -> Result<double> {
     if (!pending_active_train || active_delta.has_value()) {
-      return Status::OK();
+      return 0.0;
     }
     if (delta_train_rows == 0) {
       return Status::InvalidArgument(
           "ActivatePendingDeltaFromSubsequentWindow: delta_train_rows is 0");
     }
     if (end_row <= pending_active_train_begin) {
-      return Status::OK();
+      return 0.0;
     }
     const uint32_t available = end_row - pending_active_train_begin;
     if (available < delta_train_rows && end_row < nx) {
-      return Status::OK();
+      return 0.0;
     }
     const uint32_t train_rows = std::min<uint32_t>(delta_train_rows, available);
     if (train_rows == 0) {
-      return Status::OK();
+      return 0.0;
     }
     const uint32_t train_begin = pending_active_train_begin;
-    MatrixRM delta_train = X_whitened.middleRows(train_begin, train_rows);
+    auto delta_train = X_whitened.middleRows(train_begin, train_rows);
     IVFParams delta_params = ivf_params;
     delta_params.nlist = std::max(1u, delta_ivf_nlist);
     delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
@@ -1740,6 +1981,7 @@ int main(int argc, char** argv) {
       return active_res.status();
     }
     DeltaShard shard = active_res.value();
+    Timer delta_seed_insert_timer;
     const Status add_delta_seed = AddRangeToIndex(shard.ivf,
                                                   X_whitened,
                                                   train_begin,
@@ -1749,6 +1991,7 @@ int main(int argc, char** argv) {
     if (!add_delta_seed.ok()) {
       return add_delta_seed;
     }
+    const double delta_seed_insert_ms = delta_seed_insert_timer.ElapsedMillis();
     shard.rows = train_rows;
     active_delta = std::move(shard);
     pending_active_train = false;
@@ -1759,7 +2002,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "[MERGE] activate_delta shard=" << active_delta->shard_id
               << ", warmup_rows=" << train_rows << std::endl;
-    return Status::OK();
+    return delta_seed_insert_ms;
   };
 
   std::optional<MergeTriggerDecision> frozen_trigger_decision;
@@ -1802,9 +2045,27 @@ int main(int argc, char** argv) {
               << pending_active_train_begin << std::endl;
     return Status::OK();
   };
-  double rebuild_ms_total = init_timer.ElapsedMillis();
+  double rebuild_ms_total = init_rebuild_ms;
   double total_update_ms = 0.0;
+  double total_update_whitening_ms = 0.0;
+  double total_update_insert_ms = 0.0;
+  double total_update_record_build_ms = 0.0;
+  double total_update_insert_encode_ms = 0.0;
+  double total_update_insert_commit_ms = 0.0;
+  double total_update_onlinepq_maintenance_ms = 0.0;
+  double total_update_delete_ms = 0.0;
+  double total_update_codebook_update_ms = 0.0;
+  double total_update_reencode_ms = 0.0;
   double pending_update_ms = 0.0;
+  double pending_update_whitening_ms = 0.0;
+  double pending_update_insert_ms = 0.0;
+  double pending_update_record_build_ms = 0.0;
+  double pending_update_insert_encode_ms = 0.0;
+  double pending_update_insert_commit_ms = 0.0;
+  double pending_update_onlinepq_maintenance_ms = 0.0;
+  double pending_update_delete_ms = 0.0;
+  double pending_update_codebook_update_ms = 0.0;
+  double pending_update_reencode_ms = 0.0;
   double total_merge_compute_ms = 0.0;
   double pending_merge_compute_ms = 0.0;
   double total_global_rebuild_ms = 0.0;
@@ -2074,28 +2335,33 @@ int main(int argc, char** argv) {
     const double whitening_ms = fit_timer.ElapsedMillis();
 
     Timer transform_timer;
-    auto xb_res = whitening->TransformBatch(X, new_whiten_version);
+    auto xb_res = whitening->TransformBatch(X.topRows(seen_rows), new_whiten_version);
     if (!xb_res.ok()) {
       return xb_res.status();
     }
+    MatrixRM new_x_whitened = std::move(xb_res.value());
+    if (config.use_cosine) {
+      NormalizeRowsL2(&new_x_whitened);
+    }
+    const double whitening_transform_ms = transform_timer.ElapsedMillis();
+
     auto qb_res = whitening->TransformBatch(Q, new_whiten_version);
     if (!qb_res.ok()) {
       return qb_res.status();
     }
-    MatrixRM new_x_whitened = xb_res.value();
-    MatrixRM new_q_whitened = qb_res.value();
+    MatrixRM new_q_whitened = std::move(qb_res.value());
     if (config.use_cosine) {
-      NormalizeRowsL2(&new_x_whitened);
       NormalizeRowsL2(&new_q_whitened);
     }
-    const double whitening_transform_ms = transform_timer.ElapsedMillis();
 
     auto new_main_ivf = CreateIVFIndex();
     std::vector<DocId> main_ids(static_cast<size_t>(rebuild_main_rows));
     std::iota(main_ids.begin(), main_ids.end(), 0);
-    MatrixRM main_train = new_x_whitened.topRows(rebuild_main_rows);
     Timer build_timer;
-    auto new_main_version_res = new_main_ivf->Build(main_train, main_ids, ivf_params, 0);
+    auto new_main_version_res = new_main_ivf->Build(new_x_whitened.topRows(rebuild_main_rows),
+                                                    main_ids,
+                                                    ivf_params,
+                                                    0);
     if (!new_main_version_res.ok()) {
       return new_main_version_res.status();
     }
@@ -2118,7 +2384,7 @@ int main(int argc, char** argv) {
     if (config.enable_streaming && rows_after_main > 0) {
       if (active_seed_rows > 0) {
         Timer delta_timer;
-        MatrixRM delta_train = new_x_whitened.middleRows(active_seed_begin, active_seed_rows);
+        auto delta_train = new_x_whitened.middleRows(active_seed_begin, active_seed_rows);
         IVFParams delta_params = ivf_params;
         delta_params.nlist = std::max(1u, delta_ivf_nlist);
         delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
@@ -2163,7 +2429,8 @@ int main(int argc, char** argv) {
     sliding_window_doc_ids = std::move(rebuilt_sliding_window_doc_ids);
     last_online_pq_stats = OnlinePQUpdateStats{};
 
-    const double total_ms = total_timer.ElapsedMillis();
+    const double wall_total_ms = total_timer.ElapsedMillis();
+    const double total_ms = whitening_ms + whitening_transform_ms + main_build_ms + main_add_ms;
     rebuild_ms_total += total_ms;
     total_global_rebuild_ms += total_ms;
     pending_global_rebuild_ms += total_ms;
@@ -2195,6 +2462,7 @@ int main(int argc, char** argv) {
     event.main_add_ms = main_add_ms;
     event.delta_seed_ms = delta_seed_ms;
     event.total_ms = total_ms;
+    event.wall_total_ms = wall_total_ms;
     event.reason = trigger.reason;
     global_rebuild_events.push_back(event);
 
@@ -2213,11 +2481,40 @@ int main(int argc, char** argv) {
               << ", main_build_ms=" << main_build_ms
               << ", main_add_ms=" << main_add_ms
               << ", delta_seed_ms=" << delta_seed_ms
-              << ", total_ms=" << total_ms << std::endl;
+              << ", total_ms=" << total_ms
+              << ", wall_total_ms=" << wall_total_ms << std::endl;
     return Status::OK();
   };
 
-  std::filesystem::path results_dir = std::filesystem::path("result") / dataset_label;
+  std::string config_name = std::filesystem::path(config_path).stem().string();
+
+  std::string dataset_name = dataset_label;
+  std::string metric_name = "default";
+  
+  if (base_dataset_path) {
+    std::filesystem::path p(*base_dataset_path);
+    std::vector<std::string> parts;
+    for (const auto& part : p) {
+      parts.push_back(part.string());
+    }
+  
+    for (size_t i = 0; i < parts.size(); ++i) {
+      if (parts[i] == "data" && i + 2 < parts.size()) {
+        dataset_name = parts[i + 1];
+  
+        std::string metric;
+        for (size_t j = i + 2; j + 1 < parts.size(); ++j) {
+          if (!metric.empty()) metric += "_";
+          metric += parts[j];
+        }
+        if (!metric.empty()) metric_name = metric;
+        break;
+      }
+    }
+  }
+  
+  std::filesystem::path results_dir =
+      std::filesystem::path("result") / dataset_name / metric_name / config_name;
   std::error_code ec;
   std::filesystem::create_directories(results_dir, ec);
   const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
@@ -2236,10 +2533,18 @@ int main(int argc, char** argv) {
   uint32_t inserted_rows = 0;
 
   uint64_t eval_seq = 0;
-  auto evaluate_rows = [&](uint32_t active_rows, const char* stage) -> Result<EvalMetrics> {
+  uint32_t last_insert_begin = stream_start_idx;
+  uint32_t last_insert_end = stream_start_idx;
+
+  auto evaluate_rows = [&](uint32_t active_rows,
+                           const char* stage,
+                           uint32_t new_begin,
+                           uint32_t new_end) -> Result<EvalMetrics> {
     auto res = EvaluateState(config,
                              X_whitened,
                              active_rows,
+                             new_begin,
+                             new_end,
                              main_rows_current,
                              Q,
                              Q_whitened,
@@ -2265,6 +2570,15 @@ int main(int argc, char** argv) {
   auto write_snapshot = [&](uint32_t active_rows,
                             const EvalMetrics& metrics,
                             double update_ms,
+                            double update_whitening_ms,
+                            double update_insert_ms,
+                            double update_record_build_ms,
+                            double update_insert_encode_ms,
+                            double update_insert_commit_ms,
+                            double update_onlinepq_maintenance_ms,
+                            double update_delete_ms,
+                            double update_codebook_update_ms,
+                            double update_reencode_ms,
                             const OnlinePQUpdateStats& pq_stats,
                             bool active_window_ready,
                             bool will_commit_merge,
@@ -2280,12 +2594,28 @@ int main(int argc, char** argv) {
     snap.active_delta_docs = active_delta.has_value() ? active_delta->rows : 0;
     snap.snapshot_rows = active_rows >= last_snapshot_active_rows ? active_rows - last_snapshot_active_rows : 0;
     snap.recall = metrics.recall;
+    snap.recall_new = metrics.recall_new;
+    snap.recall_old = metrics.recall_old;
+    snap.gt_new_ratio = metrics.gt_new_ratio;
+    snap.gt_new_total = metrics.gt_new_total;
+    snap.gt_old_total = metrics.gt_old_total;
+    snap.hit_new_total = metrics.hit_new_total;
+    snap.hit_old_total = metrics.hit_old_total;
     snap.latency_ms = metrics.avg_query_ms;
     snap.end_to_end_overhead_ms = metrics.end_to_end_overhead_ms;
     snap.avg_search_ms = metrics.avg_search_ms;
     snap.avg_scanned = metrics.scanned_avg;
     snap.query_qps = metrics.query_qps;
     snap.update_ms = update_ms;
+    snap.update_whitening_ms = update_whitening_ms;
+    snap.update_insert_ms = update_insert_ms;
+    snap.update_record_build_ms = update_record_build_ms;
+    snap.update_insert_encode_ms = update_insert_encode_ms;
+    snap.update_insert_commit_ms = update_insert_commit_ms;
+    snap.update_onlinepq_maintenance_ms = update_onlinepq_maintenance_ms;
+    snap.update_delete_ms = update_delete_ms;
+    snap.update_codebook_update_ms = update_codebook_update_ms;
+    snap.update_reencode_ms = update_reencode_ms;
     snap.query_eval_ms = metrics.query_eval_ms;
     snap.merge_compute_ms = pending_merge_compute_ms;
     snap.global_rebuild_ms = pending_global_rebuild_ms;
@@ -2365,7 +2695,7 @@ int main(int argc, char** argv) {
   };
 
   if (config.enable_streaming && rows_after_main > 0) {
-    auto pre_res = evaluate_rows(stream_start_idx, "pre_stream");
+    auto pre_res = evaluate_rows(stream_start_idx, "pre_stream", stream_start_idx, stream_start_idx);
     if (!pre_res.ok()) {
       std::cerr << pre_res.status().ToString() << std::endl;
       return 1;
@@ -2374,6 +2704,15 @@ int main(int argc, char** argv) {
     if (collect_snapshots) {
       const Status ws = write_snapshot(stream_start_idx,
                                        pre_stream_metrics.value(),
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
+                                       0.0,
                                        0.0,
                                        last_online_pq_stats,
                                        false,
@@ -2393,10 +2732,16 @@ int main(int argc, char** argv) {
     std::vector<MinibatchRecord> snapshot_minibatches;
 
     while (next_insert_idx < nx) {
-      Status activate_status = ActivatePendingDeltaFromSubsequentWindow(next_insert_idx);
+      auto activate_status = ActivatePendingDeltaFromSubsequentWindow(next_insert_idx);
       if (!activate_status.ok()) {
-        std::cerr << activate_status.ToString() << std::endl;
+        std::cerr << activate_status.status().ToString() << std::endl;
         return 1;
+      }
+      if (activate_status.value() > 0.0) {
+        total_update_ms += activate_status.value();
+        total_update_insert_ms += activate_status.value();
+        pending_update_ms += activate_status.value();
+        pending_update_insert_ms += activate_status.value();
       }
       if (!frozen_delta.has_value() && active_delta.has_value()) {
         auto trigger_res = EvaluateMergeTriggerDecision(active_delta.value(), last_online_pq_stats);
@@ -2423,7 +2768,21 @@ int main(int argc, char** argv) {
       const uint32_t begin = next_insert_idx;
       const uint32_t end = begin + chunk;
 
-      Timer update_timer;
+      Timer whitening_timer;
+      auto chunk_whiten_res = whitening->TransformBatch(X.middleRows(begin, chunk), whiten_version);
+      if (!chunk_whiten_res.ok()) {
+        std::cerr << chunk_whiten_res.status().ToString() << std::endl;
+        return 1;
+      }
+      MatrixRM chunk_whitened = std::move(chunk_whiten_res.value());
+      if (config.use_cosine) {
+        NormalizeRowsL2(&chunk_whitened);
+      }
+      EnsureWhitenedCapacity(&X_whitened, end, nx, config.dim);
+      X_whitened.middleRows(begin, chunk) = chunk_whitened;
+      const double step_whitening_ms = whitening_timer.ElapsedMillis();
+
+      last_online_pq_stats = OnlinePQUpdateStats{};
       if (active_delta.has_value()) {
         std::vector<DocId> delete_doc_ids;
         if (use_sliding_window) {
@@ -2500,17 +2859,44 @@ int main(int argc, char** argv) {
           active_delta->rows += chunk;
         }
       }
-      const double step_update_ms = update_timer.ElapsedMillis();
+      const double step_insert_ms = last_online_pq_stats.insert_ms;
+      const double step_update_ms = step_whitening_ms + step_insert_ms;
 
       next_insert_idx = end;
+      last_insert_begin = begin;
+      last_insert_end = end;
       inserted_rows = next_insert_idx - stream_start_idx;
       total_update_ms += step_update_ms;
+      total_update_whitening_ms += step_whitening_ms;
+      total_update_insert_ms += step_insert_ms;
+      total_update_record_build_ms += last_online_pq_stats.record_build_ms;
+      total_update_insert_encode_ms += last_online_pq_stats.insert_encode_ms;
+      total_update_insert_commit_ms += last_online_pq_stats.insert_commit_ms;
+      total_update_onlinepq_maintenance_ms += last_online_pq_stats.maintenance_ms;
+      total_update_delete_ms += last_online_pq_stats.delete_ms;
+      total_update_codebook_update_ms += last_online_pq_stats.codebook_update_ms;
+      total_update_reencode_ms += last_online_pq_stats.reencode_ms;
       pending_update_ms += step_update_ms;
+      pending_update_whitening_ms += step_whitening_ms;
+      pending_update_insert_ms += step_insert_ms;
+      pending_update_record_build_ms += last_online_pq_stats.record_build_ms;
+      pending_update_insert_encode_ms += last_online_pq_stats.insert_encode_ms;
+      pending_update_insert_commit_ms += last_online_pq_stats.insert_commit_ms;
+      pending_update_onlinepq_maintenance_ms += last_online_pq_stats.maintenance_ms;
+      pending_update_delete_ms += last_online_pq_stats.delete_ms;
+      pending_update_codebook_update_ms += last_online_pq_stats.codebook_update_ms;
+      pending_update_reencode_ms += last_online_pq_stats.reencode_ms;
 
       activate_status = ActivatePendingDeltaFromSubsequentWindow(next_insert_idx);
       if (!activate_status.ok()) {
-        std::cerr << activate_status.ToString() << std::endl;
+        std::cerr << activate_status.status().ToString() << std::endl;
         return 1;
+      }
+      if (activate_status.value() > 0.0) {
+        total_update_ms += activate_status.value();
+        total_update_insert_ms += activate_status.value();
+        pending_update_ms += activate_status.value();
+        pending_update_insert_ms += activate_status.value();
       }
 
       bool can_start_merge = false;
@@ -2537,7 +2923,7 @@ int main(int argc, char** argv) {
 
       std::optional<EvalMetrics> batch_metrics;
       if (eval_after_each_minibatch) {
-        auto mres = evaluate_rows(next_insert_idx, "minibatch");
+        auto mres = evaluate_rows(next_insert_idx, "minibatch", begin, end);
         if (!mres.ok()) {
           std::cerr << mres.status().ToString() << std::endl;
           return 1;
@@ -2552,12 +2938,28 @@ int main(int argc, char** argv) {
         minibatch.snapshot_rows_total =
             next_insert_idx >= last_snapshot_active_rows ? next_insert_idx - last_snapshot_active_rows : 0;
         minibatch.recall = batch_metrics->recall;
+        minibatch.recall_new = batch_metrics->recall_new;
+        minibatch.recall_old = batch_metrics->recall_old;
+        minibatch.gt_new_ratio = batch_metrics->gt_new_ratio;
+        minibatch.gt_new_total = batch_metrics->gt_new_total;
+        minibatch.gt_old_total = batch_metrics->gt_old_total;
+        minibatch.hit_new_total = batch_metrics->hit_new_total;
+        minibatch.hit_old_total = batch_metrics->hit_old_total;
         minibatch.latency_ms = batch_metrics->avg_query_ms;
         minibatch.end_to_end_overhead_ms = batch_metrics->end_to_end_overhead_ms;
         minibatch.avg_search_ms = batch_metrics->avg_search_ms;
         minibatch.avg_scanned = batch_metrics->scanned_avg;
         minibatch.query_qps = batch_metrics->query_qps;
         minibatch.update_ms = step_update_ms;
+        minibatch.update_whitening_ms = step_whitening_ms;
+        minibatch.update_insert_ms = step_insert_ms;
+        minibatch.update_record_build_ms = last_online_pq_stats.record_build_ms;
+        minibatch.update_insert_encode_ms = last_online_pq_stats.insert_encode_ms;
+        minibatch.update_insert_commit_ms = last_online_pq_stats.insert_commit_ms;
+        minibatch.update_onlinepq_maintenance_ms = last_online_pq_stats.maintenance_ms;
+        minibatch.update_delete_ms = last_online_pq_stats.delete_ms;
+        minibatch.update_codebook_update_ms = last_online_pq_stats.codebook_update_ms;
+        minibatch.update_reencode_ms = last_online_pq_stats.reencode_ms;
         minibatch.update_throughput_vecps =
             (chunk > 0 && step_update_ms > 0.0)
                 ? (static_cast<double>(chunk) / (step_update_ms / 1000.0))
@@ -2726,7 +3128,7 @@ int main(int argc, char** argv) {
         if (batch_metrics.has_value() && !snapshot_state_changed) {
           snapshot_metrics = batch_metrics.value();
         } else {
-          auto sres = evaluate_rows(next_insert_idx, "snapshot");
+          auto sres = evaluate_rows(next_insert_idx, "snapshot", last_insert_begin, last_insert_end);
           if (!sres.ok()) {
             std::cerr << sres.status().ToString() << std::endl;
             return 1;
@@ -2736,6 +3138,15 @@ int main(int argc, char** argv) {
         const Status ws = write_snapshot(next_insert_idx,
                                          snapshot_metrics,
                                          pending_update_ms,
+                                         pending_update_whitening_ms,
+                                         pending_update_insert_ms,
+                                         pending_update_record_build_ms,
+                                         pending_update_insert_encode_ms,
+                                         pending_update_insert_commit_ms,
+                                         pending_update_onlinepq_maintenance_ms,
+                                         pending_update_delete_ms,
+                                         pending_update_codebook_update_ms,
+                                         pending_update_reencode_ms,
                                          last_online_pq_stats,
                                          active_window_ready,
                                          should_commit_merge,
@@ -2748,13 +3159,22 @@ int main(int argc, char** argv) {
         }
         snapshot_minibatches.clear();
         pending_update_ms = 0.0;
+        pending_update_whitening_ms = 0.0;
+        pending_update_insert_ms = 0.0;
+        pending_update_record_build_ms = 0.0;
+        pending_update_insert_encode_ms = 0.0;
+        pending_update_insert_commit_ms = 0.0;
+        pending_update_onlinepq_maintenance_ms = 0.0;
+        pending_update_delete_ms = 0.0;
+        pending_update_codebook_update_ms = 0.0;
+        pending_update_reencode_ms = 0.0;
         pending_merge_compute_ms = 0.0;
         pending_global_rebuild_ms = 0.0;
       }
     }
   }
 
-  auto final_res = evaluate_rows(next_insert_idx, "final");
+  auto final_res = evaluate_rows(next_insert_idx, "final", last_insert_begin, last_insert_end);
   if (!final_res.ok()) {
     std::cerr << final_res.status().ToString() << std::endl;
     return 1;
@@ -2856,6 +3276,73 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+
+  std::vector<double> recall_values;
+  std::vector<double> qps_values;
+  std::vector<double> latency_values;
+  std::vector<double> e2e_latency_values;
+  std::vector<double> update_throughput_values;
+  std::vector<double> amortized_update_throughput_values;
+  for (const auto& snap : snapshots) {
+    recall_values.push_back(snap.recall);
+    qps_values.push_back(snap.query_qps);
+    latency_values.push_back(snap.latency_ms);
+    e2e_latency_values.push_back(snap.end_to_end_overhead_ms);
+    if (snap.update_throughput_vecps > 0.0) {
+      update_throughput_values.push_back(snap.update_throughput_vecps);
+    }
+    if (snap.amortized_update_throughput_vecps > 0.0) {
+      amortized_update_throughput_values.push_back(snap.amortized_update_throughput_vecps);
+    }
+  }
+  if (recall_values.empty()) {
+    recall_values.push_back(final_metrics.recall);
+    qps_values.push_back(final_metrics.query_qps);
+    latency_values.push_back(final_metrics.avg_query_ms);
+    e2e_latency_values.push_back(final_metrics.end_to_end_overhead_ms);
+    if (final_metrics.update_throughput_vecps > 0.0) {
+      update_throughput_values.push_back(final_metrics.update_throughput_vecps);
+      amortized_update_throughput_values.push_back(final_metrics.update_throughput_vecps);
+    }
+  }
+  const auto recall_summary = SummarizeSeries(recall_values);
+  const auto qps_summary = SummarizeSeries(qps_values);
+  const auto latency_summary = SummarizeSeries(latency_values);
+  const auto e2e_latency_summary = SummarizeSeries(e2e_latency_values);
+  const auto update_throughput_summary = SummarizeSeries(update_throughput_values);
+  const auto amortized_update_throughput_summary =
+      SummarizeSeries(amortized_update_throughput_values);
+  const double total_maintenance_ms =
+      total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
+
+  uint64_t summary_gt_new_total = 0;
+  uint64_t summary_gt_old_total = 0;
+  uint64_t summary_hit_new_total = 0;
+  uint64_t summary_hit_old_total = 0;
+  if (!snapshots.empty()) {
+    for (const auto& snap : snapshots) {
+      summary_gt_new_total += snap.gt_new_total;
+      summary_gt_old_total += snap.gt_old_total;
+      summary_hit_new_total += snap.hit_new_total;
+      summary_hit_old_total += snap.hit_old_total;
+    }
+  } else {
+    summary_gt_new_total = final_metrics.gt_new_total;
+    summary_gt_old_total = final_metrics.gt_old_total;
+    summary_hit_new_total = final_metrics.hit_new_total;
+    summary_hit_old_total = final_metrics.hit_old_total;
+  }
+  const uint64_t summary_gt_total = summary_gt_new_total + summary_gt_old_total;
+  const double summary_recall_new = summary_gt_new_total > 0
+      ? static_cast<double>(summary_hit_new_total) / static_cast<double>(summary_gt_new_total)
+      : 0.0;
+  const double summary_recall_old = summary_gt_old_total > 0
+      ? static_cast<double>(summary_hit_old_total) / static_cast<double>(summary_gt_old_total)
+      : 0.0;
+  const double summary_gt_new_ratio = summary_gt_total > 0
+      ? static_cast<double>(summary_gt_new_total) / static_cast<double>(summary_gt_total)
+      : 0.0;
+
   const bool debug_output_enabled =
       config.enable_miss_diag || config.enable_rerank_source_diag || config.enable_latency_debug;
   if (!debug_output_enabled) {
@@ -2866,6 +3353,7 @@ int main(int argc, char** argv) {
     ofs << "    \"topk\": " << config.topk << ",\n";
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+    ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
     ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
     ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
         << ",\n";
@@ -2880,13 +3368,71 @@ int main(int argc, char** argv) {
     ofs << "  },\n";
     ofs << "  \"metrics\": {\n";
     ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
+    ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
+    ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
+    ofs << "    \"gt_new_ratio\": " << final_metrics.gt_new_ratio << ",\n";
+    ofs << "    \"gt_new_total\": " << final_metrics.gt_new_total << ",\n";
+    ofs << "    \"gt_old_total\": " << final_metrics.gt_old_total << ",\n";
+    ofs << "    \"hit_new_total\": " << final_metrics.hit_new_total << ",\n";
+    ofs << "    \"hit_old_total\": " << final_metrics.hit_old_total << ",\n";
     ofs << "    \"latency_ms\": " << final_metrics.avg_query_ms << ",\n";
     ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
     ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
     ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
+    ofs << "    \"update_whitening_ms\": " << total_update_whitening_ms << ",\n";
+    ofs << "    \"update_insert_ms\": " << total_update_insert_ms << ",\n";
+    ofs << "    \"update_record_build_ms\": " << total_update_record_build_ms << ",\n";
+    ofs << "    \"update_insert_encode_ms\": " << total_update_insert_encode_ms << ",\n";
+    ofs << "    \"update_insert_commit_ms\": " << total_update_insert_commit_ms << ",\n";
+    ofs << "    \"update_onlinepq_maintenance_ms\": " << total_update_onlinepq_maintenance_ms << ",\n";
+    ofs << "    \"update_delete_ms\": " << total_update_delete_ms << ",\n";
+    ofs << "    \"update_codebook_update_ms\": " << total_update_codebook_update_ms << ",\n";
+    ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
     ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
     ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
+    ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
+    ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
+    ofs << "    \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
     ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
+    ofs << "  },\n";
+    ofs << "  \"summary\": {\n";
+    ofs << "    \"recall_avg\": " << recall_summary.avg << ",\n";
+    ofs << "    \"recall_p5\": " << recall_summary.p5 << ",\n";
+    ofs << "    \"recall_min\": " << recall_summary.min << ",\n";
+    ofs << "    \"recall_final\": " << final_metrics.recall << ",\n";
+    ofs << "    \"recall_new\": " << summary_recall_new << ",\n";
+    ofs << "    \"recall_old\": " << summary_recall_old << ",\n";
+    ofs << "    \"gt_new_ratio\": " << summary_gt_new_ratio << ",\n";
+    ofs << "    \"gt_new_total\": " << summary_gt_new_total << ",\n";
+    ofs << "    \"gt_old_total\": " << summary_gt_old_total << ",\n";
+    ofs << "    \"hit_new_total\": " << summary_hit_new_total << ",\n";
+    ofs << "    \"hit_old_total\": " << summary_hit_old_total << ",\n";
+    ofs << "    \"qps_avg\": " << qps_summary.avg << ",\n";
+    ofs << "    \"qps_p5\": " << qps_summary.p5 << ",\n";
+    ofs << "    \"latency_avg_ms\": " << latency_summary.avg << ",\n";
+    ofs << "    \"latency_p95_ms\": " << latency_summary.p95 << ",\n";
+    ofs << "    \"latency_p99_ms\": " << latency_summary.p99 << ",\n";
+    ofs << "    \"e2e_latency_avg_ms\": " << e2e_latency_summary.avg << ",\n";
+    ofs << "    \"update_throughput_avg_vecps\": "
+        << update_throughput_summary.avg << ",\n";
+    ofs << "    \"amortized_update_throughput_avg_vecps\": "
+        << amortized_update_throughput_summary.avg << ",\n";
+    ofs << "    \"merge_count\": " << merge_events.size() << ",\n";
+    ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
+    ofs << "    \"merge_nodes\": [";
+    for (size_t ni = 0; ni < merge_events.size(); ++ni) {
+      ofs << merge_events[ni].base_rows;
+      if (ni + 1 < merge_events.size()) ofs << ", ";
+    }
+    ofs << "],\n";
+    ofs << "    \"global_rebuild_nodes\": [";
+    for (size_t ni = 0; ni < global_rebuild_events.size(); ++ni) {
+      ofs << global_rebuild_events[ni].base_rows;
+      if (ni + 1 < global_rebuild_events.size()) ofs << ", ";
+    }
+    ofs << "],\n";
+    ofs << "    \"process_rss_bytes\": " << ReadProcStatusBytes("VmRSS:") << ",\n";
+    ofs << "    \"process_peak_rss_bytes\": " << ReadProcStatusBytes("VmHWM:") << "\n";
     ofs << "  },\n";
     ofs << "  \"route_execution\": {\n";
     ofs << "    \"main_queries\": " << final_metrics.main_route_queries << ",\n";
@@ -2916,10 +3462,28 @@ int main(int argc, char** argv) {
       ofs << "    {\n";
       ofs << "      \"snapshot_size\": " << snap.base_rows << ",\n";
       ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
+      ofs << "      \"recall_new\": " << snap.recall_new << ",\n";
+      ofs << "      \"recall_old\": " << snap.recall_old << ",\n";
+      ofs << "      \"gt_new_ratio\": " << snap.gt_new_ratio << ",\n";
+      ofs << "      \"gt_new_total\": " << snap.gt_new_total << ",\n";
+      ofs << "      \"gt_old_total\": " << snap.gt_old_total << ",\n";
+      ofs << "      \"hit_new_total\": " << snap.hit_new_total << ",\n";
+      ofs << "      \"hit_old_total\": " << snap.hit_old_total << ",\n";
       ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
       ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
       ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
       ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+      ofs << "      \"update_whitening_ms\": " << snap.update_whitening_ms << ",\n";
+      ofs << "      \"update_insert_ms\": " << snap.update_insert_ms << ",\n";
+      ofs << "      \"update_record_build_ms\": " << snap.update_record_build_ms << ",\n";
+      ofs << "      \"update_insert_encode_ms\": " << snap.update_insert_encode_ms << ",\n";
+      ofs << "      \"update_insert_commit_ms\": " << snap.update_insert_commit_ms << ",\n";
+      ofs << "      \"update_onlinepq_maintenance_ms\": "
+          << snap.update_onlinepq_maintenance_ms << ",\n";
+      ofs << "      \"update_delete_ms\": " << snap.update_delete_ms << ",\n";
+      ofs << "      \"update_codebook_update_ms\": "
+          << snap.update_codebook_update_ms << ",\n";
+      ofs << "      \"update_reencode_ms\": " << snap.update_reencode_ms << ",\n";
       ofs << "      \"merge_compute_ms\": " << snap.merge_compute_ms << ",\n";
       ofs << "      \"global_rebuild_ms\": " << snap.global_rebuild_ms << ",\n";
       ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
@@ -2946,6 +3510,7 @@ int main(int argc, char** argv) {
   ofs << "    \"topk\": " << config.topk << ",\n";
   ofs << "    \"nprobe\": " << params.nprobe << ",\n";
   ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
+  ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
   ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
   ofs << "    \"main_query_only\": " << (config.main_query_only ? "true" : "false") << ",\n";
   ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
@@ -3036,10 +3601,32 @@ int main(int argc, char** argv) {
   ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
   ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
   ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
+  ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
+  ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
+  ofs << "    \"gt_new_ratio\": " << final_metrics.gt_new_ratio << ",\n";
+  ofs << "    \"gt_new_total\": " << final_metrics.gt_new_total << ",\n";
+  ofs << "    \"gt_old_total\": " << final_metrics.gt_old_total << ",\n";
+  ofs << "    \"hit_new_total\": " << final_metrics.hit_new_total << ",\n";
+  ofs << "    \"hit_old_total\": " << final_metrics.hit_old_total << ",\n";
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
+  ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
+  ofs << "    \"initial_whitening_ms\": " << init_whitening_ms << ",\n";
+  ofs << "    \"initial_whitening_transform_ms\": " << init_whitening_transform_ms << ",\n";
+  ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
+  ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
+  ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
   ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
   ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
+  ofs << "    \"update_whitening_ms\": " << total_update_whitening_ms << ",\n";
+  ofs << "    \"update_insert_ms\": " << total_update_insert_ms << ",\n";
+  ofs << "    \"update_record_build_ms\": " << total_update_record_build_ms << ",\n";
+  ofs << "    \"update_insert_encode_ms\": " << total_update_insert_encode_ms << ",\n";
+  ofs << "    \"update_insert_commit_ms\": " << total_update_insert_commit_ms << ",\n";
+  ofs << "    \"update_onlinepq_maintenance_ms\": " << total_update_onlinepq_maintenance_ms << ",\n";
+  ofs << "    \"update_delete_ms\": " << total_update_delete_ms << ",\n";
+  ofs << "    \"update_codebook_update_ms\": " << total_update_codebook_update_ms << ",\n";
+  ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
   ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
   ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
@@ -3059,6 +3646,46 @@ int main(int argc, char** argv) {
   ofs << "    \"rerank_topk_delta_ratio\": " << final_metrics.rerank_topk_delta_ratio << ",\n";
   ofs << "    \"rerank_topk_main_avg\": " << final_metrics.rerank_topk_main_avg << ",\n";
   ofs << "    \"rerank_topk_delta_avg\": " << final_metrics.rerank_topk_delta_avg << "\n";
+  ofs << "  },\n";
+  ofs << "  \"summary\": {\n";
+  ofs << "    \"recall_avg\": " << recall_summary.avg << ",\n";
+  ofs << "    \"recall_p5\": " << recall_summary.p5 << ",\n";
+  ofs << "    \"recall_min\": " << recall_summary.min << ",\n";
+  ofs << "    \"recall_final\": " << final_metrics.recall << ",\n";
+  ofs << "    \"recall_new\": " << summary_recall_new << ",\n";
+  ofs << "    \"recall_old\": " << summary_recall_old << ",\n";
+  ofs << "    \"gt_new_ratio\": " << summary_gt_new_ratio << ",\n";
+  ofs << "    \"gt_new_total\": " << summary_gt_new_total << ",\n";
+  ofs << "    \"gt_old_total\": " << summary_gt_old_total << ",\n";
+  ofs << "    \"hit_new_total\": " << summary_hit_new_total << ",\n";
+  ofs << "    \"hit_old_total\": " << summary_hit_old_total << ",\n";
+  ofs << "    \"qps_avg\": " << qps_summary.avg << ",\n";
+  ofs << "    \"qps_p5\": " << qps_summary.p5 << ",\n";
+  ofs << "    \"latency_avg_ms\": " << latency_summary.avg << ",\n";
+  ofs << "    \"latency_p95_ms\": " << latency_summary.p95 << ",\n";
+  ofs << "    \"latency_p99_ms\": " << latency_summary.p99 << ",\n";
+  ofs << "    \"e2e_latency_avg_ms\": " << e2e_latency_summary.avg << ",\n";
+  ofs << "    \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
+  ofs << "    \"update_throughput_avg_vecps\": "
+      << update_throughput_summary.avg << ",\n";
+  ofs << "    \"amortized_update_throughput_avg_vecps\": "
+      << amortized_update_throughput_summary.avg << ",\n";
+  ofs << "    \"merge_count\": " << merge_events.size() << ",\n";
+  ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
+  ofs << "    \"merge_nodes\": [";
+  for (size_t ni = 0; ni < merge_events.size(); ++ni) {
+    ofs << merge_events[ni].base_rows;
+    if (ni + 1 < merge_events.size()) ofs << ", ";
+  }
+  ofs << "],\n";
+  ofs << "    \"global_rebuild_nodes\": [";
+  for (size_t ni = 0; ni < global_rebuild_events.size(); ++ni) {
+    ofs << global_rebuild_events[ni].base_rows;
+    if (ni + 1 < global_rebuild_events.size()) ofs << ", ";
+  }
+  ofs << "],\n";
+  ofs << "    \"process_rss_bytes\": " << ReadProcStatusBytes("VmRSS:") << ",\n";
+  ofs << "    \"process_peak_rss_bytes\": " << ReadProcStatusBytes("VmHWM:") << "\n";
   ofs << "  },\n";
   ofs << "  \"route_execution\": {\n";
   ofs << "    \"main_queries\": " << final_metrics.main_route_queries << ",\n";
@@ -3209,7 +3836,8 @@ int main(int argc, char** argv) {
     ofs << "      \"main_build_ms\": " << ev.main_build_ms << ",\n";
     ofs << "      \"main_add_ms\": " << ev.main_add_ms << ",\n";
     ofs << "      \"delta_seed_ms\": " << ev.delta_seed_ms << ",\n";
-    ofs << "      \"total_ms\": " << ev.total_ms << "\n";
+    ofs << "      \"total_ms\": " << ev.total_ms << ",\n";
+    ofs << "      \"wall_total_ms\": " << ev.wall_total_ms << "\n";
     ofs << "    }";
     if (i + 1 < global_rebuild_events.size()) {
       ofs << ",";
@@ -3228,12 +3856,30 @@ int main(int argc, char** argv) {
     ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
     ofs << "      \"snapshot_rows\": " << snap.snapshot_rows << ",\n";
     ofs << "      \"recall\": " << snap.recall << ",\n";
+    ofs << "      \"recall_new\": " << snap.recall_new << ",\n";
+    ofs << "      \"recall_old\": " << snap.recall_old << ",\n";
+    ofs << "      \"gt_new_ratio\": " << snap.gt_new_ratio << ",\n";
+    ofs << "      \"gt_new_total\": " << snap.gt_new_total << ",\n";
+    ofs << "      \"gt_old_total\": " << snap.gt_old_total << ",\n";
+    ofs << "      \"hit_new_total\": " << snap.hit_new_total << ",\n";
+    ofs << "      \"hit_old_total\": " << snap.hit_old_total << ",\n";
     ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
     ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
     ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
     ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
     ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
     ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
+    ofs << "      \"update_whitening_ms\": " << snap.update_whitening_ms << ",\n";
+    ofs << "      \"update_insert_ms\": " << snap.update_insert_ms << ",\n";
+    ofs << "      \"update_record_build_ms\": " << snap.update_record_build_ms << ",\n";
+    ofs << "      \"update_insert_encode_ms\": " << snap.update_insert_encode_ms << ",\n";
+    ofs << "      \"update_insert_commit_ms\": " << snap.update_insert_commit_ms << ",\n";
+    ofs << "      \"update_onlinepq_maintenance_ms\": "
+        << snap.update_onlinepq_maintenance_ms << ",\n";
+    ofs << "      \"update_delete_ms\": " << snap.update_delete_ms << ",\n";
+    ofs << "      \"update_codebook_update_ms\": "
+        << snap.update_codebook_update_ms << ",\n";
+    ofs << "      \"update_reencode_ms\": " << snap.update_reencode_ms << ",\n";
     ofs << "      \"merge_compute_ms\": " << snap.merge_compute_ms << ",\n";
     ofs << "      \"global_rebuild_ms\": " << snap.global_rebuild_ms << ",\n";
     ofs << "      \"query_eval_ms\": " << snap.query_eval_ms << ",\n";
@@ -3280,12 +3926,30 @@ int main(int argc, char** argv) {
       ofs << "          \"batch_rows\": " << mb.batch_rows << ",\n";
       ofs << "          \"snapshot_rows_total\": " << mb.snapshot_rows_total << ",\n";
       ofs << "          \"recall\": " << mb.recall << ",\n";
+      ofs << "          \"recall_new\": " << mb.recall_new << ",\n";
+      ofs << "          \"recall_old\": " << mb.recall_old << ",\n";
+      ofs << "          \"gt_new_ratio\": " << mb.gt_new_ratio << ",\n";
+      ofs << "          \"gt_new_total\": " << mb.gt_new_total << ",\n";
+      ofs << "          \"gt_old_total\": " << mb.gt_old_total << ",\n";
+      ofs << "          \"hit_new_total\": " << mb.hit_new_total << ",\n";
+      ofs << "          \"hit_old_total\": " << mb.hit_old_total << ",\n";
       ofs << "          \"latency_ms\": " << mb.latency_ms << ",\n";
       ofs << "          \"end_to_end_overhead_ms\": " << mb.end_to_end_overhead_ms << ",\n";
       ofs << "          \"avg_search_ms\": " << mb.avg_search_ms << ",\n";
       ofs << "          \"avg_scanned\": " << mb.avg_scanned << ",\n";
       ofs << "          \"query_qps\": " << mb.query_qps << ",\n";
       ofs << "          \"update_ms\": " << mb.update_ms << ",\n";
+      ofs << "          \"update_whitening_ms\": " << mb.update_whitening_ms << ",\n";
+      ofs << "          \"update_insert_ms\": " << mb.update_insert_ms << ",\n";
+      ofs << "          \"update_record_build_ms\": " << mb.update_record_build_ms << ",\n";
+      ofs << "          \"update_insert_encode_ms\": " << mb.update_insert_encode_ms << ",\n";
+      ofs << "          \"update_insert_commit_ms\": " << mb.update_insert_commit_ms << ",\n";
+      ofs << "          \"update_onlinepq_maintenance_ms\": "
+          << mb.update_onlinepq_maintenance_ms << ",\n";
+      ofs << "          \"update_delete_ms\": " << mb.update_delete_ms << ",\n";
+      ofs << "          \"update_codebook_update_ms\": "
+          << mb.update_codebook_update_ms << ",\n";
+      ofs << "          \"update_reencode_ms\": " << mb.update_reencode_ms << ",\n";
       ofs << "          \"update_throughput_vecps\": " << mb.update_throughput_vecps << ",\n";
       ofs << "          \"query_eval_ms\": " << mb.query_eval_ms << ",\n";
       ofs << "          \"nqe_batch\": " << mb.nqe_batch << ",\n";

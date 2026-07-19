@@ -29,6 +29,7 @@ struct IVFParams {
   std::vector<std::vector<uint64_t>> fixed_pq_counts;
   double fixed_pq_baseline_nqe{-1.0};
   double fixed_pq_ema_nqe{-1.0};
+  bool defer_pq_stats_to_add{false};
 };
 
 struct OnlinePQUpdateOptions {
@@ -62,6 +63,16 @@ struct OnlinePQUpdateStats {
   double nqe_baseline{0.0};
   double qe_ratio{1.0};
   double codebook_drift_l2{0.0};
+  double record_build_ms{0.0};
+  double insert_ms{0.0};
+  double insert_encode_ms{0.0};
+  double insert_entry_ms{0.0};
+  double insert_commit_ms{0.0};
+  double delete_ms{0.0};
+  double onlinepq_stats_ms{0.0};
+  double codebook_update_ms{0.0};
+  double reencode_ms{0.0};
+  double maintenance_ms{0.0};
 };
 
 struct PQRuntimeState {
@@ -94,6 +105,10 @@ class IVFIndex {
 
   // NTS: Adds vector records to the mutable shard.
   virtual Status Add(const AlignedVector<VectorRecord>& recs) = 0;
+
+  // NTS: Adds one chunk and optionally finalizes deferred initial PQ statistics.
+  virtual Status AddBatch(const AlignedVector<VectorRecord>& recs,
+                          bool finalize_deferred_stats) = 0;
 
   // NTS: Adds records and optionally applies residual OnlinePQ codebook update.
   virtual Result<OnlinePQUpdateStats> AddWithOnlinePQ(
