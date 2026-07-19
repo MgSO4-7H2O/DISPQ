@@ -23,6 +23,7 @@ add_library(ann
   src/common/dataset.cpp
   src/common/config.cpp
   src/common/serialization.cpp
+  src/common/prebuilt_index.cpp
   src/whitening/whitening.cpp
   src/index/ivf.cpp
   src/index/merge.cpp
@@ -41,6 +42,10 @@ ann_set_warnings(ann)
 add_executable(run_eval apps/run_eval.cpp)
 target_link_libraries(run_eval PRIVATE ann)
 ann_set_warnings(run_eval)
+
+add_executable(build_index apps/build_index.cpp)
+target_link_libraries(build_index PRIVATE ann)
+ann_set_warnings(build_index)
 
 add_executable(run_eval_ms apps/run_eval_ms.cpp)
 target_link_libraries(run_eval_ms PRIVATE ann)

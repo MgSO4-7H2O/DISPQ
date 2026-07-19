@@ -196,6 +196,12 @@ class ZCAWhiteningModel : public WhiteningModel {
       versions_[payload.version] = std::move(payload);
     }
     dim_ = dim;
+    VersionId max_version = 0;
+    for (const auto& kv : versions_) {
+      max_version = std::max(max_version, kv.first);
+    }
+    next_version_ = max_version + 1;
+    ResetPending();
     return Status::OK();
   }
 

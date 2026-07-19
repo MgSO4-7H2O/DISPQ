@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -28,6 +30,159 @@ constexpr double kDefaultNQEEps = 1e-6;
 constexpr size_t kPrecomputedTableMaxBytes = (static_cast<size_t>(2) << 30);  // 2GB
 constexpr uint32_t kInvalidListId = std::numeric_limits<uint32_t>::max();
 constexpr size_t kDenseDocCompactMinGaps = 65536;
+constexpr uint32_t kIVFSerializeMagic = 0x49564637;  // 'IVF7'
+constexpr uint32_t kIVFSerializeFormatVersion = 1;
+
+void AppendRaw(std::vector<uint8_t>* bytes, const void* data, size_t len) {
+  if (len == 0) {
+    return;
+  }
+  const auto* ptr = reinterpret_cast<const uint8_t*>(data);
+  bytes->insert(bytes->end(), ptr, ptr + len);
+}
+
+template <typename T>
+void AppendPod(std::vector<uint8_t>* bytes, const T& value) {
+  AppendRaw(bytes, &value, sizeof(T));
+}
+
+void AppendBool(std::vector<uint8_t>* bytes, bool value) {
+  const uint8_t stored = value ? 1 : 0;
+  AppendPod(bytes, stored);
+}
+
+template <typename T>
+Status ReadPod(const std::vector<uint8_t>& bytes, size_t* offset, T* value) {
+  if (offset == nullptr || value == nullptr || *offset > bytes.size() ||
+      bytes.size() - *offset < sizeof(T)) {
+    return Status::InvalidArgument("IVF payload truncated");
+  }
+  std::memcpy(value, bytes.data() + *offset, sizeof(T));
+  *offset += sizeof(T);
+  return Status::OK();
+}
+
+Status ReadBool(const std::vector<uint8_t>& bytes, size_t* offset, bool* value) {
+  uint8_t stored = 0;
+  Status status = ReadPod(bytes, offset, &stored);
+  if (!status.ok()) {
+    return status;
+  }
+  if (stored > 1) {
+    return Status::InvalidArgument("Invalid bool in IVF payload");
+  }
+  *value = (stored != 0);
+  return Status::OK();
+}
+
+Status ReadRaw(const std::vector<uint8_t>& bytes, size_t* offset, void* dst, size_t len) {
+  if (len == 0) {
+    return Status::OK();
+  }
+  if (offset == nullptr || dst == nullptr || *offset > bytes.size() ||
+      bytes.size() - *offset < len) {
+    return Status::InvalidArgument("IVF payload truncated");
+  }
+  std::memcpy(dst, bytes.data() + *offset, len);
+  *offset += len;
+  return Status::OK();
+}
+
+void AppendMatrix(std::vector<uint8_t>* bytes, const MatrixRM& matrix) {
+  const uint32_t rows = static_cast<uint32_t>(matrix.rows());
+  const uint32_t cols = static_cast<uint32_t>(matrix.cols());
+  AppendPod(bytes, rows);
+  AppendPod(bytes, cols);
+  AppendRaw(bytes, matrix.data(), sizeof(float) * static_cast<size_t>(matrix.size()));
+}
+
+Result<MatrixRM> ReadMatrix(const std::vector<uint8_t>& bytes, size_t* offset) {
+  uint32_t rows = 0;
+  uint32_t cols = 0;
+  Status status = ReadPod(bytes, offset, &rows);
+  if (!status.ok()) {
+    return status;
+  }
+  status = ReadPod(bytes, offset, &cols);
+  if (!status.ok()) {
+    return status;
+  }
+  const uint64_t count = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
+  if (count > static_cast<uint64_t>(std::numeric_limits<Eigen::Index>::max())) {
+    return Status::InvalidArgument("Matrix in IVF payload is too large");
+  }
+  MatrixRM matrix(static_cast<Eigen::Index>(rows), static_cast<Eigen::Index>(cols));
+  status = ReadRaw(bytes, offset, matrix.data(), sizeof(float) * static_cast<size_t>(count));
+  if (!status.ok()) {
+    return status;
+  }
+  return matrix;
+}
+
+void AppendFloatVector(std::vector<uint8_t>* bytes, const Eigen::VectorXf& vec) {
+  const uint32_t size = static_cast<uint32_t>(vec.size());
+  AppendPod(bytes, size);
+  AppendRaw(bytes, vec.data(), sizeof(float) * static_cast<size_t>(size));
+}
+
+Result<Eigen::VectorXf> ReadFloatVector(const std::vector<uint8_t>& bytes, size_t* offset) {
+  uint32_t size = 0;
+  Status status = ReadPod(bytes, offset, &size);
+  if (!status.ok()) {
+    return status;
+  }
+  Eigen::VectorXf vec(static_cast<Eigen::Index>(size));
+  status = ReadRaw(bytes, offset, vec.data(), sizeof(float) * static_cast<size_t>(size));
+  if (!status.ok()) {
+    return status;
+  }
+  return vec;
+}
+
+void AppendByteVector(std::vector<uint8_t>* bytes, const std::vector<uint8_t>& values) {
+  const uint64_t size = static_cast<uint64_t>(values.size());
+  AppendPod(bytes, size);
+  AppendRaw(bytes, values.data(), static_cast<size_t>(size));
+}
+
+Result<std::vector<uint8_t>> ReadByteVector(const std::vector<uint8_t>& bytes,
+                                            size_t* offset) {
+  uint64_t size = 0;
+  Status status = ReadPod(bytes, offset, &size);
+  if (!status.ok()) {
+    return status;
+  }
+  if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return Status::InvalidArgument("Byte vector in IVF payload is too large");
+  }
+  std::vector<uint8_t> values(static_cast<size_t>(size));
+  status = ReadRaw(bytes, offset, values.data(), values.size());
+  if (!status.ok()) {
+    return status;
+  }
+  return values;
+}
+
+void AppendUint64Vector(std::vector<uint8_t>* bytes, const std::vector<uint64_t>& values) {
+  const uint32_t size = static_cast<uint32_t>(values.size());
+  AppendPod(bytes, size);
+  AppendRaw(bytes, values.data(), sizeof(uint64_t) * values.size());
+}
+
+Result<std::vector<uint64_t>> ReadUint64Vector(const std::vector<uint8_t>& bytes,
+                                               size_t* offset) {
+  uint32_t size = 0;
+  Status status = ReadPod(bytes, offset, &size);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<uint64_t> values(static_cast<size_t>(size));
+  status = ReadRaw(bytes, offset, values.data(), sizeof(uint64_t) * values.size());
+  if (!status.ok()) {
+    return status;
+  }
+  return values;
+}
 
 struct DenseDocListMap {
   DocId base{0};
@@ -178,6 +333,203 @@ struct IndexData {
   uint64_t ntotal{0};
   double last_patch_pq_reencode_ms{0.0};
 };
+
+void AppendIndexData(std::vector<uint8_t>* bytes, const IndexData& data) {
+  AppendPod(bytes, data.dim);
+  AppendPod(bytes, data.nlist);
+  AppendPod(bytes, data.version);
+  AppendBool(bytes, data.use_pq);
+  AppendBool(bytes, data.pq_residual);
+  AppendPod(bytes, data.M);
+  AppendPod(bytes, data.nbits);
+  AppendPod(bytes, data.Ks);
+  AppendPod(bytes, data.dsub);
+  AppendMatrix(bytes, data.routing_centroids);
+  AppendPod(bytes, data.nqe_baseline);
+  AppendPod(bytes, data.nqe_ema);
+  AppendBool(bytes, data.defer_pq_stats_to_add);
+  AppendPod(bytes, data.online_pq_batch_count);
+  AppendPod(bytes, data.warmup_nqe_sum);
+  AppendPod(bytes, data.warmup_seen_batches);
+  AppendPod(bytes, data.deferred_nqe_sum);
+  AppendPod(bytes, data.deferred_nqe_count);
+  AppendPod(bytes, data.last_patch_pq_reencode_ms);
+
+  const uint32_t codebook_count = static_cast<uint32_t>(data.pq_codebooks.size());
+  AppendPod(bytes, codebook_count);
+  for (const MatrixRM& codebook : data.pq_codebooks) {
+    AppendMatrix(bytes, codebook);
+  }
+
+  const uint32_t counts_count = static_cast<uint32_t>(data.pq_counts.size());
+  AppendPod(bytes, counts_count);
+  for (const auto& counts : data.pq_counts) {
+    AppendUint64Vector(bytes, counts);
+  }
+
+  const uint32_t list_count = static_cast<uint32_t>(data.lists.size());
+  AppendPod(bytes, list_count);
+  for (const auto& list : data.lists) {
+    const uint64_t entry_count = static_cast<uint64_t>(list.size());
+    AppendPod(bytes, entry_count);
+    for (const ListEntry& entry : list) {
+      AppendPod(bytes, entry.doc_id);
+      AppendPod(bytes, entry.versions.whiten_version);
+      AppendPod(bytes, entry.versions.index_version);
+      AppendPod(bytes, entry.norm);
+      AppendFloatVector(bytes, entry.vector);
+      AppendByteVector(bytes, entry.pq_code);
+    }
+  }
+}
+
+Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& bytes,
+                                                 size_t* offset) {
+  auto data = std::make_unique<IndexData>();
+  Status status = ReadPod(bytes, offset, &data->dim);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->nlist);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->version);
+  if (!status.ok()) return status;
+  status = ReadBool(bytes, offset, &data->use_pq);
+  if (!status.ok()) return status;
+  status = ReadBool(bytes, offset, &data->pq_residual);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->M);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->nbits);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->Ks);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->dsub);
+  if (!status.ok()) return status;
+  auto centroids_res = ReadMatrix(bytes, offset);
+  if (!centroids_res.ok()) return centroids_res.status();
+  data->routing_centroids = std::move(centroids_res.value());
+  status = ReadPod(bytes, offset, &data->nqe_baseline);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->nqe_ema);
+  if (!status.ok()) return status;
+  status = ReadBool(bytes, offset, &data->defer_pq_stats_to_add);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->online_pq_batch_count);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->warmup_nqe_sum);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->warmup_seen_batches);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->deferred_nqe_sum);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->deferred_nqe_count);
+  if (!status.ok()) return status;
+  status = ReadPod(bytes, offset, &data->last_patch_pq_reencode_ms);
+  if (!status.ok()) return status;
+
+  if (data->dim == 0 || data->nlist == 0 || data->version == 0) {
+    return Status::InvalidArgument("Invalid IVF metadata in payload");
+  }
+  if (data->routing_centroids.rows() != static_cast<Eigen::Index>(data->nlist) ||
+      data->routing_centroids.cols() != static_cast<Eigen::Index>(data->dim)) {
+    return Status::InvalidArgument("Routing centroid shape mismatch in IVF payload");
+  }
+  data->routing_centroid_norms.resize(static_cast<Eigen::Index>(data->nlist));
+  for (uint32_t i = 0; i < data->nlist; ++i) {
+    data->routing_centroid_norms(static_cast<Eigen::Index>(i)) =
+        data->routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+  }
+  if (data->use_pq) {
+    if (data->M == 0 || data->Ks == 0 || data->dsub == 0 ||
+        data->M * data->dsub != data->dim || data->Ks > 256) {
+      return Status::InvalidArgument("Invalid PQ metadata in IVF payload");
+    }
+  }
+
+  uint32_t codebook_count = 0;
+  status = ReadPod(bytes, offset, &codebook_count);
+  if (!status.ok()) return status;
+  data->pq_codebooks.resize(static_cast<size_t>(codebook_count));
+  for (uint32_t i = 0; i < codebook_count; ++i) {
+    auto book_res = ReadMatrix(bytes, offset);
+    if (!book_res.ok()) return book_res.status();
+    data->pq_codebooks[static_cast<size_t>(i)] = std::move(book_res.value());
+  }
+  if (data->use_pq && data->pq_codebooks.size() != data->M) {
+    return Status::InvalidArgument("PQ codebook count mismatch in IVF payload");
+  }
+  for (const MatrixRM& codebook : data->pq_codebooks) {
+    if (codebook.rows() != static_cast<Eigen::Index>(data->Ks) ||
+        codebook.cols() != static_cast<Eigen::Index>(data->dsub)) {
+      return Status::InvalidArgument("PQ codebook shape mismatch in IVF payload");
+    }
+  }
+
+  uint32_t counts_count = 0;
+  status = ReadPod(bytes, offset, &counts_count);
+  if (!status.ok()) return status;
+  data->pq_counts.resize(static_cast<size_t>(counts_count));
+  for (uint32_t i = 0; i < counts_count; ++i) {
+    auto counts_res = ReadUint64Vector(bytes, offset);
+    if (!counts_res.ok()) return counts_res.status();
+    data->pq_counts[static_cast<size_t>(i)] = std::move(counts_res.value());
+  }
+  if (data->use_pq && data->pq_counts.size() != data->M) {
+    return Status::InvalidArgument("PQ count table count mismatch in IVF payload");
+  }
+  for (const auto& counts : data->pq_counts) {
+    if (counts.size() != data->Ks) {
+      return Status::InvalidArgument("PQ count table shape mismatch in IVF payload");
+    }
+  }
+
+  uint32_t list_count = 0;
+  status = ReadPod(bytes, offset, &list_count);
+  if (!status.ok()) return status;
+  if (list_count != data->nlist) {
+    return Status::InvalidArgument("List count mismatch in IVF payload");
+  }
+  data->lists.resize(static_cast<size_t>(list_count));
+  for (uint32_t list_id = 0; list_id < list_count; ++list_id) {
+    uint64_t entry_count = 0;
+    status = ReadPod(bytes, offset, &entry_count);
+    if (!status.ok()) return status;
+    if (entry_count > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return Status::InvalidArgument("List in IVF payload is too large");
+    }
+    auto& list = data->lists[static_cast<size_t>(list_id)];
+    list.resize(static_cast<size_t>(entry_count));
+    for (uint64_t i = 0; i < entry_count; ++i) {
+      ListEntry entry;
+      status = ReadPod(bytes, offset, &entry.doc_id);
+      if (!status.ok()) return status;
+      status = ReadPod(bytes, offset, &entry.versions.whiten_version);
+      if (!status.ok()) return status;
+      status = ReadPod(bytes, offset, &entry.versions.index_version);
+      if (!status.ok()) return status;
+      status = ReadPod(bytes, offset, &entry.norm);
+      if (!status.ok()) return status;
+      auto vector_res = ReadFloatVector(bytes, offset);
+      if (!vector_res.ok()) return vector_res.status();
+      entry.vector = std::move(vector_res.value());
+      auto pq_code_res = ReadByteVector(bytes, offset);
+      if (!pq_code_res.ok()) return pq_code_res.status();
+      entry.pq_code = std::move(pq_code_res.value());
+      if (entry.versions.index_version != data->version) {
+        return Status::InvalidArgument("Entry index version mismatch in IVF payload");
+      }
+      if (data->use_pq) {
+        if (entry.pq_code.size() != data->M) {
+          return Status::InvalidArgument("PQ code size mismatch in IVF payload");
+        }
+      } else if (entry.vector.size() != static_cast<Eigen::Index>(data->dim)) {
+        return Status::InvalidArgument("Vector dimension mismatch in IVF payload");
+      }
+      list[static_cast<size_t>(i)] = std::move(entry);
+    }
+  }
+
+  return data;
+}
 
 inline float SquaredL2FromNormDot(float a_norm, float b_norm, float dot) {
   const float dist = a_norm + b_norm - 2.0f * dot;
@@ -1749,9 +2101,99 @@ class KMeansIVFIndex : public IVFIndex {
     return it->second->last_patch_pq_reencode_ms;
   }
 
-  Result<std::vector<uint8_t>> Serialize() const override { return std::vector<uint8_t>{}; }
+  Result<std::vector<uint8_t>> Serialize() const override {
+    std::shared_lock lock(mu_);
+    if (latest_version_ == 0) {
+      return Status::InvalidArgument("Serialize: index not built");
+    }
+    auto it = data_map_.find(latest_version_);
+    if (it == data_map_.end() || !it->second) {
+      return Status::NotFound("Serialize: latest index version missing");
+    }
 
-  Status Deserialize(const std::vector<uint8_t>&) override { return Status::OK(); }
+    std::vector<uint8_t> bytes;
+    AppendPod(&bytes, kIVFSerializeMagic);
+    AppendPod(&bytes, kIVFSerializeFormatVersion);
+    AppendPod(&bytes, latest_version_);
+    AppendPod(&bytes, next_version_);
+    const uint32_t data_count = 1;
+    AppendPod(&bytes, data_count);
+    AppendIndexData(&bytes, *it->second);
+    return bytes;
+  }
+
+  Status Deserialize(const std::vector<uint8_t>& bytes) override {
+    size_t offset = 0;
+    uint32_t magic = 0;
+    Status status = ReadPod(bytes, &offset, &magic);
+    if (!status.ok()) {
+      return status;
+    }
+    if (magic != kIVFSerializeMagic) {
+      return Status::InvalidArgument("Bad IVF magic");
+    }
+
+    uint32_t format_version = 0;
+    status = ReadPod(bytes, &offset, &format_version);
+    if (!status.ok()) {
+      return status;
+    }
+    if (format_version != kIVFSerializeFormatVersion) {
+      return Status::InvalidArgument("Unsupported IVF payload format version");
+    }
+
+    VersionId latest_version = 0;
+    VersionId next_version = 1;
+    uint32_t data_count = 0;
+    status = ReadPod(bytes, &offset, &latest_version);
+    if (!status.ok()) return status;
+    status = ReadPod(bytes, &offset, &next_version);
+    if (!status.ok()) return status;
+    status = ReadPod(bytes, &offset, &data_count);
+    if (!status.ok()) return status;
+    if (latest_version == 0 || data_count == 0) {
+      return Status::InvalidArgument("Invalid IVF payload header");
+    }
+
+    std::unordered_map<VersionId, std::unique_ptr<IndexData>> loaded;
+    VersionId max_version = 0;
+    for (uint32_t i = 0; i < data_count; ++i) {
+      auto data_res = ReadIndexData(bytes, &offset);
+      if (!data_res.ok()) {
+        return data_res.status();
+      }
+      std::unique_ptr<IndexData> data = std::move(data_res.value());
+      if (!loaded.emplace(data->version, std::move(data)).second) {
+        return Status::AlreadyExists("Duplicate index version in IVF payload");
+      }
+    }
+    if (offset != bytes.size()) {
+      return Status::InvalidArgument("Trailing bytes in IVF payload");
+    }
+    if (loaded.find(latest_version) == loaded.end()) {
+      return Status::InvalidArgument("Latest index version missing in IVF payload");
+    }
+
+    for (auto& kv : loaded) {
+      IndexData* data = kv.second.get();
+      max_version = std::max(max_version, data->version);
+      if (data->use_pq) {
+        data->pq_codes_by_list.clear();
+        data->pq_codes_by_list.resize(data->lists.size());
+        for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
+          RebuildListPQCodes(data, list_id);
+        }
+        BuildPrecomputedTable(data);
+      }
+      RebuildDocMapLocked(data);
+    }
+
+    std::unique_lock lock(mu_);
+    data_map_ = std::move(loaded);
+    latest_version_ = latest_version;
+    next_version_ = std::max(next_version, max_version + 1);
+    return Status::OK();
+  }
 
  private:
   struct RemovedDoc {

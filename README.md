@@ -289,5 +289,21 @@ cmake --build build -j
 ./build/run_eval configs/sift/sift.json data/sift
 ```
 
+预先构建 main 索引和码本：
+
+```bash
+./build/build_index configs/sift/sift.json data/sift
+./build/run_eval configs/sift/sift.json data/sift --use-prebuilt-index
+```
+
+`build_index` 默认写入 `index/<dataset>/<config>/`。也可以显式指定输出/读取目录：
+
+```bash
+./build/build_index configs/sift/sift.json data/sift index/sift/custom
+./build/run_eval configs/sift/sift.json data/sift --prebuilt-index index/sift/custom
+```
+
+不传预构建索引参数时，`run_eval` 保持原有现场构建流程。
+
 如果不开 streaming，可直接跑离线主索引评估；  
 开启 streaming 后，`run_eval` 会输出 merge、OnlinePQ、latency、imbalance 等过程指标。

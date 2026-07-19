@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -26,6 +27,7 @@
 
 #include "common/config.h"
 #include "common/dataset.h"
+#include "common/prebuilt_index.h"
 #include "common/timer.h"
 #include "common/types.h"
 #include "eval/metrics.h"
@@ -276,6 +278,98 @@ uint32_t ResolveDeltaTrainRows(const Config& config,
                                       ? std::numeric_limits<uint32_t>::max()
                                       : static_cast<uint32_t>(requested_rows_u64);
   return std::min<uint32_t>(available_stream_rows, requested_rows);
+}
+
+struct RuntimeOptions {
+  std::string config_path{"configs/sift/sift.json"};
+  std::optional<std::string> dataset_spec;
+  std::optional<std::string> query_spec;
+  std::optional<std::string> prebuilt_index_dir;
+  bool use_default_prebuilt_index{false};
+  bool fresh_index{false};
+};
+
+std::string SanitizePathPart(const std::string& value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isalnum(uch) || ch == '-' || ch == '_') {
+      out.push_back(ch);
+    } else {
+      out.push_back('_');
+    }
+  }
+  return out.empty() ? "default" : out;
+}
+
+std::string DefaultPrebuiltIndexDir(const std::string& config_path,
+                                    const std::string& dataset_label) {
+  const std::filesystem::path config_fs_path(config_path);
+  const std::string config_stem =
+      config_fs_path.stem().string().empty() ? "config" : config_fs_path.stem().string();
+  return (std::filesystem::path("index") / SanitizePathPart(dataset_label) /
+          SanitizePathPart(config_stem))
+      .string();
+}
+
+void PrintUsage(const char* argv0) {
+  std::cerr << "Usage: " << argv0
+            << " [config.json] [dataset_dir_or_base.fvecs] [query_dir_or_query.fvecs] "
+               "[--use-prebuilt-index | --prebuilt-index DIR | --fresh-index]\n";
+}
+
+Result<RuntimeOptions> ParseRuntimeOptions(int argc, char** argv) {
+  RuntimeOptions opts;
+  std::vector<std::string> positional;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--help" || arg == "-h") {
+      PrintUsage(argv[0]);
+      return Status::InvalidArgument("help requested");
+    }
+    if (arg == "--use-prebuilt-index") {
+      opts.use_default_prebuilt_index = true;
+      continue;
+    }
+    if (arg == "--prebuilt-index" || arg == "--index") {
+      if (i + 1 >= argc) {
+        return Status::InvalidArgument(arg + " requires a directory path");
+      }
+      opts.prebuilt_index_dir = argv[++i];
+      continue;
+    }
+    if (arg == "--fresh-index") {
+      opts.fresh_index = true;
+      continue;
+    }
+    if (!arg.empty() && arg[0] == '-') {
+      return Status::InvalidArgument("Unknown option: " + arg);
+    }
+    positional.push_back(arg);
+  }
+
+  if (positional.size() > 3) {
+    return Status::InvalidArgument("Too many positional arguments");
+  }
+  if (!positional.empty()) {
+    opts.config_path = positional[0];
+  }
+  if (positional.size() > 1) {
+    opts.dataset_spec = positional[1];
+  }
+  if (positional.size() > 2) {
+    opts.query_spec = positional[2];
+  }
+  if (opts.fresh_index &&
+      (opts.use_default_prebuilt_index || opts.prebuilt_index_dir.has_value())) {
+    return Status::InvalidArgument("--fresh-index cannot be combined with prebuilt index options");
+  }
+  if (opts.use_default_prebuilt_index && opts.prebuilt_index_dir.has_value()) {
+    return Status::InvalidArgument(
+        "--use-prebuilt-index cannot be combined with --prebuilt-index");
+  }
+  return opts;
 }
 
 double ComputeNonEmptyListImbalance(const std::vector<uint32_t>& sizes,
@@ -1660,7 +1754,18 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::string config_path = (argc > 1) ? argv[1] : "configs/sift/sift.json";
+  auto runtime_opts_res = ParseRuntimeOptions(argc, argv);
+  if (!runtime_opts_res.ok()) {
+    const std::string message = runtime_opts_res.status().message();
+    if (message == "help requested") {
+      return 0;
+    }
+    std::cerr << runtime_opts_res.status().ToString() << std::endl;
+    PrintUsage(argv[0]);
+    return 1;
+  }
+  RuntimeOptions runtime_opts = runtime_opts_res.value();
+  const std::string config_path = runtime_opts.config_path;
   auto config_res = LoadConfigFromJson(config_path);
   if (!config_res.ok()) {
     std::cerr << config_res.status().ToString() << std::endl;
@@ -1669,10 +1774,8 @@ int main(int argc, char** argv) {
   Config config = config_res.value();
   std::cout << "Loaded " << config.ToString() << std::endl;
 
-  std::optional<std::string> dataset_spec =
-      (argc > 2) ? std::optional<std::string>(argv[2]) : std::nullopt;
-  std::optional<std::string> query_spec =
-      (argc > 3) ? std::optional<std::string>(argv[3]) : std::nullopt;
+  std::optional<std::string> dataset_spec = runtime_opts.dataset_spec;
+  std::optional<std::string> query_spec = runtime_opts.query_spec;
   std::string dataset_label = "synthetic";
 
   std::optional<std::string> base_dataset_path;
@@ -1691,6 +1794,15 @@ int main(int argc, char** argv) {
     } else {
       dataset_label = ds_path.stem().string();
     }
+  }
+  if (runtime_opts.use_default_prebuilt_index) {
+    runtime_opts.prebuilt_index_dir = DefaultPrebuiltIndexDir(config_path, dataset_label);
+  }
+  if (runtime_opts.prebuilt_index_dir) {
+    std::cout << "[INFO] Prebuilt main index enabled: "
+              << *runtime_opts.prebuilt_index_dir << std::endl;
+  } else if (runtime_opts.fresh_index) {
+    std::cout << "[INFO] Fresh main index build forced." << std::endl;
   }
 
   std::optional<std::string> query_dataset_path;
@@ -1847,16 +1959,74 @@ int main(int argc, char** argv) {
   uint32_t next_insert_idx = stream_start_idx;
 
   Timer init_total_timer;
-  Timer init_fit_timer;
-  auto whiten_version_res = whitening->Fit(X.topRows(main_rows_initial));
-  if (!whiten_version_res.ok()) {
-    std::cerr << whiten_version_res.status().ToString() << std::endl;
-    return 1;
-  }
-  whiten_version = whiten_version_res.value();
-  const double init_whitening_ms = init_fit_timer.ElapsedMillis();
-
   const uint32_t init_visible_rows = std::min<uint32_t>(nx, stream_start_idx);
+  double init_whitening_ms = 0.0;
+  double init_whitening_transform_ms = 0.0;
+  double init_main_build_ms = 0.0;
+  double init_main_add_ms = 0.0;
+  double init_load_ms = 0.0;
+  bool used_prebuilt_index = false;
+
+  if (runtime_opts.prebuilt_index_dir) {
+    Timer load_timer;
+    auto artifact_res = LoadPrebuiltMainIndex(*runtime_opts.prebuilt_index_dir);
+    if (!artifact_res.ok()) {
+      std::cerr << artifact_res.status().ToString() << std::endl;
+      return 1;
+    }
+    PrebuiltMainIndexArtifact artifact = std::move(artifact_res.value());
+    if (artifact.metadata.dim != config.dim) {
+      std::cerr << "Prebuilt index dim " << artifact.metadata.dim
+                << " mismatches runtime dim " << config.dim << std::endl;
+      return 1;
+    }
+    if (artifact.metadata.main_rows != main_rows_initial) {
+      std::cerr << "Prebuilt index main_rows " << artifact.metadata.main_rows
+                << " mismatches runtime main_rows " << main_rows_initial << std::endl;
+      return 1;
+    }
+    if (artifact.metadata.total_rows != 0 && artifact.metadata.total_rows != nx) {
+      std::cerr << "Prebuilt index total_rows " << artifact.metadata.total_rows
+                << " mismatches runtime total_rows " << nx << std::endl;
+      return 1;
+    }
+    Status whitening_status = whitening->Deserialize(artifact.whitening_bytes);
+    if (!whitening_status.ok()) {
+      std::cerr << whitening_status.ToString() << std::endl;
+      return 1;
+    }
+    Status index_status = main_ivf->Deserialize(artifact.index_bytes);
+    if (!index_status.ok()) {
+      std::cerr << index_status.ToString() << std::endl;
+      return 1;
+    }
+    whiten_version = artifact.metadata.whiten_version;
+    main_versions = VersionSet{whiten_version, artifact.metadata.index_version};
+    auto main_sizes_res = main_ivf->GetPartitionSizes(main_versions);
+    if (!main_sizes_res.ok()) {
+      std::cerr << main_sizes_res.status().ToString() << std::endl;
+      return 1;
+    }
+    init_load_ms = load_timer.ElapsedMillis();
+    used_prebuilt_index = true;
+    if (base_dataset_path &&
+        artifact.metadata.dataset_path != "synthetic" &&
+        artifact.metadata.dataset_path != *base_dataset_path) {
+      std::cout << "[WARN] Prebuilt index was built from dataset_path="
+                << artifact.metadata.dataset_path
+                << ", runtime dataset_path=" << *base_dataset_path << std::endl;
+    }
+  } else {
+    Timer init_fit_timer;
+    auto whiten_version_res = whitening->Fit(X.topRows(main_rows_initial));
+    if (!whiten_version_res.ok()) {
+      std::cerr << whiten_version_res.status().ToString() << std::endl;
+      return 1;
+    }
+    whiten_version = whiten_version_res.value();
+    init_whitening_ms = init_fit_timer.ElapsedMillis();
+  }
+
   Timer init_transform_timer;
   auto xb_res = whitening->TransformBatch(X.topRows(init_visible_rows), whiten_version);
   if (!xb_res.ok()) {
@@ -1867,7 +2037,7 @@ int main(int argc, char** argv) {
   if (config.use_cosine) {
     NormalizeRowsL2(&X_whitened);
   }
-  const double init_whitening_transform_ms = init_transform_timer.ElapsedMillis();
+  init_whitening_transform_ms = init_transform_timer.ElapsedMillis();
 
   auto qb_res = whitening->TransformBatch(Q, whiten_version);
   if (!qb_res.ok()) {
@@ -1881,31 +2051,36 @@ int main(int argc, char** argv) {
               << std::endl;
   }
 
-  std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
-  std::iota(main_ids.begin(), main_ids.end(), 0);
-  Timer init_build_timer;
-  auto main_version_res = main_ivf->Build(X_whitened.topRows(main_rows_initial),
-                                          main_ids,
-                                          ivf_params,
-                                          0);
-  if (!main_version_res.ok()) {
-    std::cerr << main_version_res.status().ToString() << std::endl;
-    return 1;
+  if (!used_prebuilt_index) {
+    std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
+    std::iota(main_ids.begin(), main_ids.end(), 0);
+    Timer init_build_timer;
+    auto main_version_res = main_ivf->Build(X_whitened.topRows(main_rows_initial),
+                                            main_ids,
+                                            ivf_params,
+                                            0);
+    if (!main_version_res.ok()) {
+      std::cerr << main_version_res.status().ToString() << std::endl;
+      return 1;
+    }
+    init_main_build_ms = init_build_timer.ElapsedMillis();
+    main_versions = VersionSet{whiten_version, main_version_res.value()};
+    Timer init_add_timer;
+    Status add_main =
+        AddRangeToIndex(main_ivf, X_whitened, 0, main_rows_initial, config.dim, main_versions);
+    if (!add_main.ok()) {
+      std::cerr << add_main.ToString() << std::endl;
+      return 1;
+    }
+    init_main_add_ms = init_add_timer.ElapsedMillis();
   }
-  const double init_main_build_ms = init_build_timer.ElapsedMillis();
-  main_versions = VersionSet{whiten_version, main_version_res.value()};
-  Timer init_add_timer;
-  Status add_main =
-      AddRangeToIndex(main_ivf, X_whitened, 0, main_rows_initial, config.dim, main_versions);
-  if (!add_main.ok()) {
-    std::cerr << add_main.ToString() << std::endl;
-    return 1;
-  }
-  const double init_main_add_ms = init_add_timer.ElapsedMillis();
   const double init_rebuild_ms = init_whitening_ms + init_whitening_transform_ms +
                                  init_main_build_ms + init_main_add_ms;
   const double init_total_wall_ms = init_total_timer.ElapsedMillis();
-  std::cout << "[INIT BUILD] whitening_ms=" << init_whitening_ms
+  std::cout << (used_prebuilt_index ? "[INIT LOAD] " : "[INIT BUILD] ")
+            << "prebuilt=" << std::boolalpha << used_prebuilt_index
+            << ", index_load_ms=" << init_load_ms
+            << ", whitening_ms=" << init_whitening_ms
             << ", whitening_transform_ms=" << init_whitening_transform_ms
             << ", main_build_ms=" << init_main_build_ms
             << ", main_add_ms=" << init_main_add_ms
@@ -3390,6 +3565,9 @@ int main(int argc, char** argv) {
     ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
     ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
     ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
+    ofs << "    \"initial_used_prebuilt_index\": "
+        << (used_prebuilt_index ? "true" : "false") << ",\n";
+    ofs << "    \"initial_index_load_ms\": " << init_load_ms << ",\n";
     ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
     ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
     ofs << "    \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
@@ -3609,6 +3787,9 @@ int main(int argc, char** argv) {
   ofs << "    \"hit_new_total\": " << final_metrics.hit_new_total << ",\n";
   ofs << "    \"hit_old_total\": " << final_metrics.hit_old_total << ",\n";
   ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
+  ofs << "    \"initial_used_prebuilt_index\": "
+      << (used_prebuilt_index ? "true" : "false") << ",\n";
+  ofs << "    \"initial_index_load_ms\": " << init_load_ms << ",\n";
   ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
   ofs << "    \"initial_whitening_ms\": " << init_whitening_ms << ",\n";
   ofs << "    \"initial_whitening_transform_ms\": " << init_whitening_transform_ms << ",\n";
