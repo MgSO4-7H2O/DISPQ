@@ -286,7 +286,7 @@ SA-WRQ 当前实现的是一套面向流式向量检索的双层索引框架：
 ```bash
 cmake -S . -B build
 cmake --build build -j
-./build/run_eval configs/sift.json data/sift
+./build/run_eval configs/sift/sift.json data/sift
 ```
 
 如果不开 streaming，可直接跑离线主索引评估；  

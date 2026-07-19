@@ -1660,7 +1660,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::string config_path = (argc > 1) ? argv[1] : "configs/base.json";
+  const std::string config_path = (argc > 1) ? argv[1] : "configs/sift/sift.json";
   auto config_res = LoadConfigFromJson(config_path);
   if (!config_res.ok()) {
     std::cerr << config_res.status().ToString() << std::endl;
