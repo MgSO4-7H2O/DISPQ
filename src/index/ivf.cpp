@@ -317,8 +317,8 @@ struct IndexData {
   MatrixRM routing_centroids;
   Eigen::VectorXf routing_centroid_norms;
   std::vector<MatrixRM> pq_codebooks;
-  // Derived cache for the SIFT1M fast path. It is rebuilt from the serialized
-  // AoS codebooks and is intentionally not part of the index payload.
+  // Derived SoA cache rebuilt from the serialized AoS codebooks. It is
+  // intentionally not part of the index payload.
   std::vector<MatrixRM> pq_codebooks_soa;
   std::vector<std::vector<uint8_t>> pq_codes_by_list;
   bool use_precomputed_table{false};
@@ -343,7 +343,7 @@ void RebuildPQSoACache(IndexData* data) {
     return;
   }
   data->pq_codebooks_soa.clear();
-  if (!data->use_pq || data->dsub != 8 || data->Ks != 256 ||
+  if (!data->use_pq || data->dsub == 0 || data->Ks == 0 ||
       data->pq_codebooks.size() != data->M) {
     return;
   }
@@ -612,10 +612,12 @@ uint32_t NearestCodeword(Eigen::Ref<const Eigen::VectorXf> sub,
                          const MatrixRM& codebook,
                          const MatrixRM* codebook_soa,
                          float* best_dist_out) {
-  if (codebook_soa != nullptr && sub.size() == 8 && codebook.rows() == 256 &&
-      codebook.cols() == 8 && codebook_soa->rows() == 8 &&
-      codebook_soa->cols() == 256) {
-    return internal::AssignPQSoA8x256(sub.data(), codebook_soa->data(), best_dist_out);
+  if (codebook_soa != nullptr && sub.size() == codebook.cols() &&
+      codebook_soa->rows() == codebook.cols() &&
+      codebook_soa->cols() == codebook.rows()) {
+    return internal::AssignPQSoA(
+        sub.data(), static_cast<uint32_t>(codebook.cols()), codebook_soa->data(),
+        static_cast<uint32_t>(codebook.rows()), best_dist_out);
   }
   return NearestCodeword(sub, codebook, best_dist_out);
 }
@@ -634,9 +636,15 @@ MatrixRM InitializeCentroids(Eigen::Ref<const MatrixRM> X, uint32_t nlist) {
   return centroids;
 }
 
+enum class KMeansMode {
+  kGeneric,
+  kPQ,
+};
+
 void RunKMeans(Eigen::Ref<const MatrixRM> X,
                MatrixRM* centroids,
-               uint32_t iterations) {
+               uint32_t iterations,
+               KMeansMode mode = KMeansMode::kGeneric) {
   const int64_t num_vecs = X.rows();
   const int64_t dim = X.cols();
   const int64_t k = centroids->rows();
@@ -652,7 +660,7 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X,
 #endif
   for (uint32_t iter = 0; iter < kmeans_iters; ++iter) {
 #if defined(__AVX512F__)
-    if (dim == 8 && k == 256) {
+    if (mode == KMeansMode::kPQ) {
       MatrixRM centroids_soa(dim, k);
       for (Eigen::Index centroid = 0; centroid < centroids->rows(); ++centroid) {
         for (Eigen::Index d = 0; d < centroids->cols(); ++d) {
@@ -664,7 +672,8 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X,
 #endif
       for (int64_t i = 0; i < num_vecs; ++i) {
         assignments[static_cast<size_t>(i)] = static_cast<int>(
-            internal::AssignPQSoA8x256(X.row(i).data(), centroids_soa.data(), nullptr));
+            internal::AssignPQSoA(X.row(i).data(), static_cast<uint32_t>(dim),
+                                  centroids_soa.data(), static_cast<uint32_t>(k), nullptr));
       }
     } else
 #endif
@@ -1154,7 +1163,7 @@ class KMeansIVFIndex : public IVFIndex {
           const Eigen::Index subdim = static_cast<Eigen::Index>(data->dsub);
           MatrixRM sub = residuals.block(0, offset, residuals.rows(), subdim);
           MatrixRM codebook = InitializeCentroids(sub, data->Ks);
-          RunKMeans(sub, &codebook, p.kmeans_iterations);
+          RunKMeans(sub, &codebook, p.kmeans_iterations, KMeansMode::kPQ);
           data->pq_codebooks[static_cast<size_t>(m)] = std::move(codebook);
         }
       }
