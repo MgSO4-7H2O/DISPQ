@@ -8,7 +8,7 @@
   "dim": 128,
   "seed": 1337,
   "pq_enable": true,
-  "pq_m": 64,
+  "pq_m": 16,
   "pq_nbits": 8,
   "pq_residual": true,
   "max_queries": 10000,

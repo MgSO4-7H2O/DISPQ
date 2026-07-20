@@ -1,7 +1,30 @@
 cmake_minimum_required(VERSION 3.16)
 project(ann LANGUAGES CXX)
 
+# Keep single-config builds optimized by default while retaining debug symbols
+# for profiling.  Multi-config generators select the configuration at build
+# time and should not be overridden here.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
+      "Build type: Debug, Release, RelWithDebInfo, or MinSizeRel" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+               Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 option(ANN_ENABLE_PROFILING "Enable profiling-friendly compiler options" OFF)
+
+option(ANN_ENABLE_NATIVE
+       "Enable host-specific optimization and ISA extensions (e.g. AVX-512)" ON)
+
+if(ANN_ENABLE_NATIVE)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:CXX>:-O3>
+      $<$<COMPILE_LANGUAGE:CXX>:-march=native>
+      $<$<COMPILE_LANGUAGE:CXX>:-mtune=native>
+    )
+  endif()
+endif()
 
 if(ANN_ENABLE_PROFILING)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -16,7 +39,20 @@ endif()
 
 include(cmake/Options.cmake)
 
-find_package(Eigen3 REQUIRED)
+set(ANN_VENDORED_EIGEN_DIR
+    "${CMAKE_SOURCE_DIR}/third_party/eigen"
+    CACHE PATH "Path to a vendored Eigen tree; empty to use system Eigen")
+if(ANN_VENDORED_EIGEN_DIR AND
+   EXISTS "${ANN_VENDORED_EIGEN_DIR}/Eigen/Core")
+  add_library(ann_eigen INTERFACE)
+  target_include_directories(ann_eigen SYSTEM INTERFACE
+                             "${ANN_VENDORED_EIGEN_DIR}")
+  add_library(Eigen3::Eigen ALIAS ann_eigen)
+  message(STATUS "Using vendored Eigen: ${ANN_VENDORED_EIGEN_DIR}")
+else()
+  find_package(Eigen3 REQUIRED)
+  message(STATUS "Using system Eigen: ${Eigen3_DIR}")
+endif()
 find_package(OpenMP REQUIRED)
 
 add_library(ann
@@ -26,6 +62,7 @@ add_library(ann
   src/common/prebuilt_index.cpp
   src/whitening/whitening.cpp
   src/index/ivf.cpp
+  src/index/soa_kernels.cpp
   src/index/merge.cpp
   src/index/postings.cpp
   src/search/hybrid_search.cpp

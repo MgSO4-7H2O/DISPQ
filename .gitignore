@@ -1,4 +1,5 @@
 /data
+/build_*/
 /build
 /index
 /result
@@ -7,3 +8,4 @@
 *.pdf
 /build-avx512
 /build-generic
+.codegraph

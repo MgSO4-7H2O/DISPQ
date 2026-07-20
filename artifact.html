@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SA-WRQ · Repository Artifact</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a2d;
+      --panel-2: #17223a;
+      --panel-3: #0f172a;
+      --text: #e8eefb;
+      --muted: #9eacc7;
+      --faint: #71809e;
+      --line: #293753;
+      --cyan: #58d6e8;
+      --blue: #80a7ff;
+      --green: #74d6a0;
+      --amber: #f0c674;
+      --rose: #f095a9;
+      --shadow: 0 18px 55px rgba(0, 0, 0, .25);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(88, 214, 232, .11), transparent 30rem),
+        radial-gradient(circle at 90% 10%, rgba(128, 167, 255, .10), transparent 32rem),
+        var(--bg);
+      font: 15px/1.65 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .shell { max-width: 1500px; margin: 0 auto; padding: 30px 28px 80px; }
+
+    .hero {
+      padding: 42px 44px 38px;
+      border: 1px solid rgba(128, 167, 255, .23);
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(23, 34, 58, .96), rgba(13, 22, 42, .93));
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin-bottom: 10px;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { margin: 0; line-height: 1.2; letter-spacing: -.02em; }
+    h1 { max-width: 940px; font-size: clamp(30px, 4vw, 52px); }
+    h2 { margin-bottom: 18px; font-size: 25px; }
+    h3 { margin-bottom: 8px; font-size: 17px; }
+    p { margin: 0 0 13px; }
+    .hero p { max-width: 980px; margin-top: 18px; color: #c5d0e5; font-size: 17px; }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 28px;
+    }
+
+    .meta {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(8, 14, 28, .45);
+    }
+    .meta strong { display: block; color: #fff; font-size: 17px; }
+    .meta span { color: var(--muted); font-size: 12px; }
+
+    .toolbar {
+      position: sticky;
+      z-index: 10;
+      top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 20px 0 28px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(11, 16, 32, .88);
+      backdrop-filter: blur(15px);
+    }
+
+    .toolbar a, .toolbar button {
+      padding: 8px 11px;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      color: var(--muted);
+      background: transparent;
+      font: inherit;
+      cursor: pointer;
+    }
+    .toolbar a:hover, .toolbar button:hover { border-color: var(--line); color: var(--text); text-decoration: none; }
+    .toolbar .spacer { flex: 1; }
+    .search {
+      width: min(320px, 46vw);
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      outline: none;
+      color: var(--text);
+      background: var(--panel-3);
+      font: inherit;
+    }
+    .search:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(88, 214, 232, .12); }
+
+    section { scroll-margin-top: 84px; margin-top: 34px; }
+    .section-intro { max-width: 950px; color: var(--muted); }
+
+    .panel {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(18, 26, 45, .86);
+      box-shadow: 0 10px 35px rgba(0, 0, 0, .12);
+    }
+
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+
+    .callout {
+      margin: 16px 0;
+      padding: 14px 16px;
+      border-left: 3px solid var(--cyan);
+      border-radius: 8px;
+      color: #cbd7eb;
+      background: rgba(88, 214, 232, .075);
+    }
+    .callout strong { color: #fff; }
+    .callout.warn { border-left-color: var(--amber); background: rgba(240, 198, 116, .075); }
+
+    .tag {
+      display: inline-block;
+      margin: 3px 4px 3px 0;
+      padding: 2px 8px;
+      border: 1px solid rgba(128, 167, 255, .30);
+      border-radius: 999px;
+      color: #c8d7ff;
+      background: rgba(128, 167, 255, .10);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .tag.green { border-color: rgba(116, 214, 160, .32); color: #b5f0ce; background: rgba(116, 214, 160, .09); }
+    .tag.amber { border-color: rgba(240, 198, 116, .32); color: #f8dda0; background: rgba(240, 198, 116, .09); }
+    .tag.rose { border-color: rgba(240, 149, 169, .32); color: #ffc0cf; background: rgba(240, 149, 169, .09); }
+
+    .stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
+    .stat { padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-3); }
+    .stat .value { color: #fff; font-size: 24px; font-weight: 760; }
+    .stat .label { color: var(--muted); font-size: 12px; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      margin: 20px 0 8px;
+    }
+    .flow-node {
+      position: relative;
+      min-height: 140px;
+      padding: 17px 15px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: linear-gradient(160deg, var(--panel-2), var(--panel-3));
+    }
+    .flow-node::after {
+      content: "→";
+      position: absolute;
+      top: 48px;
+      right: -18px;
+      color: var(--cyan);
+      font-size: 23px;
+      font-weight: 700;
+    }
+    .flow-node:last-child::after { display: none; }
+    .flow-node small { display: block; margin-bottom: 4px; color: var(--cyan); font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    .flow-node p { color: var(--muted); font-size: 13px; }
+
+    .path-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .path-card { padding: 19px; border: 1px solid var(--line); border-radius: 13px; background: var(--panel-3); }
+    .path-card .entry { margin-bottom: 12px; color: #fff; font-weight: 700; }
+    .path-card ol { margin: 0; padding-left: 22px; color: #c4d0e6; }
+    .path-card li { padding: 3px 0; }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { padding: 1px 5px; border-radius: 5px; color: #d7e6ff; background: rgba(128, 167, 255, .11); font-size: .92em; }
+
+    .tree {
+      overflow: auto;
+      margin: 0;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      color: #c8d5eb;
+      background: #0b1222;
+      font: 13px/1.75 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .tree .dir { color: var(--cyan); font-weight: 700; }
+    .tree .app { color: var(--amber); }
+    .tree .ignored { color: var(--faint); }
+
+    details {
+      margin: 12px 0;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(15, 23, 42, .72);
+    }
+    details[open] { background: rgba(18, 26, 45, .95); }
+    summary {
+      padding: 14px 17px;
+      color: #e9f1ff;
+      font-weight: 720;
+      cursor: pointer;
+      list-style-position: inside;
+    }
+    summary::marker { color: var(--cyan); }
+    .details-body { overflow-x: auto; padding: 0 17px 17px; }
+
+    table { width: 100%; border-collapse: collapse; min-width: 680px; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid rgba(41, 55, 83, .76); vertical-align: top; text-align: left; }
+    th { color: var(--cyan); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+    td { color: #c3cee2; font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { width: 24%; color: #eef4ff; font-weight: 650; }
+    td:nth-child(2) { width: 37%; }
+    .path { display: inline-block; margin-bottom: 3px; color: #eaf2ff; }
+    .line { color: var(--faint); font-size: 11px; font-weight: 500; }
+    .symbols { color: #b9c8e3; font-size: 12px; }
+
+    .config-table td:first-child { width: 27%; }
+    .config-table td:nth-child(2) { width: 22%; }
+    .config-table td:nth-child(3) { width: auto; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); }
+    .dot.blue { background: var(--blue); }
+    .dot.green { background: var(--green); }
+    .dot.amber { background: var(--amber); }
+
+    .footer { margin-top: 42px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--faint); font-size: 12px; }
+    .no-match { display: none; margin-top: 15px; color: var(--amber); }
+
+    @media (max-width: 1050px) {
+      .meta-grid, .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .flow-node:nth-child(3)::after { display: none; }
+    }
+    @media (max-width: 760px) {
+      .shell { padding: 15px 12px 55px; }
+      .hero { padding: 29px 23px; }
+      .grid-2, .grid-3, .path-grid, .flow { grid-template-columns: 1fr; }
+      .flow-node::after { top: auto; right: auto; bottom: -20px; left: 50%; content: "↓"; }
+      .flow-node:nth-child(3)::after { display: block; }
+      .flow-node:last-child::after { display: none; }
+      .meta-grid, .stat-grid { grid-template-columns: 1fr 1fr; }
+      .toolbar { top: 5px; }
+      .toolbar .spacer { display: none; }
+      .search { width: 100%; order: 10; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div class="eyebrow">SA-WRQ · CodeGraph artifact</div>
+      <h1>仓库结构、主要功能与关键调用路径</h1>
+      <p>这是一份面向代码阅读和 artifact 评审的静态地图。内容以当前工作区的 CodeGraph 索引、CMake 构建文件、README、配置文件和测试实现为依据，帮助读者先理解系统边界，再定位到具体文件和函数。</p>
+      <div class="meta-grid">
+        <div class="meta"><strong>38</strong><span>CodeGraph 索引代码文件</span></div>
+        <div class="meta"><strong>649 / 2,068</strong><span>节点 / 调用与依赖关系</span></div>
+        <div class="meta"><strong>C++17</strong><span>Eigen3 + OpenMP</span></div>
+        <div class="meta"><strong>2026-07-20</strong><span>生成日期 · 当前分支 main</span></div>
+      </div>
+    </header>
+
+    <nav class="toolbar" aria-label="页面导航">
+      <a href="#overview">总览</a>
+      <a href="#flows">主流程</a>
+      <a href="#tree">文件树</a>
+      <a href="#catalog">文件职责</a>
+      <a href="#configs">配置</a>
+      <a href="#tests">测试</a>
+      <a href="#build">构建</a>
+      <span class="spacer"></span>
+      <button id="expandAll" type="button">展开全部</button>
+      <button id="collapseAll" type="button">收起全部</button>
+      <input id="search" class="search" type="search" placeholder="搜索文件、函数或关键词…" aria-label="搜索文件、函数或关键词">
+    </nav>
+
+    <main>
+      <section id="overview">
+        <h2>1. 系统定位</h2>
+        <p class="section-intro">SA-WRQ 是一套面向流式向量检索的双层 ANN 框架：稳定的 <code>main</code> IVF/PQ 索引承载主体检索，<code>active_delta</code> 接收新数据，必要时通过 <code>frozen_delta</code> 完成无中断交接；OnlinePQ 负责轻量在线适配，balanced merge 负责把增量数据并回 main 并修复局部 IVF 分桶。</p>
+        <div class="stat-grid">
+          <div class="stat"><div class="value">main</div><div class="label">稳定的大规模 IVF/PQ 路由</div></div>
+          <div class="stat"><div class="value">delta</div><div class="label">新写入与在线 PQ 适配</div></div>
+          <div class="stat"><div class="value">merge</div><div class="label">局部重路由、重分桶、patch main</div></div>
+          <div class="stat"><div class="value">rebuild</div><div class="label">可选的全局 whitening + main 重建兜底</div></div>
+        </div>
+        <div class="callout"><strong>最短理解：</strong>在线路径保持轻量，delta 内主要更新 PQ；当 delta 达到 rows、QE ratio、drift、delta/main ratio 或 list imbalance 条件时冻结并 merge。IVF coarse 层面的结构修复集中在 merge 的局部邻域重分桶，而不是 steady state 下单独刷新 delta coarse centroids。</div>
+        <div class="grid-2">
+          <div class="panel">
+            <h3>运行时路由状态</h3>
+            <p>系统最多同时暴露三路检索：<span class="tag green">main</span><span class="tag amber">frozen_delta</span><span class="tag">active_delta</span>。冻结旧 delta、创建新 active delta 后，查询仍可覆盖整个可见数据集。</p>
+            <p class="symbols">核心数据结构：<code>VersionSet</code>、<code>VectorRecord</code>、<code>SearchResult</code>、<code>DeltaShard</code>、<code>SearchRoute</code>。</p>
+          </div>
+          <div class="panel">
+            <h3>CodeGraph 证据</h3>
+            <p>索引状态为 up to date；CodeGraph 识别出 3 个应用入口、13 个实现模块、4 个 CTest 测试和 1 个 RSS 监控工具。关键调用链由 <code>node</code> 的 callers/callees trail 交叉核对。</p>
+            <p class="symbols">保留的既有工作区修改：<code>.gitignore</code>；本 artifact 新增：<code>artifact.html</code>。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="flows">
+        <h2>2. 架构与关键调用路径</h2>
+        <div class="panel">
+          <h3>主数据流</h3>
+          <div class="flow">
+            <div class="flow-node"><small>Input</small><h3>Config + fvecs</h3><p><code>LoadConfigFromJson</code>、<code>ResolveFvecsPath</code>、<code>LoadFvecs</code>。</p></div>
+            <div class="flow-node"><small>Transform</small><h3>Versioned whitening</h3><p><code>Fit</code> / <code>TransformBatch</code> 产生版本化白化空间。</p></div>
+            <div class="flow-node"><small>Index</small><h3>IVF / PQ</h3><p><code>KMeansIVFIndex::Build</code>、<code>AddBatch</code>、PQ codebook 与 postings。</p></div>
+            <div class="flow-node"><small>Serve</small><h3>Multi-route search</h3><p>main、frozen_delta、active_delta 搜索后统一 merge top-k。</p></div>
+            <div class="flow-node"><small>Maintain</small><h3>Merge / rebuild</h3><p>OnlinePQ、partition patch、可选 global rebuild 与指标输出。</p></div>
+          </div>
+          <div class="legend"><span><i class="dot"></i>公共输入/版本管理</span><span><i class="dot blue"></i>检索核心</span><span><i class="dot green"></i>稳定路由</span><span><i class="dot amber"></i>增量维护</span></div>
+        </div>
+
+        <div class="path-grid" style="margin-top:18px">
+          <article class="path-card filterable">
+            <div class="entry"><a href="apps/build_index.cpp">apps/build_index.cpp</a><span class="line"> · main L153</span></div>
+            <ol>
+              <li>读取 config，解析 base fvecs；没有数据时生成 synthetic matrix。</li>
+              <li><code>WhiteningModel::Fit</code> → <code>TransformBatch</code>，必要时做 L2 normalization。</li>
+              <li><code>IVFIndex::Build</code> 训练 main IVF/PQ，<code>AddRangeToIndex</code> 分块写入记录。</li>
+              <li>序列化 whitening 和 IVF，<code>SavePrebuiltMainIndex</code> 写出 manifest、<code>whitening.bin</code>、<code>main_ivf.bin</code>。</li>
+            </ol>
+          </article>
+          <article class="path-card filterable">
+            <div class="entry"><a href="apps/run_eval.cpp">apps/run_eval.cpp</a><span class="line"> · main L1756</span></div>
+            <ol>
+              <li><code>ParseRuntimeOptions</code> 支持默认配置、query/data 路径和 prebuilt/fresh index 选择。</li>
+              <li>加载或构建 main；按窗口创建 <code>BuildDeltaShard</code>，使用 <code>AddRangeToIndexWithOnlinePQSlidingWindow</code> 更新。</li>
+              <li><code>EvaluateState</code> 先生成 blockwise exact ground truth，再搜索各 route、<code>MergeTopK</code>、exact rerank 并统计 recall/latency/scan。</li>
+              <li>按 delta 状态触发 freeze/merge；必要时重新 fit whitening、重建 main 和 active delta。</li>
+            </ol>
+          </article>
+          <article class="path-card filterable">
+            <div class="entry"><a href="apps/run_eval_ms.cpp">apps/run_eval_ms.cpp</a><span class="line"> · main L1111</span></div>
+            <ol>
+              <li>加载 workload JSON；每一个 insert/search checkpoint 都由 workload 驱动。</li>
+              <li>使用 <code>EvaluateStatePrefix</code> 对当前 prefix 做严格评测，不把 <code>stream_batch_size</code> 当作 workload 语义。</li>
+              <li>记录 snapshot、merge event、global rebuild event 和分位延迟。</li>
+              <li><code>WriteSummaryJson</code> 输出 <code>online_eval.json</code> 或显式指定的 summary 路径。</li>
+            </ol>
+          </article>
+          <article class="path-card filterable">
+            <div class="entry">查询热路径 <span class="line">· multi-route</span></div>
+            <ol>
+              <li>原始 query 由 <code>WhiteningModel::Transform</code> 转到目标版本空间。</li>
+              <li><code>IVFIndex::SearchBatch</code> 逐 route 调用 <code>SearchSingleQuery</code>，使用 routing centroid、PQ precomputed table 和 nprobe。</li>
+              <li>应用层按 doc id 合并多个 route 的候选；启用 exact rerank 时扩大 route top-k 后再排序。</li>
+              <li>输出 recall、p50/p99、QPS、scanned candidates 及可选 miss/route/slow-query diagnostics。</li>
+            </ol>
+          </article>
+        </div>
+
+        <div class="panel" style="margin-top:18px">
+          <h3>Merge 与持久化调用链</h3>
+          <table>
+            <thead><tr><th>链路</th><th>关键步骤</th><th>代码位置</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td>冻结并回 main</td><td><code>freeze_delta</code> → centroid assignment → <code>compute_partition_stats</code> → <code>score_partitions</code> → <code>PreparePartitionPatchImpl</code> → <code>commit_partition_patch</code></td><td><a href="src/index/merge.cpp">src/index/merge.cpp</a><span class="line"> L473–968</span></td></tr>
+              <tr class="filterable"><td>balanced assignment</td><td>在最近 <code>top-r</code> main centroids 中加入 projected-list-size / hard-cap / balance penalty，避免把新记录全部压入过载 list。</td><td><a href="src/index/merge.cpp">src/index/merge.cpp</a><span class="line"> L89–154</span></td></tr>
+              <tr class="filterable"><td>邻域重分桶</td><td><code>TopRNeighborPartitions</code> 找到相邻 partitions，<code>RepartitionNeighborhood</code> 联合旧记录和 delta 记录并生成 patch。</td><td><a href="src/index/merge.cpp">src/index/merge.cpp</a><span class="line"> L283–394、L713–857</span></td></tr>
+              <tr class="filterable"><td>主索引 artifact</td><td>whitening 与 IVF 各自二进制序列化；manifest 保存 format/version/dim/rows/config/dataset 元数据。</td><td><a href="src/common/prebuilt_index.cpp">src/common/prebuilt_index.cpp</a><span class="line"> Save L64、Load L109</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="tree">
+        <h2>3. 文件树</h2>
+        <p class="section-intro">下面的树包含源码、头文件、测试、配置和构建入口。<code>build/</code>、<code>data/</code>、<code>index/</code>、<code>result/</code> 等运行时目录由 <a href=".gitignore">.gitignore</a> 排除，未作为源文件列入。</p>
+        <pre class="tree"><span class="dir">SA-WRQ/</span>
+├── <span class="dir">apps/</span>
+│   ├── <span class="app">build_index.cpp</span>
+│   ├── <span class="app">run_eval.cpp</span>
+│   └── <span class="app">run_eval_ms.cpp</span>
+├── <span class="dir">include/</span>
+│   ├── <span class="dir">common/</span>
+│   │   ├── config.h · dataset.h · prebuilt_index.h · result.h
+│   │   ├── serialization.h · status.h · timer.h · types.h
+│   ├── <span class="dir">eval/</span>
+│   │   └── gt.h · metrics.h
+│   ├── <span class="dir">index/</span>
+│   │   └── ivf.h · merge.h · postings.h
+│   ├── <span class="dir">search/</span>
+│   │   └── exact_search.h · hybrid_search.h · rerank.h
+│   └── <span class="dir">whitening/</span>
+│       └── whitening.h
+├── <span class="dir">src/</span>
+│   ├── <span class="dir">common/</span> · config.cpp · dataset.cpp · prebuilt_index.cpp · serialization.cpp
+│   ├── <span class="dir">eval/</span> · gt.cpp · metrics.cpp
+│   ├── <span class="dir">index/</span> · ivf.cpp · merge.cpp · postings.cpp
+│   ├── <span class="dir">search/</span> · exact_search.cpp · hybrid_search.cpp · rerank.cpp
+│   └── <span class="dir">whitening/</span> · whitening.cpp
+├── <span class="dir">tests/</span>
+│   ├── test_interfaces.cpp · test_recall_smoke.cpp
+│   ├── test_online_pq.cpp · test_merge.cpp
+├── <span class="dir">tools/</span>
+│   └── monitor_rss.py
+├── <span class="dir">configs/</span>
+│   ├── <span class="dir">sift/</span> · sift.json · sift_drift.json
+│   ├── <span class="dir">sift10m/</span> · sift10m.json · sift10m_nearest_merge.json
+│   │               sift10m_no_merge.json · sift10m_no_onlinepq.json · sift10m_no_rebuild.json
+│   ├── deep10m/deep10m.json · gist/gist.json · openai/openai.json
+├── <span class="dir">cmake/</span>
+│   └── Options.cmake
+├── CMakeLists.txt
+├── README.md
+├── .gitignore
+└── artifact.html <span class="ignored">← 本文档</span></pre>
+      </section>
+
+      <section id="catalog">
+        <h2>4. 文件职责目录</h2>
+        <p class="section-intro">表格中的“主要符号”来自 CodeGraph 的 file/symbol map 和关键 callers/callees trail；它们不是所有内部 helper 的穷举，而是阅读该文件时最值得先看的入口。</p>
+
+        <details open class="filter-group">
+          <summary>应用入口 · <code>apps/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要函数 / 依赖关系</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="apps/build_index.cpp">apps/build_index.cpp</a><span class="line"> · 320 lines</span></td><td>离线构建可复用的 main whitening + IVF/PQ prebuilt index；支持真实 fvecs 或 synthetic 数据。</td><td class="symbols"><code>main</code>、<code>ResolveMainRows</code>、<code>AddRangeToIndex</code>、<code>DefaultPrebuiltIndexDir</code>；调用 <code>Fit</code>、<code>Build</code>、<code>Serialize</code>、<code>SavePrebuiltMainIndex</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="apps/run_eval.cpp">apps/run_eval.cpp</a><span class="line"> · 4277 lines</span></td><td>常规评测和 streaming 评测主程序：加载/构建 main，管理 delta 生命周期，执行多路查询、merge、global rebuild 和详细指标统计。</td><td class="symbols"><code>ParseRuntimeOptions</code>、<code>BuildDeltaShard</code>、<code>AddRangeToIndex</code>、<code>AddRangeToIndexWithOnlinePQSlidingWindow</code>、<code>EvaluateState</code>、<code>MergeTopK</code>、<code>main</code>；支持 <code>--use-prebuilt-index</code>、<code>--prebuilt-index</code>、<code>--fresh-index</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="apps/run_eval_ms.cpp">apps/run_eval_ms.cpp</a><span class="line"> · 2288 lines</span></td><td>严格 workload 驱动的 micro/streaming 评测；每个操作和 checkpoint 按 workload JSON 的 prefix 执行，输出 snapshot 和 summary JSON。</td><td class="symbols"><code>LoadWorkloadJson</code>、<code>BuildDeltaShard</code>、<code>EvaluateStatePrefix</code>、<code>WriteSummaryJson</code>、<code>main</code>；维护 <code>WorkloadOp</code>、<code>SnapshotLite</code> 和 route-level 指标。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+
+        <details open class="filter-group">
+          <summary>公共 API · <code>include/common/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要符号</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="include/common/config.h">include/common/config.h</a></td><td>所有运行时开关和阈值的配置模型；覆盖 IVF/PQ、whitening、streaming、merge、rebuild、OnlinePQ、diagnostics。</td><td class="symbols"><code>Config</code>、<code>LoadConfigFromJson</code>、<code>Config::ToString</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/dataset.h">include/common/dataset.h</a></td><td>fvecs 数据读取和路径解析接口；支持传入具体文件或自动寻找指定 suffix 的目录。</td><td class="symbols"><code>LoadFvecs</code>、<code>ResolveFvecsPath</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/prebuilt_index.h">include/common/prebuilt_index.h</a></td><td>主索引 artifact 的内存表示和保存/加载接口。</td><td class="symbols"><code>PrebuiltMainIndexMetadata</code>、<code>PrebuiltMainIndexArtifact</code>、<code>SavePrebuiltMainIndex</code>、<code>LoadPrebuiltMainIndex</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/result.h">include/common/result.h</a></td><td>统一的值或错误返回容器，支撑跨模块的显式错误传播。</td><td class="symbols"><code>Result&lt;T&gt;</code>、<code>ok</code>、<code>status</code>、<code>value</code>、<code>Ok</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/serialization.h">include/common/serialization.h</a></td><td>二进制 blob 的文件级读写声明，被 prebuilt index 和接口测试使用。</td><td class="symbols"><code>SaveBinary</code>、<code>LoadBinary</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/status.h">include/common/status.h</a></td><td>统一错误码与消息格式，覆盖 invalid argument、not found、I/O、internal、unavailable 等状态。</td><td class="symbols"><code>StatusCode</code>、<code>Status</code>、<code>OK</code>、<code>InvalidArgument</code>、<code>NotFound</code>、<code>IOError</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/timer.h">include/common/timer.h</a></td><td>轻量 wall-clock 计时器，贯穿构建、写入、查询、merge 和维护统计。</td><td class="symbols"><code>Timer</code>、<code>Reset</code>、<code>ElapsedMillis</code>、<code>Clock</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/common/types.h">include/common/types.h</a></td><td>跨模块共享的 ID、矩阵、版本、向量记录和搜索结果类型。</td><td class="symbols"><code>DocId</code>、<code>VersionId</code>、<code>MatrixRM</code>、<code>VersionSet</code>、<code>Candidate</code>、<code>SearchResult</code>、<code>VectorRecord</code>。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+
+        <details open class="filter-group">
+          <summary>评测 API · <code>include/eval/</code> + <code>src/eval/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要符号</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="include/eval/gt.h">include/eval/gt.h</a><br><a class="path" href="src/eval/gt.cpp">src/eval/gt.cpp</a></td><td>为 query/database 矩阵计算 exact top-k doc-id ground truth。</td><td class="symbols"><code>ComputeGroundTruth</code>；被 <code>test_interfaces</code> 和 <code>test_recall_smoke</code> 使用。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/eval/metrics.h">include/eval/metrics.h</a><br><a class="path" href="src/eval/metrics.cpp">src/eval/metrics.cpp</a></td><td>计算 recall@k 和延迟分位数，供应用评测和 smoke tests 共用。</td><td class="symbols"><code>RecallAtK</code>、<code>BenchmarkSummary</code>、<code>SummarizeLatencies</code>。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+
+        <details open class="filter-group">
+          <summary>索引 API · <code>include/index/</code> + <code>src/index/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要符号 / 关键职责</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="include/index/ivf.h">include/index/ivf.h</a></td><td>IVF/PQ、OnlinePQ、partition snapshot/patch 和持久化的抽象 API。</td><td class="symbols"><code>IVFParams</code>、<code>OnlinePQUpdateOptions</code>、<code>OnlinePQUpdateStats</code>、<code>PQRuntimeState</code>、<code>PartitionPatch</code>、<code>IVFIndex</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="src/index/ivf.cpp">src/index/ivf.cpp</a><span class="line"> · 2368 lines</span></td><td>核心 KMeans IVF 实现：路由 centroid、PQ codebook、posting/list 存储、搜索、增量写入、OnlinePQ、partition patch 和序列化。</td><td class="symbols"><code>KMeansIVFIndex</code>、<code>Build</code>、<code>AddBatch</code>、<code>AddWithOnlinePQSlidingWindowImpl</code>、<code>SearchSingleQuery</code>、<code>Search</code>、<code>SearchBatch</code>、<code>CommitPartitionPatch</code>、<code>Serialize</code>、<code>Deserialize</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/index/merge.h">include/index/merge.h</a></td><td>delta→main merge 的数据结构和公开流程接口。</td><td class="symbols"><code>FrozenDelta</code>、<code>DeltaAssignment</code>、<code>PartitionStats</code>、<code>MergeOptions</code>、<code>MergeReport</code>、<code>freeze_delta</code>、<code>prepare_partition_patch</code>、<code>merge_frozen_delta_into_main</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="src/index/merge.cpp">src/index/merge.cpp</a></td><td>实现冻结、分配、评分、append/recluster 选择、局部邻域重分桶及 patch commit；balanced_append 的主要落点。</td><td class="symbols"><code>assign_delta_to_main_centroids_for_merge</code>、<code>TopRNeighborPartitions</code>、<code>RepartitionNeighborhood</code>、<code>compute_partition_stats</code>、<code>score_partitions</code>、<code>PreparePartitionPatchImpl</code>、<code>MergeFrozenDeltaIntoMainImpl</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/index/postings.h">include/index/postings.h</a><br><a class="path" href="src/index/postings.cpp">src/index/postings.cpp</a></td><td>按 version + IVF partition 组织可读快照和追加记录的低层 posting store；当前直接使用者主要是接口测试。</td><td class="symbols"><code>PostingListView</code>、<code>PostingStore</code>、<code>GetPostingList</code>、<code>AddPosting</code>。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+
+        <details open class="filter-group">
+          <summary>搜索与重排 · <code>include/search/</code> + <code>src/search/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要符号</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="include/search/hybrid_search.h">include/search/hybrid_search.h</a><br><a class="path" href="src/search/hybrid_search.cpp">src/search/hybrid_search.cpp</a></td><td>面向单 query 的高层查询 façade；保存 IVF/version 和可选 whitening，负责把原始 query 转换后交给 IVF。</td><td class="symbols"><code>SearchParams</code>、<code>HybridSearcher</code>、<code>ConcreteHybridSearcher</code>、<code>SetIndex</code>、<code>SetWhitening</code>、<code>Search</code>、<code>CreateHybridSearcher</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/search/exact_search.h">include/search/exact_search.h</a><br><a class="path" href="src/search/exact_search.cpp">src/search/exact_search.cpp</a></td><td>批量 brute-force L2 baseline，返回每个 query 的 exact doc-id top-k；应用层的大规模评测另有 blockwise helper。</td><td class="symbols"><code>ExactSearchBatch</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="include/search/rerank.h">include/search/rerank.h</a><br><a class="path" href="src/search/rerank.cpp">src/search/rerank.cpp</a></td><td>通过 doc-id→vector callback 对候选重新计算 exact L2 距离并排序。</td><td class="symbols"><code>RerankL2</code>、<code>Candidate::rerank_dist</code>。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+
+        <details open class="filter-group">
+          <summary>Whitening · <code>include/whitening/</code> + <code>src/whitening/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要符号</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="include/whitening/whitening.h">include/whitening/whitening.h</a></td><td>版本化 whitening 模型的训练、单向量/批量变换、running stats、版本桥接和序列化接口。</td><td class="symbols"><code>WhiteningModel</code>、<code>Fit</code>、<code>Transform</code>、<code>TransformBatch</code>、<code>UpdateStats</code>、<code>FinalizeNewVersion</code>、<code>Bridge</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="src/whitening/whitening.cpp">src/whitening/whitening.cpp</a></td><td>ZCA whitening 的具体实现；以不可变 version payload 服务查询，并支持 pending stats 形成新版本。</td><td class="symbols"><code>ZCAWhiteningModel</code>、<code>ComputeZCATransform</code>、<code>ComputePayloadFromCov</code>、<code>ResetPending</code>、<code>Serialize</code>、<code>Deserialize</code>、<code>CreateWhiteningModel</code>。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+
+        <details open class="filter-group">
+          <summary>公共实现 · <code>src/common/</code></summary>
+          <div class="details-body"><table>
+            <thead><tr><th>文件</th><th>主要功能</th><th>主要符号</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="src/common/config.cpp">src/common/config.cpp</a></td><td>以轻量 regex extractor 从 JSON 文本读取配置，并做 streaming、rerank、merge、rebuild、OnlinePQ 参数校验。</td><td class="symbols"><code>ExtractUint</code>、<code>ExtractBool</code>、<code>ExtractString</code>、<code>ExtractDouble</code>、<code>Config::ToString</code>、<code>LoadConfigFromJson</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="src/common/dataset.cpp">src/common/dataset.cpp</a></td><td>解析 binary fvecs；检查维度一致性，并在文件/目录输入之间解析目标 suffix。</td><td class="symbols"><code>LoadFvecs</code>、<code>ResolveFvecsPath</code>、<code>EndsWith</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="src/common/prebuilt_index.cpp">src/common/prebuilt_index.cpp</a></td><td>将 whitening 和 IVF bytes 写入 prebuilt 目录并维护 manifest；加载时校验 format version 和 metadata。</td><td class="symbols"><code>SavePrebuiltMainIndex</code>、<code>LoadPrebuiltMainIndex</code>、<code>JsonEscape</code>、<code>ExtractUint32</code>、<code>ExtractString</code>。</td></tr>
+              <tr class="filterable"><td><a class="path" href="src/common/serialization.cpp">src/common/serialization.cpp</a></td><td>最小化的 binary file blob 读写实现，向上层返回 <code>Status</code>。</td><td class="symbols"><code>SaveBinary</code>、<code>LoadBinary</code>。</td></tr>
+            </tbody>
+          </table></div>
+        </details>
+      </section>
+
+      <section id="configs">
+        <h2>5. 配置文件与实验变体</h2>
+        <p class="section-intro">所有配置文件共用 <code>Config</code> schema。它们不是不同实现，而是针对数据集规模、merge 策略、OnlinePQ 和 global rebuild 的实验 profile。</p>
+        <div class="panel" style="margin-bottom:18px">
+          <h3>关键配置域</h3>
+          <div>
+            <span class="tag">IVF: ivf_nlist / nprobe</span>
+            <span class="tag">PQ: pq_enable / pq_m / pq_nbits / pq_residual</span>
+            <span class="tag green">Streaming: main_index_rows / delta_train_window / stream_batch_size</span>
+            <span class="tag amber">Merge: merge_trigger_* / merge_assignment_*</span>
+            <span class="tag rose">OnlinePQ: online_pq_enable / update_scheme / qe_ratio</span>
+            <span class="tag">Rebuild: global_rebuild_*</span>
+            <span class="tag">Diagnostics: miss / latency / rerank source</span>
+          </div>
+        </div>
+        <div class="panel">
+          <table class="config-table">
+            <thead><tr><th>配置文件</th><th>profile 特征</th><th>主要用途 / 有意差异</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="configs/sift/sift.json">configs/sift/sift.json</a></td><td>128D，nlist 4096，main 200K</td><td>默认 SIFT streaming profile；OnlinePQ 开启、balanced_append、global rebuild 关闭。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/sift/sift_drift.json">configs/sift/sift_drift.json</a></td><td>128D，PQ M=16，main imbalance threshold=35</td><td>SIFT drift / rebuild profile；开启 global rebuild，并降低 active/frozen exact-rerank candidates。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/sift10m/sift10m.json">configs/sift10m/sift10m.json</a></td><td>128D，nlist 8192，main 2M，batch 100K</td><td>大规模 SIFT profile；nprobe 48，OnlinePQ 开启，balanced merge，global rebuild 关闭。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/sift10m/sift10m_nearest_merge.json">configs/sift10m/sift10m_nearest_merge.json</a></td><td>与 sift10m 类似</td><td>merge assignment ablation：<code>merge_assignment_mode="nearest"</code>，并开启 global rebuild。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/sift10m/sift10m_no_merge.json">configs/sift10m/sift10m_no_merge.json</a></td><td>大规模 SIFT</td><td>merge 对照 profile：把 imbalance trigger 设为极大值，保留其他 state triggers；global rebuild 开启。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/sift10m/sift10m_no_onlinepq.json">configs/sift10m/sift10m_no_onlinepq.json</a></td><td>大规模 SIFT</td><td>OnlinePQ ablation：<code>online_pq_enable=false</code>，其余主要索引设置保持相近。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/sift10m/sift10m_no_rebuild.json">configs/sift10m/sift10m_no_rebuild.json</a></td><td>大规模 SIFT</td><td>global rebuild ablation：<code>enable_global_rebuild=false</code>，OnlinePQ 和 balanced merge 保留。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/deep10m/deep10m.json">configs/deep10m/deep10m.json</a></td><td>96D，nlist 8192，main 2M，batch 100K</td><td>Deep10M streaming profile；PQ M=16、nprobe 64、OnlinePQ 开启。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/gist/gist.json">configs/gist/gist.json</a></td><td>960D，nlist 4096，main 200K，batch 10K</td><td>高维 GIST profile；delta nlist 1024，OnlinePQ 和 balanced merge 开启。</td></tr>
+              <tr class="filterable"><td><a class="path" href="configs/openai/openai.json">configs/openai/openai.json</a></td><td>1536D，cosine=true，main 200K</td><td>高维 cosine profile；PQ M=192，global rebuild 开启。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><strong>配置读取边界：</strong><code>src/common/config.cpp</code> 使用 regex 提取已知字段，而不是通用 JSON parser；新增字段需要同时在 <code>Config</code>、读取逻辑和校验逻辑中补齐。</div>
+      </section>
+
+      <section id="tests">
+        <h2>6. 测试覆盖</h2>
+        <p class="section-intro">CMake 注册了 4 个 CTest target。测试整体是接口、召回、OnlinePQ 和 merge 四个层次；未包含端到端大数据集回归数据。</p>
+        <div class="panel">
+          <table>
+            <thead><tr><th>测试</th><th>验证范围</th><th>关键断言 / 价值</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><a class="path" href="tests/test_interfaces.cpp">tests/test_interfaces.cpp</a><span class="line"> · CTest: test_interfaces</span></td><td>跨模块 API smoke test。</td><td class="symbols">whitening Fit/Transform/Bridge；IVF Build/Add/Search 和 bad version error；HybridSearcher；PostingStore；binary serialization；RecallAtK、ground truth、RerankL2、fvecs loader。</td></tr>
+              <tr class="filterable"><td><a class="path" href="tests/test_recall_smoke.cpp">tests/test_recall_smoke.cpp</a><span class="line"> · CTest: test_recall_smoke</span></td><td>小矩阵端到端召回 smoke test。</td><td class="symbols">构建 IVF，生成 exact ground truth，使用 HybridSearcher 逐 query 搜索并计算 recall。</td></tr>
+              <tr class="filterable"><td><a class="path" href="tests/test_online_pq.cpp">tests/test_online_pq.cpp</a><span class="line"> · CTest: test_online_pq</span></td><td>OnlinePQ 行为和 sliding-window 更新。</td><td class="symbols">无更新路径与 Add 等价；main→delta 固定 codebook/state 初始化；触发后 codebook/count 更新；旧 code index 不改写但搜索使用新 codebook；insert + delete 保持窗口容量。</td></tr>
+              <tr class="filterable"><td><a class="path" href="tests/test_merge.cpp">tests/test_merge.cpp</a><span class="line"> · CTest: test_merge</span></td><td>delta→main merge 算法和 patch 提交。</td><td class="symbols">freeze、centroid assignment、partition stats/score、append、local recluster、patch+commit、main-space PQ re-encode、统一 merge API，以及 balanced_append 偏向健康邻居的行为。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="build">
+        <h2>7. 构建与产物</h2>
+        <div class="grid-2">
+          <div class="panel">
+            <h3>CMake target</h3>
+            <table>
+              <thead><tr><th>target</th><th>类型</th><th>组成 / 用途</th></tr></thead>
+              <tbody>
+                <tr class="filterable"><td><code>ann</code></td><td>library</td><td>common、whitening、index、search、eval 的全部实现。</td></tr>
+                <tr class="filterable"><td><code>run_eval</code></td><td>executable</td><td>常规和 streaming 评测。</td></tr>
+                <tr class="filterable"><td><code>build_index</code></td><td>executable</td><td>构建 main prebuilt index。</td></tr>
+                <tr class="filterable"><td><code>run_eval_ms</code></td><td>executable</td><td>workload JSON 严格评测。</td></tr>
+                <tr class="filterable"><td><code>test_*</code></td><td>CTest</td><td>interfaces、recall smoke、online PQ、merge。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="panel">
+            <h3>README 中的最短运行路径</h3>
+            <pre class="tree">cmake -S . -B build
+cmake --build build -j
+./build/run_eval configs/sift/sift.json data/sift
+
+# 先构建并复用 main index
+./build/build_index configs/sift/sift.json data/sift
+./build/run_eval configs/sift/sift.json data/sift --use-prebuilt-index
+
+# 运行测试
+ctest --test-dir build --output-on-failure</pre>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <h3>Prebuilt index 目录内容</h3>
+          <table>
+            <thead><tr><th>文件</th><th>来源</th><th>作用</th></tr></thead>
+            <tbody>
+              <tr class="filterable"><td><code>manifest.json</code></td><td><code>SavePrebuiltMainIndex</code></td><td>format/version、dim、main_rows、total_rows、whiten_version、index_version、config_path、dataset_path。</td></tr>
+              <tr class="filterable"><td><code>whitening.bin</code></td><td><code>WhiteningModel::Serialize</code></td><td>版本化 whitening payload。</td></tr>
+              <tr class="filterable"><td><code>main_ivf.bin</code></td><td><code>IVFIndex::Serialize</code></td><td>main IVF/PQ index state；加载后 rebuild list PQ codes、precomputed table 和 doc map。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="notes">
+        <h2>8. 阅读时应注意的边界</h2>
+        <div class="grid-3">
+          <div class="panel filterable"><h3>OnlinePQ ≠ coarse refresh</h3><p><code>AddWithOnlinePQSlidingWindowImpl</code> 更新 residual PQ 统计和 codebook；当前 steady state 不单独刷新 delta coarse centroids。</p></div>
+          <div class="panel filterable"><h3>Merge 承担 IVF 修复</h3><p><code>balanced_append</code> 在 main centroid 邻域内重新分配并 patch partitions；它不是简单地把每条 delta 记录追加到最近 list。</p></div>
+          <div class="panel filterable"><h3>两类 exact baseline</h3><p><code>src/search/exact_search.cpp</code> 提供公共 <code>ExactSearchBatch</code>；<code>run_eval.cpp</code> 另有面向 doc-id 路由集合的 blockwise ground-truth helper。</p></div>
+          <div class="panel filterable"><h3>版本是显式状态</h3><p>whitening 和 IVF 都以 <code>VersionId</code> 参与 route；错误 version 会通过 <code>Status</code>/<code>Result</code> 返回，而不是静默回退。</p></div>
+          <div class="panel filterable"><h3>MS workload 在仓库外提供</h3><p><code>run_eval_ms</code> 会从 dataset 目录寻找 <code>_workload.json</code>，但当前源树中没有内置 workload 示例；运行时需显式提供或放置对应文件。</p></div>
+          <div class="panel filterable"><h3>当前工作区状态</h3><p>生成 artifact 前未修改既有工作；<code>.gitignore</code> 的原始修改保留。若提交 artifact，请单独审阅是否希望把它纳入版本库。</p></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      生成依据：CodeGraph <code>files</code>、<code>status</code>、关键文件 symbol map 和 callers/callees trail；同时核对 <code>README.md</code>、<code>CMakeLists.txt</code>、<code>cmake/Options.cmake</code>、<code>configs/*.json</code> 与测试源码。此文件是静态说明，不会自动随源码变化更新。
+    </footer>
+    <div id="noMatch" class="no-match">没有匹配项。可以尝试搜索目录名、文件名、函数名或关键词（例如 <code>merge</code>、<code>OnlinePQ</code>、<code>whitening</code>）。</div>
+  </div>
+
+  <script>
+    (function () {
+      const search = document.getElementById('search');
+      const rows = Array.from(document.querySelectorAll('.filterable'));
+      const groups = Array.from(document.querySelectorAll('.filter-group'));
+      const noMatch = document.getElementById('noMatch');
+
+      function filter() {
+        const needle = search.value.trim().toLowerCase();
+        let visible = 0;
+        rows.forEach(function (row) {
+          const match = !needle || row.textContent.toLowerCase().includes(needle);
+          row.style.display = match ? '' : 'none';
+          if (match) visible += 1;
+        });
+        groups.forEach(function (group) {
+          const hasMatch = !needle || Array.from(group.querySelectorAll('.filterable')).some(function (row) {
+            return row.style.display !== 'none';
+          });
+          group.style.display = hasMatch ? '' : 'none';
+          if (needle && hasMatch) group.open = true;
+        });
+        noMatch.style.display = needle && visible === 0 ? 'block' : 'none';
+      }
+
+      search.addEventListener('input', filter);
+      document.getElementById('expandAll').addEventListener('click', function () {
+        document.querySelectorAll('details').forEach(function (item) { item.open = true; });
+      });
+      document.getElementById('collapseAll').addEventListener('click', function () {
+        document.querySelectorAll('details').forEach(function (item) { item.open = false; });
+      });
+    }());
+  </script>
+</body>
+</html>

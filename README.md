@@ -289,6 +289,22 @@ cmake --build build -j
 ./build/run_eval configs/sift/sift.json data/sift
 ```
 
+```bash
+cmake -S . -B build_release \
+-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+-DANN_ENABLE_PROFILING=ON
+```
+
+在支持 AVX-512 的目标机器上，可以启用本机 ISA 优化；该构建不可直接移植到不支持对应指令集的机器：
+
+```bash
+cmake -S . -B build_native \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DANN_ENABLE_PROFILING=ON \
+  -DANN_ENABLE_NATIVE=ON
+cmake --build build_native -j
+```
+
 预先构建 main 索引和码本：
 
 ```bash

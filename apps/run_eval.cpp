@@ -1270,7 +1270,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 
   Timer whitening_wall_timer;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static)
 #endif
   for (int64_t i = 0; i < static_cast<int64_t>(nq); ++i) {
     if (failed.load()) {

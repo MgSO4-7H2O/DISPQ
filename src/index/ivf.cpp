@@ -20,6 +20,7 @@
 #endif
 
 #include "common/timer.h"
+#include "soa_kernels.h"
 
 namespace ann {
 namespace {
@@ -316,6 +317,9 @@ struct IndexData {
   MatrixRM routing_centroids;
   Eigen::VectorXf routing_centroid_norms;
   std::vector<MatrixRM> pq_codebooks;
+  // Derived cache for the SIFT1M fast path. It is rebuilt from the serialized
+  // AoS codebooks and is intentionally not part of the index payload.
+  std::vector<MatrixRM> pq_codebooks_soa;
   std::vector<std::vector<uint8_t>> pq_codes_by_list;
   bool use_precomputed_table{false};
   std::vector<float> pq_precomputed_table;
@@ -333,6 +337,35 @@ struct IndexData {
   uint64_t ntotal{0};
   double last_patch_pq_reencode_ms{0.0};
 };
+
+void RebuildPQSoACache(IndexData* data) {
+  if (data == nullptr) {
+    return;
+  }
+  data->pq_codebooks_soa.clear();
+  if (!data->use_pq || data->dsub != 8 || data->Ks != 256 ||
+      data->pq_codebooks.size() != data->M) {
+    return;
+  }
+
+  data->pq_codebooks_soa.resize(data->M);
+  for (uint32_t m = 0; m < data->M; ++m) {
+    const MatrixRM& aos = data->pq_codebooks[static_cast<size_t>(m)];
+    if (aos.rows() != static_cast<Eigen::Index>(data->Ks) ||
+        aos.cols() != static_cast<Eigen::Index>(data->dsub)) {
+      data->pq_codebooks_soa.clear();
+      return;
+    }
+    MatrixRM soa(static_cast<Eigen::Index>(data->dsub),
+                 static_cast<Eigen::Index>(data->Ks));
+    for (Eigen::Index k = 0; k < aos.rows(); ++k) {
+      for (Eigen::Index d = 0; d < aos.cols(); ++d) {
+        soa(d, k) = aos(k, d);
+      }
+    }
+    data->pq_codebooks_soa[static_cast<size_t>(m)] = std::move(soa);
+  }
+}
 
 void AppendIndexData(std::vector<uint8_t>* bytes, const IndexData& data) {
   AppendPod(bytes, data.dim);
@@ -463,6 +496,7 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
       return Status::InvalidArgument("PQ codebook shape mismatch in IVF payload");
     }
   }
+  RebuildPQSoACache(data.get());
 
   uint32_t counts_count = 0;
   status = ReadPod(bytes, offset, &counts_count);
@@ -574,6 +608,18 @@ uint32_t NearestCodeword(Eigen::Ref<const Eigen::VectorXf> sub,
   return best_idx;
 }
 
+uint32_t NearestCodeword(Eigen::Ref<const Eigen::VectorXf> sub,
+                         const MatrixRM& codebook,
+                         const MatrixRM* codebook_soa,
+                         float* best_dist_out) {
+  if (codebook_soa != nullptr && sub.size() == 8 && codebook.rows() == 256 &&
+      codebook.cols() == 8 && codebook_soa->rows() == 8 &&
+      codebook_soa->cols() == 256) {
+    return internal::AssignPQSoA8x256(sub.data(), codebook_soa->data(), best_dist_out);
+  }
+  return NearestCodeword(sub, codebook, best_dist_out);
+}
+
 MatrixRM InitializeCentroids(Eigen::Ref<const MatrixRM> X, uint32_t nlist) {
   const int64_t num_vecs = X.rows();
   const int64_t dim = X.cols();
@@ -588,47 +634,69 @@ MatrixRM InitializeCentroids(Eigen::Ref<const MatrixRM> X, uint32_t nlist) {
   return centroids;
 }
 
-void RunKMeans(Eigen::Ref<const MatrixRM> X, MatrixRM* centroids, uint32_t iterations) {
+void RunKMeans(Eigen::Ref<const MatrixRM> X,
+               MatrixRM* centroids,
+               uint32_t iterations) {
   const int64_t num_vecs = X.rows();
   const int64_t dim = X.cols();
   const int64_t k = centroids->rows();
   std::vector<int> assignments(num_vecs, 0);
 
   const uint32_t kmeans_iters = (iterations == 0) ? kDefaultKMeansIterations : iterations;
-  for (uint32_t iter = 0; iter < kmeans_iters; ++iter) {
-    // Assignment step.
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+  // KMeans is also invoked from the outer PQ-subspace parallel loop below.
+  // Do not create nested teams: parallelize either the subspaces or this
+  // KMeans instance, but never both at the same time.
+  const bool use_parallel = !omp_in_parallel();
+  const int num_threads = use_parallel ? std::max(1, omp_get_max_threads()) : 1;
 #endif
-    for (int64_t i = 0; i < num_vecs; ++i) {
-      const Eigen::VectorXf vec = X.row(i).transpose();
-      float best = std::numeric_limits<float>::max();
-      int best_idx = 0;
-      for (int64_t c = 0; c < k; ++c) {
-        const float dist = (centroids->row(c).transpose() - vec).squaredNorm();
-        if (dist < best) {
-          best = dist;
-          best_idx = static_cast<int>(c);
+  for (uint32_t iter = 0; iter < kmeans_iters; ++iter) {
+#if defined(__AVX512F__)
+    if (dim == 8 && k == 256) {
+      MatrixRM centroids_soa(dim, k);
+      for (Eigen::Index centroid = 0; centroid < centroids->rows(); ++centroid) {
+        for (Eigen::Index d = 0; d < centroids->cols(); ++d) {
+          centroids_soa(d, centroid) = (*centroids)(centroid, d);
         }
       }
-      assignments[static_cast<size_t>(i)] = best_idx;
+#ifdef _OPENMP
+#pragma omp parallel for if (use_parallel) schedule(static)
+#endif
+      for (int64_t i = 0; i < num_vecs; ++i) {
+        assignments[static_cast<size_t>(i)] = static_cast<int>(
+            internal::AssignPQSoA8x256(X.row(i).data(), centroids_soa.data(), nullptr));
+      }
+    } else
+#endif
+    {
+      // Assignment step.
+#ifdef _OPENMP
+#pragma omp parallel for if (use_parallel) schedule(static)
+#endif
+      for (int64_t i = 0; i < num_vecs; ++i) {
+        const Eigen::VectorXf vec = X.row(i).transpose();
+        float best = std::numeric_limits<float>::max();
+        int best_idx = 0;
+        for (int64_t c = 0; c < k; ++c) {
+          const float dist = (centroids->row(c).transpose() - vec).squaredNorm();
+          if (dist < best) {
+            best = dist;
+            best_idx = static_cast<int>(c);
+          }
+        }
+        assignments[static_cast<size_t>(i)] = best_idx;
+      }
     }
 
     // Update step.
     MatrixRM new_centroids = MatrixRM::Zero(k, dim);
     std::vector<int64_t> counts(static_cast<size_t>(k), 0);
 #ifdef _OPENMP
-    int num_threads = 1;
-#pragma omp parallel
-    {
-#pragma omp single
-      { num_threads = omp_get_num_threads(); }
-    }
     std::vector<MatrixRM> partial_sums(static_cast<size_t>(num_threads), MatrixRM::Zero(k, dim));
     std::vector<std::vector<int64_t>> partial_counts(
         static_cast<size_t>(num_threads), std::vector<int64_t>(static_cast<size_t>(k), 0));
 
-#pragma omp parallel
+#pragma omp parallel if (use_parallel)
     {
       const int tid = omp_get_thread_num();
       MatrixRM& thread_sum = partial_sums[static_cast<size_t>(tid)];
@@ -1079,7 +1147,7 @@ class KMeansIVFIndex : public IVFIndex {
           }
         }
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static)
 #endif
         for (uint32_t m = 0; m < data->M; ++m) {
           const Eigen::Index offset = static_cast<Eigen::Index>(m * data->dsub);
@@ -1090,6 +1158,8 @@ class KMeansIVFIndex : public IVFIndex {
           data->pq_codebooks[static_cast<size_t>(m)] = std::move(codebook);
         }
       }
+
+      RebuildPQSoACache(data.get());
 
       bool use_fixed_counts = false;
       if (!p.fixed_pq_counts.empty()) {
@@ -1130,8 +1200,13 @@ class KMeansIVFIndex : public IVFIndex {
                 residual.data() + static_cast<Eigen::Index>(m * data->dsub),
                 static_cast<Eigen::Index>(data->dsub));
             float best_dist = 0.0f;
+            const MatrixRM* codebook_soa =
+                data->pq_codebooks_soa.size() == data->M
+                    ? &data->pq_codebooks_soa[static_cast<size_t>(m)]
+                    : nullptr;
             const uint32_t k =
-                NearestCodeword(sub, data->pq_codebooks[static_cast<size_t>(m)], &best_dist);
+                NearestCodeword(sub, data->pq_codebooks[static_cast<size_t>(m)], codebook_soa,
+                                &best_dist);
             computed_counts[static_cast<size_t>(m)][static_cast<size_t>(k)]++;
             err2 += static_cast<double>(best_dist);
             r2 += static_cast<double>(sub.squaredNorm());
@@ -1207,10 +1282,14 @@ class KMeansIVFIndex : public IVFIndex {
           Eigen::Map<const Eigen::VectorXf> sub(
               residual.data() + static_cast<Eigen::Index>(m * data.dsub),
               static_cast<Eigen::Index>(data.dsub));
+          const MatrixRM* codebook_soa =
+              data.pq_codebooks_soa.size() == data.M
+                  ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
+                  : nullptr;
           float best_dist = 0.0f;
           const uint32_t k = collect_initial_pq_stats
-                                 ? NearestCodeword(sub, codebook, &best_dist)
-                                 : NearestCodeword(sub, codebook, nullptr);
+                                 ? NearestCodeword(sub, codebook, codebook_soa, &best_dist)
+                                 : NearestCodeword(sub, codebook, codebook_soa, nullptr);
           entry.pq_code[static_cast<size_t>(m)] = static_cast<uint8_t>(k);
           if (collect_initial_pq_stats) {
             err2 += static_cast<double>(best_dist);
@@ -1388,8 +1467,12 @@ class KMeansIVFIndex : public IVFIndex {
             Eigen::Map<const Eigen::VectorXf> sub(
                 residual.data() + static_cast<Eigen::Index>(m * data.dsub),
                 static_cast<Eigen::Index>(data.dsub));
+            const MatrixRM* codebook_soa =
+                data.pq_codebooks_soa.size() == data.M
+                    ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
+                    : nullptr;
             entry.pq_code[static_cast<size_t>(m)] =
-                static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
+                static_cast<uint8_t>(NearestCodeword(sub, codebook, codebook_soa, nullptr));
           }
         } else {
           entry.vector = rec.x;
@@ -1505,8 +1588,12 @@ class KMeansIVFIndex : public IVFIndex {
         Eigen::Map<const Eigen::VectorXf> sub(
             residual_ptr + static_cast<Eigen::Index>(m * data.dsub),
             static_cast<Eigen::Index>(data.dsub));
+        const MatrixRM* codebook_soa =
+            data.pq_codebooks_soa.size() == data.M
+                ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
+                : nullptr;
         float best_dist = 0.0f;
-        const uint32_t best_idx = NearestCodeword(sub, codebook, &best_dist);
+        const uint32_t best_idx = NearestCodeword(sub, codebook, codebook_soa, &best_dist);
         const size_t code_offset = i * static_cast<size_t>(data.M) + static_cast<size_t>(m);
         codes_before[code_offset] = static_cast<uint8_t>(best_idx);
         best_dists[code_offset] = best_dist;
@@ -1717,6 +1804,7 @@ class KMeansIVFIndex : public IVFIndex {
       stats.updated_codebook = stats.updated_codewords > 0;
       stats.codebook_drift_l2 = std::sqrt(drift_sq);
       if (stats.updated_codebook) {
+        RebuildPQSoACache(&data);
         BuildPrecomputedTable(&data);
       }
       stats.codebook_update_ms += codebook_update_timer.ElapsedMillis();
@@ -1734,9 +1822,13 @@ class KMeansIVFIndex : public IVFIndex {
             Eigen::Map<const Eigen::VectorXf> sub(
                 residual_ptr + static_cast<Eigen::Index>(m * data.dsub),
                 static_cast<Eigen::Index>(data.dsub));
+            const MatrixRM* codebook_soa =
+                data.pq_codebooks_soa.size() == data.M
+                    ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
+                    : nullptr;
             codes_for_insert[static_cast<size_t>(i) * static_cast<size_t>(data.M) +
                              static_cast<size_t>(m)] =
-                static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
+                static_cast<uint8_t>(NearestCodeword(sub, codebook, codebook_soa, nullptr));
           }
         }
         stats.reencode_ms += reencode_timer.ElapsedMillis();
@@ -2071,8 +2163,12 @@ class KMeansIVFIndex : public IVFIndex {
             Eigen::Map<const Eigen::VectorXf> sub(
                 residual.data() + static_cast<Eigen::Index>(m * data.dsub),
                 static_cast<Eigen::Index>(data.dsub));
+            const MatrixRM* codebook_soa =
+                data.pq_codebooks_soa.size() == data.M
+                    ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
+                    : nullptr;
             entry.pq_code[static_cast<size_t>(m)] =
-              static_cast<uint8_t>(NearestCodeword(sub, codebook, nullptr));
+              static_cast<uint8_t>(NearestCodeword(sub, codebook, codebook_soa, nullptr));
           }
         } else {
           entry.vector = rec.x;
