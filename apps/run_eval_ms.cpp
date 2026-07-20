@@ -40,6 +40,7 @@ using namespace ann;
 namespace {
 
 constexpr uint32_t kDeltaKMeansIterationsDefault = 10;
+constexpr uint32_t kAddBlockRows = 65536;
 constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
 
 struct WorkloadOp {
@@ -516,20 +517,28 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
 
   if (begin == end) return Status::OK();
 
-  AlignedVector<VectorRecord> records;
-  records.reserve(static_cast<size_t>(end - begin));
+  for (uint32_t block_begin = begin; block_begin < end;) {
+    const uint32_t block_end =
+        block_begin + std::min<uint32_t>(kAddBlockRows, end - block_begin);
+    AlignedVector<VectorRecord> records;
+    records.reserve(static_cast<size_t>(block_end - block_begin));
 
-  for (uint32_t i = begin; i < end; ++i) {
-    VectorRecord rec;
-    rec.doc_id = i;
-    rec.dim = dim;
-    rec.versions = versions;
-    rec.ivf_id = 0;
-    rec.x = x_whitened.row(static_cast<Eigen::Index>(i)).transpose();
-    records.push_back(std::move(rec));
+    for (uint32_t i = block_begin; i < block_end; ++i) {
+      VectorRecord rec;
+      rec.doc_id = i;
+      rec.dim = dim;
+      rec.versions = versions;
+      rec.ivf_id = 0;
+      rec.x = x_whitened.row(static_cast<Eigen::Index>(i)).transpose();
+      records.push_back(std::move(rec));
+    }
+
+    const Status add_status = ivf->AddBatch(records, block_end == end);
+    if (!add_status.ok()) return add_status;
+    block_begin = block_end;
   }
 
-  return ivf->Add(records);
+  return Status::OK();
 }
 
 Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
@@ -552,19 +561,30 @@ Result<OnlinePQUpdateStats> AddRangeToIndexWithOnlinePQ(
   if (begin == end) return empty;
 
   AlignedVector<VectorRecord> records;
-  records.reserve(static_cast<size_t>(end - begin));
+  records.resize(static_cast<size_t>(end - begin));
 
-  for (uint32_t i = begin; i < end; ++i) {
+  Timer record_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t offset = 0; offset < static_cast<int64_t>(records.size()); ++offset) {
+    const uint32_t i = begin + static_cast<uint32_t>(offset);
     VectorRecord rec;
     rec.doc_id = i;
     rec.dim = dim;
     rec.versions = versions;
     rec.ivf_id = 0;
     rec.x = x_whitened.row(static_cast<Eigen::Index>(i)).transpose();
-    records.push_back(std::move(rec));
+    records[static_cast<size_t>(offset)] = std::move(rec);
   }
+  const double record_build_ms = record_timer.ElapsedMillis();
 
-  return ivf->AddWithOnlinePQ(records, options);
+  auto add_res = ivf->AddWithOnlinePQ(records, options);
+  if (!add_res.ok()) return add_res.status();
+  OnlinePQUpdateStats stats = add_res.value();
+  stats.record_build_ms += record_build_ms;
+  stats.insert_ms += record_build_ms;
+  return stats;
 }
 
 Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
@@ -595,15 +615,15 @@ Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
 size_t ResolveGroundTruthBlockRows(Eigen::Index nq,
                                    Eigen::Index dim,
                                    size_t total_docs) {
+  if (total_docs == 0) {
+    return 0;
+  }
   const size_t nq_size = std::max<size_t>(1, static_cast<size_t>(nq));
   const size_t dim_size = std::max<size_t>(1, static_cast<size_t>(dim));
   const size_t bytes_per_row = (nq_size + dim_size + 1) * sizeof(float);
-
-  return std::max<size_t>(
-      1,
-      std::min(total_docs,
-               kGroundTruthBlockTargetBytes /
-                   std::max<size_t>(1, bytes_per_row)));
+  const size_t rows_by_budget =
+      std::max<size_t>(1, kGroundTruthBlockTargetBytes / std::max<size_t>(1, bytes_per_row));
+  return std::min(total_docs, rows_by_budget);
 }
 
 Result<std::vector<std::vector<DocId>>> ExactSearchPrefixBlockwise(
@@ -611,46 +631,52 @@ Result<std::vector<std::vector<DocId>>> ExactSearchPrefixBlockwise(
     Eigen::Ref<const MatrixRM> database,
     uint32_t seen_rows,
     uint32_t topk) {
+  if (queries.cols() == 0 || database.cols() == 0) {
+    return Status::InvalidArgument("ExactSearchPrefixBlockwise: empty matrices");
+  }
+  if (queries.cols() != database.cols()) {
+    return Status::InvalidArgument("ExactSearchPrefixBlockwise: dimension mismatch");
+  }
+  if (queries.rows() == 0) {
+    return Status::InvalidArgument("ExactSearchPrefixBlockwise: no queries");
+  }
   if (seen_rows == 0 || seen_rows > static_cast<uint32_t>(database.rows())) {
     return Status::InvalidArgument("ExactSearchPrefixBlockwise: invalid seen_rows");
   }
+  if (topk == 0) {
+    return Status::InvalidArgument("ExactSearchPrefixBlockwise: topk must be positive");
+  }
 
   const size_t limit = std::min<size_t>(topk, seen_rows);
-
-  std::vector<std::vector<ExactDocCandidate>> heaps(
-      static_cast<size_t>(queries.rows()));
-
-  for (auto& heap : heaps) heap.reserve(limit);
+  std::vector<std::vector<ExactDocCandidate>> heaps(static_cast<size_t>(queries.rows()));
+  for (auto& heap : heaps) {
+    heap.reserve(limit);
+  }
 
   const Eigen::VectorXf query_norms = queries.rowwise().squaredNorm();
   const size_t block_rows =
       ResolveGroundTruthBlockRows(queries.rows(), queries.cols(), seen_rows);
 
-  for (uint32_t block_begin = 0;
-       block_begin < seen_rows;
+  for (uint32_t block_begin = 0; block_begin < seen_rows;
        block_begin += static_cast<uint32_t>(block_rows)) {
     const uint32_t block_count =
-        std::min<uint32_t>(static_cast<uint32_t>(block_rows),
-                           seen_rows - block_begin);
-
-    MatrixRM block = database.middleRows(block_begin, block_count);
+        std::min<uint32_t>(static_cast<uint32_t>(block_rows), seen_rows - block_begin);
+    const auto block = database.middleRows(static_cast<Eigen::Index>(block_begin),
+                                           static_cast<Eigen::Index>(block_count));
     const Eigen::VectorXf block_norms = block.rowwise().squaredNorm();
     const MatrixRM dots = queries * block.transpose();
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int64_t qi = 0;
-         qi < static_cast<int64_t>(queries.rows());
-         ++qi) {
+    for (int64_t qi = 0; qi < static_cast<int64_t>(queries.rows()); ++qi) {
       auto& heap = heaps[static_cast<size_t>(qi)];
       const float qnorm = query_norms(static_cast<Eigen::Index>(qi));
 
       for (uint32_t bi = 0; bi < block_count; ++bi) {
-        float dist =
-            qnorm + block_norms(static_cast<Eigen::Index>(bi)) -
-            2.0f * dots(static_cast<Eigen::Index>(qi),
-                        static_cast<Eigen::Index>(bi));
+        float dist = qnorm + block_norms(static_cast<Eigen::Index>(bi)) -
+                     2.0f * dots(static_cast<Eigen::Index>(qi),
+                                  static_cast<Eigen::Index>(bi));
 
         if (dist < 0.0f) dist = 0.0f;
 
@@ -670,22 +696,119 @@ Result<std::vector<std::vector<DocId>>> ExactSearchPrefixBlockwise(
 
   std::vector<std::vector<DocId>> out(static_cast<size_t>(queries.rows()));
 
-  for (size_t qi = 0; qi < heaps.size(); ++qi) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int64_t qi64 = 0; qi64 < static_cast<int64_t>(heaps.size()); ++qi64) {
+    const size_t qi = static_cast<size_t>(qi64);
     auto& heap = heaps[qi];
     std::sort(heap.begin(), heap.end(), ExactDocLess);
 
-    out[qi].reserve(heap.size());
-    for (const auto& cand : heap) out[qi].push_back(cand.doc_id);
+    std::vector<DocId> row;
+    row.reserve(heap.size());
+    for (const auto& cand : heap) row.push_back(cand.doc_id);
+    out[qi] = std::move(row);
   }
 
   return out;
 }
 
-struct QueryCandidate {
-  DocId doc_id{0};
-  float approx_dist{0.0f};
-  float rerank_dist{0.0f};
-};
+bool ApproxCandidateLess(const Candidate& a, const Candidate& b) {
+  if (a.approx_dist != b.approx_dist) {
+    return a.approx_dist < b.approx_dist;
+  }
+  return a.doc_id < b.doc_id;
+}
+
+bool RerankCandidateLess(const Candidate& a, const Candidate& b) {
+  if (a.rerank_dist != b.rerank_dist) {
+    return a.rerank_dist < b.rerank_dist;
+  }
+  if (a.approx_dist != b.approx_dist) {
+    return a.approx_dist < b.approx_dist;
+  }
+  return a.doc_id < b.doc_id;
+}
+
+SearchResult MergeTopKPrefix(const std::vector<SearchResult>& partial_results,
+                             uint32_t topk,
+                             bool exact_rerank_enable,
+                             const std::vector<uint32_t>& rerank_candidates_per_route,
+                             Eigen::Ref<const Eigen::VectorXf> query_whitened,
+                             const MatrixRM& base_whitened,
+                             uint32_t seen_rows) {
+  SearchResult out;
+  if (partial_results.empty() || topk == 0) {
+    return out;
+  }
+
+  std::unordered_map<DocId, Candidate> best_by_doc;
+  uint64_t scanned = 0;
+  for (size_t ri = 0; ri < partial_results.size(); ++ri) {
+    const SearchResult& part = partial_results[ri];
+    scanned += part.scanned_candidates;
+    size_t route_take = part.topk.size();
+    if (exact_rerank_enable) {
+      const uint32_t route_cap = ri < rerank_candidates_per_route.size()
+                                     ? rerank_candidates_per_route[ri]
+                                     : static_cast<uint32_t>(route_take);
+      route_take = std::min(route_take, static_cast<size_t>(route_cap));
+    }
+    for (size_t i = 0; i < route_take; ++i) {
+      const Candidate& cand = part.topk[i];
+      if (cand.doc_id >= seen_rows) {
+        continue;
+      }
+      auto it = best_by_doc.find(cand.doc_id);
+      if (it == best_by_doc.end() || cand.approx_dist < it->second.approx_dist) {
+        best_by_doc[cand.doc_id] = cand;
+      }
+    }
+  }
+
+  std::vector<Candidate> merged;
+  merged.reserve(best_by_doc.size());
+  for (const auto& kv : best_by_doc) {
+    merged.push_back(kv.second);
+  }
+
+  if (exact_rerank_enable) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && merged.size() > 1)
+#endif
+    for (int64_t i = 0; i < static_cast<int64_t>(merged.size()); ++i) {
+      Candidate& cand = merged[static_cast<size_t>(i)];
+      if (cand.doc_id >= static_cast<DocId>(base_whitened.rows())) {
+        cand.rerank_dist = std::numeric_limits<float>::infinity();
+        continue;
+      }
+      const Eigen::VectorXf diff =
+          query_whitened - base_whitened.row(static_cast<Eigen::Index>(cand.doc_id)).transpose();
+      cand.rerank_dist = diff.squaredNorm();
+    }
+    if (merged.size() > topk) {
+      std::nth_element(merged.begin(),
+                       merged.begin() + static_cast<std::ptrdiff_t>(topk),
+                       merged.end(),
+                       RerankCandidateLess);
+      merged.resize(topk);
+    }
+    std::sort(merged.begin(), merged.end(), RerankCandidateLess);
+  } else {
+    if (merged.size() > topk) {
+      std::nth_element(merged.begin(),
+                       merged.begin() + static_cast<std::ptrdiff_t>(topk),
+                       merged.end(),
+                       ApproxCandidateLess);
+      merged.resize(topk);
+    }
+    std::sort(merged.begin(), merged.end(), ApproxCandidateLess);
+  }
+
+  out.topk = std::move(merged);
+  out.scanned_candidates = scanned;
+  return out;
+}
 
 Result<EvalMetricsLite> EvaluateStatePrefix(
     const Config& config,
@@ -775,9 +898,10 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
     }
   }
 
-  std::vector<std::vector<QueryCandidate>> merged(static_cast<size_t>(nq));
+  std::vector<std::vector<SearchResult>> route_results(
+      static_cast<size_t>(nq), std::vector<SearchResult>(static_cast<size_t>(route_count)));
   std::vector<double> query_ms(static_cast<size_t>(nq), 0.0);
-  uint64_t scanned_total = 0;
+  std::vector<uint64_t> scanned_counts(static_cast<size_t>(nq), 0);
   double slowest_route_wall_ms = 0.0;
 
   Timer search_timer;
@@ -793,102 +917,56 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
         route.versions,
         route.from_new,
         false);
-    slowest_route_wall_ms =
-        std::max(slowest_route_wall_ms, route_timer.ElapsedMillis());
+    const double route_elapsed = route_timer.ElapsedMillis();
+    slowest_route_wall_ms = std::max(slowest_route_wall_ms, route_elapsed);
   
     if (!res.ok()) return res.status();
   
-    const auto& batch = res.value();
+    std::vector<SearchResult> batch = std::move(res.value());
   
     if (batch.size() != nq) {
       return Status::Internal("SearchBatch size mismatch");
     }
   
     for (uint32_t qi = 0; qi < nq; ++qi) {
-      scanned_total += batch[qi].scanned_candidates;
-  
-      uint32_t route_cap =
-          enable_exact_rerank
-              ? route_rerank_candidates[static_cast<size_t>(ri)]
-              : config.topk;
-  
-      size_t take = batch[qi].topk.size();
-      if (enable_exact_rerank) {
-        take = std::min<size_t>(take, route_cap);
-      }
-  
-      for (size_t ci = 0; ci < take; ++ci) {
-        const auto& cand = batch[qi].topk[ci];
-  
-        if (cand.doc_id >= seen_rows) continue;
-  
-        QueryCandidate qc;
-        qc.doc_id = cand.doc_id;
-        qc.approx_dist = cand.approx_dist;
-        qc.rerank_dist = cand.rerank_dist;
-  
-        merged[qi].push_back(qc);
-      }
+      route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] =
+          std::move(batch[static_cast<size_t>(qi)]);
     }
   }
 
-  const double wall_ms = search_timer.ElapsedMillis();
   const double per_query_search_ms =
       nq > 0 ? slowest_route_wall_ms / static_cast<double>(nq) : 0.0;
 
   std::vector<std::vector<DocId>> pred(static_cast<size_t>(nq));
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
   for (int64_t qi64 = 0; qi64 < static_cast<int64_t>(nq); ++qi64) {
     const uint32_t qi = static_cast<uint32_t>(qi64);
     Timer query_timer;
-    auto& vec = merged[qi];
-
-    std::unordered_map<DocId, QueryCandidate> best;
-    best.reserve(vec.size() * 2 + 1);
-
-    for (auto cand : vec) {
-      if (config.exact_rerank_enable) {
-        const Eigen::VectorXf diff =
-            queries_whitened.row(qi).transpose() -
-            base_whitened.row(static_cast<Eigen::Index>(cand.doc_id))
-                .transpose();
-        cand.rerank_dist = diff.squaredNorm();
-      } else {
-        cand.rerank_dist = cand.approx_dist;
-      }
-
-      auto it = best.find(cand.doc_id);
-      if (it == best.end() ||
-          cand.rerank_dist < it->second.rerank_dist) {
-        best[cand.doc_id] = cand;
-      }
+    const Eigen::VectorXf query =
+        queries_whitened.row(static_cast<Eigen::Index>(qi)).transpose();
+    SearchResult merged = MergeTopKPrefix(route_results[static_cast<size_t>(qi)],
+                                          params.topk,
+                                          enable_exact_rerank,
+                                          route_rerank_candidates,
+                                          query,
+                                          base_whitened,
+                                          seen_rows);
+    std::vector<DocId> row;
+    row.reserve(merged.topk.size());
+    for (const auto& cand : merged.topk) {
+      row.push_back(cand.doc_id);
     }
-
-    std::vector<QueryCandidate> uniq;
-    uniq.reserve(best.size());
-
-    for (auto& kv : best) uniq.push_back(kv.second);
-
-    std::sort(uniq.begin(), uniq.end(),
-              [](const QueryCandidate& a, const QueryCandidate& b) {
-                if (a.rerank_dist != b.rerank_dist) {
-                  return a.rerank_dist < b.rerank_dist;
-                }
-                return a.doc_id < b.doc_id;
-              });
-
-    const size_t take = std::min<size_t>(config.topk, uniq.size());
-    pred[qi].reserve(take);
-
-    for (size_t i = 0; i < take; ++i) {
-      pred[qi].push_back(uniq[i].doc_id);
-    }
+    pred[static_cast<size_t>(qi)] = std::move(row);
+    scanned_counts[static_cast<size_t>(qi)] = merged.scanned_candidates;
     query_ms[static_cast<size_t>(qi)] =
         per_query_search_ms + query_timer.ElapsedMillis();
   }
+  const double wall_ms = search_timer.ElapsedMillis();
+  const uint64_t scanned_total =
+      std::accumulate(scanned_counts.begin(), scanned_counts.end(), uint64_t{0});
 
   auto recall_res = RecallAtK(gt, pred, config.topk);
   if (!recall_res.ok()) return recall_res.status();
