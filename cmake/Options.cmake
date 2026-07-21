@@ -1,0 +1,16 @@
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(ANN_ENABLE_WARNINGS "Enable strict compiler warnings" ON)
+
+function(ann_set_warnings target)
+  if(NOT ANN_ENABLE_WARNINGS)
+    return()
+  endif()
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4)
+  else()
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endfunction()

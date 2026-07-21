@@ -1,0 +1,12 @@
+/data
+/build_*/
+/build
+/index
+/result
+/test
+.vscode
+*.pdf
+/build-avx512
+/build-generic
+/build-release
+.codegraph
