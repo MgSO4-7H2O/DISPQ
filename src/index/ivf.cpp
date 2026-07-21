@@ -317,6 +317,9 @@ struct IndexData {
   MatrixRM routing_centroids;
   Eigen::VectorXf routing_centroid_norms;
   std::vector<MatrixRM> pq_codebooks;
+  // Existing codes remain reusable until an in-memory codebook update makes
+  // previously stored codes stale. This is conservative after OnlinePQ.
+  bool pq_code_reuse_safe{true};
   // Derived SoA cache rebuilt from the serialized AoS codebooks. It is
   // intentionally not part of the index payload.
   std::vector<MatrixRM> pq_codebooks_soa;
@@ -336,6 +339,8 @@ struct IndexData {
   uint64_t deferred_nqe_count{0};
   uint64_t ntotal{0};
   double last_patch_pq_reencode_ms{0.0};
+  PatchProfiling last_patch_profiling;
+  IngestProfiling last_ingest_profiling;
 };
 
 void RebuildPQSoACache(IndexData* data) {
@@ -458,6 +463,7 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
   if (!status.ok()) return status;
   status = ReadPod(bytes, offset, &data->last_patch_pq_reencode_ms);
   if (!status.ok()) return status;
+  data->pq_code_reuse_safe = (data->online_pq_batch_count == 0);
 
   if (data->dim == 0 || data->nlist == 0 || data->version == 0) {
     return Status::InvalidArgument("Invalid IVF metadata in payload");
@@ -1259,6 +1265,8 @@ class KMeansIVFIndex : public IVFIndex {
       return validate;
     }
 
+    data.last_ingest_profiling = IngestProfiling{};
+    data.last_ingest_profiling.records = recs.size();
     std::vector<int> centroids(recs.size(), 0);
     AlignedVector<ListEntry> entries(recs.size());
     const bool collect_initial_pq_stats = data.use_pq && data.defer_pq_stats_to_add;
@@ -1267,6 +1275,17 @@ class KMeansIVFIndex : public IVFIndex {
       per_record_nqe.assign(recs.size(), 0.0);
     }
 
+    Timer assignment_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      centroids[i] = NearestCentroid(recs[i].x, data);
+    }
+    data.last_ingest_profiling.assignment_us = assignment_timer.ElapsedMicros();
+
+    Timer encode_timer;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
@@ -1274,7 +1293,7 @@ class KMeansIVFIndex : public IVFIndex {
       const size_t i = static_cast<size_t>(ii);
       const auto& rec = recs[i];
       ListEntry entry;
-      const int centroid = NearestCentroid(rec.x, data);
+      const int centroid = centroids[i];
       entry.doc_id = rec.doc_id;
       entry.versions = rec.versions;
       entry.versions.index_version = data.version;
@@ -1312,9 +1331,9 @@ class KMeansIVFIndex : public IVFIndex {
         entry.vector = rec.x;
         entry.norm = entry.vector.squaredNorm();
       }
-      centroids[i] = centroid;
       entries[i] = std::move(entry);
     }
+    data.last_ingest_profiling.encode_us = encode_timer.ElapsedMicros();
 
     if (collect_initial_pq_stats) {
       for (size_t i = 0; i < entries.size(); ++i) {
@@ -1337,7 +1356,9 @@ class KMeansIVFIndex : public IVFIndex {
       }
     }
 
+    Timer commit_timer;
     CommitPendingLocked(&data, centroids, &entries);
+    data.last_ingest_profiling.commit_us = commit_timer.ElapsedMicros();
     return Status::OK();
   }
 
@@ -1410,6 +1431,8 @@ class KMeansIVFIndex : public IVFIndex {
     if (!validate_deletes.ok()) {
       return validate_deletes;
     }
+    data.last_ingest_profiling = IngestProfiling{};
+    data.last_ingest_profiling.records = recs.size();
     std::unordered_map<DocId, size_t> delete_rec_pos;
     if (delete_recs != nullptr) {
       if (delete_recs->size() != delete_doc_ids.size()) {
@@ -1453,6 +1476,17 @@ class KMeansIVFIndex : public IVFIndex {
       }
       std::vector<int> centroids(recs.size(), 0);
       AlignedVector<ListEntry> entries(recs.size());
+      Timer assignment_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        centroids[i] = NearestCentroid(recs[i].x, data);
+      }
+      stats.insert_assignment_us += assignment_timer.ElapsedMicros();
+      data.last_ingest_profiling.assignment_us = stats.insert_assignment_us;
+
       Timer encode_timer;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -1461,7 +1495,7 @@ class KMeansIVFIndex : public IVFIndex {
         const size_t i = static_cast<size_t>(ii);
         const auto& rec = recs[i];
         ListEntry entry;
-        const int centroid = NearestCentroid(rec.x, data);
+        const int centroid = centroids[i];
         entry.doc_id = rec.doc_id;
         entry.versions = rec.versions;
         entry.versions.index_version = data.version;
@@ -1487,14 +1521,16 @@ class KMeansIVFIndex : public IVFIndex {
           entry.vector = rec.x;
           entry.norm = entry.vector.squaredNorm();
         }
-        centroids[i] = centroid;
         entries[i] = std::move(entry);
       }
       stats.insert_encode_ms += encode_timer.ElapsedMillis();
+      data.last_ingest_profiling.encode_us = stats.insert_encode_ms * 1000.0;
       Timer commit_timer;
       CommitPendingLocked(&data, centroids, &entries);
       stats.insert_commit_ms += commit_timer.ElapsedMillis();
-      stats.insert_ms += stats.insert_encode_ms + stats.insert_commit_ms;
+      data.last_ingest_profiling.commit_us = stats.insert_commit_ms * 1000.0;
+      stats.insert_ms += stats.insert_assignment_us / 1000.0 +
+                         stats.insert_encode_ms + stats.insert_commit_ms;
       stats.maintenance_ms += stats.delete_ms;
       return stats;
     }
@@ -1573,6 +1609,17 @@ class KMeansIVFIndex : public IVFIndex {
       stats.delete_ms += delete_timer.ElapsedMillis();
     }
 
+    Timer assignment_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      centroids[i] = NearestCentroid(recs[i].x, data);
+    }
+    stats.insert_assignment_us += assignment_timer.ElapsedMicros();
+    data.last_ingest_profiling.assignment_us = stats.insert_assignment_us;
+
     Timer encode_timer;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -1580,9 +1627,7 @@ class KMeansIVFIndex : public IVFIndex {
     for (int64_t ii = 0; ii < static_cast<int64_t>(recs.size()); ++ii) {
       const size_t i = static_cast<size_t>(ii);
       const auto& rec = recs[i];
-      const int centroid = NearestCentroid(rec.x, data);
-      centroids[i] = centroid;
-
+      const int centroid = centroids[i];
       residuals.row(static_cast<Eigen::Index>(i)) = rec.x.transpose();
       if (data.pq_residual) {
         residuals.row(static_cast<Eigen::Index>(i)) -=
@@ -1613,6 +1658,7 @@ class KMeansIVFIndex : public IVFIndex {
       nqe_by_record[i] = err2 / (r2 + eps);
     }
     stats.insert_encode_ms += encode_timer.ElapsedMillis();
+    data.last_ingest_profiling.encode_us = stats.insert_encode_ms * 1000.0;
 
     Timer onlinepq_stats_timer;
     double nqe_sum = 0.0;
@@ -1813,6 +1859,7 @@ class KMeansIVFIndex : public IVFIndex {
       stats.updated_codebook = stats.updated_codewords > 0;
       stats.codebook_drift_l2 = std::sqrt(drift_sq);
       if (stats.updated_codebook) {
+        data.pq_code_reuse_safe = false;
         RebuildPQSoACache(&data);
         BuildPrecomputedTable(&data);
       }
@@ -1866,7 +1913,10 @@ class KMeansIVFIndex : public IVFIndex {
     Timer commit_timer;
     CommitPendingLocked(&data, centroids, &entries);
     stats.insert_commit_ms += commit_timer.ElapsedMillis();
-    stats.insert_ms += stats.insert_encode_ms + stats.insert_entry_ms + stats.insert_commit_ms;
+    data.last_ingest_profiling.commit_us = stats.insert_commit_ms * 1000.0;
+    stats.insert_ms += stats.insert_assignment_us / 1000.0 +
+                       stats.insert_encode_ms + stats.insert_entry_ms +
+                       stats.insert_commit_ms;
     stats.maintenance_ms += stats.delete_ms + stats.onlinepq_stats_ms +
                             stats.codebook_update_ms + stats.reencode_ms;
     return stats;
@@ -2112,6 +2162,7 @@ class KMeansIVFIndex : public IVFIndex {
     }
     IndexData& data = *it->second;
     data.last_patch_pq_reencode_ms = 0.0;
+    data.last_patch_profiling = PatchProfiling{};
     std::vector<uint8_t> patch_partitions(data.nlist, 0);
     for (uint32_t partition_id : patch.partition_ids) {
       if (partition_id >= data.nlist) {
@@ -2128,6 +2179,8 @@ class KMeansIVFIndex : public IVFIndex {
     for (const auto& records : patch.replacement_records) {
       patch_record_count += records.size();
     }
+    data.last_patch_profiling.patch_records =
+        static_cast<uint64_t>(patch_record_count);
     patch_doc_ids.reserve(patch_record_count);
     for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
       const auto& records = patch.replacement_records[i];
@@ -2147,26 +2200,54 @@ class KMeansIVFIndex : public IVFIndex {
       }
     }
 
-    double pq_reencode_ms = 0.0;
+    double pq_code_assignment_us = 0.0;
+    double pq_code_copy_or_reuse_us = 0.0;
+    double pq_list_flatten_us = 0.0;
+    uint64_t pq_codes_reused = 0;
+    uint64_t pq_codes_reencoded = 0;
     for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
       const uint32_t partition_id = patch.partition_ids[i];
       const auto& records = patch.replacement_records[i];
       auto& dst = data.lists[static_cast<size_t>(partition_id)];
+      AlignedVector<ListEntry> old_entries;
+      std::unordered_map<DocId, const ListEntry*> old_by_doc;
+      std::vector<const ListEntry*> reusable;
+      if (data.use_pq) {
+        reusable.assign(records.size(), nullptr);
+      }
+      if (data.use_pq && data.pq_code_reuse_safe) {
+        Timer pq_reuse_timer;
+        old_entries = std::move(dst);
+        old_by_doc.reserve(old_entries.size());
+        for (const auto& old_entry : old_entries) {
+          old_by_doc.emplace(old_entry.doc_id, &old_entry);
+        }
+        for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
+          auto old_it = old_by_doc.find(records[record_pos].doc_id);
+          if (old_it != old_by_doc.end() && old_it->second->pq_code.size() == data.M) {
+            reusable[record_pos] = old_it->second;
+          }
+        }
+        pq_code_copy_or_reuse_us += pq_reuse_timer.ElapsedMicros();
+      }
       dst.clear();
       dst.reserve(records.size());
-      Timer pq_reencode_timer;
-      for (const auto& rec : records) {
-        ListEntry entry;
-        entry.doc_id = rec.doc_id;
-        entry.versions = rec.versions;
-        entry.versions.index_version = data.version;
-        if (data.use_pq) {
-          entry.pq_code.resize(data.M);
+      std::vector<uint8_t> prepared_codes;
+      if (data.use_pq) {
+        prepared_codes.resize(records.size() * static_cast<size_t>(data.M));
+        Timer pq_reencode_timer;
+        for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
+          if (reusable[record_pos] != nullptr) {
+            continue;
+          }
+          const auto& rec = records[record_pos];
           Eigen::VectorXf residual = rec.x;
           if (data.pq_residual) {
             residual -=
                 data.routing_centroids.row(static_cast<Eigen::Index>(partition_id)).transpose();
           }
+          uint8_t* code_out =
+              prepared_codes.data() + record_pos * static_cast<size_t>(data.M);
           for (uint32_t m = 0; m < data.M; ++m) {
             const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
             Eigen::Map<const Eigen::VectorXf> sub(
@@ -2176,9 +2257,38 @@ class KMeansIVFIndex : public IVFIndex {
                 data.pq_codebooks_soa.size() == data.M
                     ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
                     : nullptr;
-            entry.pq_code[static_cast<size_t>(m)] =
-              static_cast<uint8_t>(NearestCodeword(sub, codebook, codebook_soa, nullptr));
+            code_out[m] =
+                static_cast<uint8_t>(NearestCodeword(sub, codebook, codebook_soa, nullptr));
           }
+          ++pq_codes_reencoded;
+        }
+        pq_code_assignment_us += pq_reencode_timer.ElapsedMicros();
+
+        Timer pq_copy_timer;
+        for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
+          const ListEntry* old_entry = reusable[record_pos];
+          if (old_entry == nullptr) {
+            continue;
+          }
+          std::copy(old_entry->pq_code.begin(),
+                    old_entry->pq_code.end(),
+                    prepared_codes.begin() +
+                        static_cast<std::ptrdiff_t>(record_pos * static_cast<size_t>(data.M)));
+          ++pq_codes_reused;
+        }
+        pq_code_copy_or_reuse_us += pq_copy_timer.ElapsedMicros();
+      }
+
+      for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
+        const auto& rec = records[record_pos];
+        ListEntry entry;
+        entry.doc_id = rec.doc_id;
+        entry.versions = rec.versions;
+        entry.versions.index_version = data.version;
+        if (data.use_pq) {
+          const uint8_t* code_begin =
+              prepared_codes.data() + record_pos * static_cast<size_t>(data.M);
+          entry.pq_code.assign(code_begin, code_begin + data.M);
         } else {
           entry.vector = rec.x;
           entry.norm = entry.vector.squaredNorm();
@@ -2186,13 +2296,19 @@ class KMeansIVFIndex : public IVFIndex {
         dst.push_back(std::move(entry));
       }
       if (data.use_pq) {
-        pq_reencode_ms += pq_reencode_timer.ElapsedMillis();
+        Timer pq_list_flatten_timer;
         RebuildListPQCodes(&data, partition_id);
+        pq_list_flatten_us += pq_list_flatten_timer.ElapsedMicros();
       }
     }
 
     RebuildDocMapLocked(&data);
-    data.last_patch_pq_reencode_ms = pq_reencode_ms;
+    data.last_patch_pq_reencode_ms = pq_code_assignment_us / 1000.0;
+    data.last_patch_profiling.pq_code_assignment_us = pq_code_assignment_us;
+    data.last_patch_profiling.pq_code_copy_or_reuse_us = pq_code_copy_or_reuse_us;
+    data.last_patch_profiling.pq_list_flatten_us = pq_list_flatten_us;
+    data.last_patch_profiling.pq_codes_reused = pq_codes_reused;
+    data.last_patch_profiling.pq_codes_reencoded = pq_codes_reencoded;
     return Status::OK();
   }
 
@@ -2204,6 +2320,26 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::NotFound("Index version not built");
     }
     return it->second->last_patch_pq_reencode_ms;
+  }
+
+  Result<PatchProfiling> GetLastPatchProfiling(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    return it->second->last_patch_profiling;
+  }
+
+  Result<IngestProfiling> GetLastIngestProfiling(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    return it->second->last_ingest_profiling;
   }
 
   Result<std::vector<uint8_t>> Serialize() const override {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -17,6 +18,12 @@
 
 namespace ann {
 namespace {
+
+using ProfilingClock = std::chrono::steady_clock;
+
+double ElapsedProfilingMicros(ProfilingClock::time_point start) {
+  return std::chrono::duration<double, std::micro>(ProfilingClock::now() - start).count();
+}
 
 uint32_t NearestCentroid(Eigen::Ref<const Eigen::VectorXf> x,
                          Eigen::Ref<const MatrixRM> centroids,
@@ -72,6 +79,50 @@ struct AssignmentDiagnostics {
   double imbalance_after{0.0};
 };
 
+struct AssignmentTopCandidate {
+  float dist{0.0f};
+  uint32_t part{0};
+};
+
+struct AssignmentCandidateState {
+  uint32_t part{0};
+  float dist{0.0f};
+  double penalty{0.0};
+  double cost{0.0};
+};
+
+struct AssignmentScratch {
+  std::vector<AssignmentTopCandidate> top_candidates;
+};
+
+bool IsAssignmentCandidateLess(const AssignmentTopCandidate& lhs,
+                               const AssignmentTopCandidate& rhs) {
+  if (lhs.dist != rhs.dist) {
+    return lhs.dist < rhs.dist;
+  }
+  return lhs.part < rhs.part;
+}
+
+void InsertAssignmentTopCandidate(AssignmentScratch* scratch,
+                                  AssignmentTopCandidate candidate,
+                                  uint32_t top_r) {
+  auto& top_candidates = scratch->top_candidates;
+  if (top_candidates.size() == static_cast<size_t>(top_r) &&
+      !IsAssignmentCandidateLess(candidate, top_candidates.back())) {
+    return;
+  }
+
+  const auto insert_pos = std::lower_bound(
+      top_candidates.begin(), top_candidates.end(), candidate,
+      [](const AssignmentTopCandidate& lhs, const AssignmentTopCandidate& rhs) {
+        return IsAssignmentCandidateLess(lhs, rhs);
+      });
+  top_candidates.insert(insert_pos, candidate);
+  if (top_candidates.size() > static_cast<size_t>(top_r)) {
+    top_candidates.pop_back();
+  }
+}
+
 double ComputeImbalanceRatio(const std::vector<uint32_t>& sizes) {
   if (sizes.empty()) {
     return 0.0;
@@ -91,7 +142,8 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     Eigen::Ref<const MatrixRM> main_centroids,
     const std::vector<uint32_t>& main_partition_sizes,
     const MergeOptions& options,
-    AssignmentDiagnostics* diag_out) {
+    AssignmentDiagnostics* diag_out,
+    MergeProfiling* profiling) {
   if (main_centroids.rows() == 0 || main_centroids.cols() == 0) {
     return Status::InvalidArgument("assign_delta_to_main_centroids_for_merge: empty main_centroids");
   }
@@ -100,7 +152,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
         "assign_delta_to_main_centroids_for_merge: main_partition_sizes size mismatch");
   }
 
-AssignmentDiagnostics diag;
+  AssignmentDiagnostics diag;
   diag.imbalance_before = ComputeImbalanceRatio(main_partition_sizes);
 
   const uint32_t nlist = static_cast<uint32_t>(main_centroids.rows());
@@ -120,102 +172,162 @@ AssignmentDiagnostics diag;
   uint32_t moved_count = 0;
   double ratio_sum = 0.0;
   double ratio_max = 1.0;
+  double distance_us = 0.0;
+  double top_r_us = 0.0;
+  double balance_us = 0.0;
+  double materialize_us = 0.0;
+  const auto assignment_start = ProfilingClock::now();
 
   for (const auto& rec : frozen_delta.records) {
     if (rec.x.size() != main_centroids.cols()) {
       return Status::InvalidArgument(
           "assign_delta_to_main_centroids_for_merge: record dim mismatch with main centroids");
     }
+  }
 
-    std::vector<std::pair<float, uint32_t>> dists;
-    dists.reserve(static_cast<size_t>(nlist));
-    for (uint32_t i = 0; i < nlist; ++i) {
-      const float dist =
-          (rec.x - main_centroids.row(static_cast<Eigen::Index>(i)).transpose()).squaredNorm();
-      dists.emplace_back(dist, i);
+  constexpr size_t kMaxAssignmentChunkBytes = 64ULL * 1024ULL * 1024ULL;
+  const size_t bytes_per_record =
+      static_cast<size_t>(nlist) * sizeof(float) +
+      static_cast<size_t>(top_r) * sizeof(AssignmentTopCandidate);
+  const size_t chunk_records = std::max<size_t>(
+      1,
+      std::min<size_t>(16384,
+                       kMaxAssignmentChunkBytes / std::max<size_t>(1, bytes_per_record)));
+  std::vector<float> chunk_distances;
+  std::vector<AssignmentTopCandidate> chunk_top_candidates;
+  if (!frozen_delta.records.empty()) {
+    chunk_distances.resize(chunk_records * static_cast<size_t>(nlist));
+    chunk_top_candidates.resize(chunk_records * static_cast<size_t>(top_r));
+  }
+
+  for (size_t chunk_begin = 0; chunk_begin < frozen_delta.records.size();
+       chunk_begin += chunk_records) {
+    const size_t chunk_count =
+        std::min(chunk_records, frozen_delta.records.size() - chunk_begin);
+
+    const auto distance_start = ProfilingClock::now();
+    #pragma omp parallel for schedule(static)
+    for (int64_t local_index = 0; local_index < static_cast<int64_t>(chunk_count);
+         ++local_index) {
+      const auto& rec = frozen_delta.records[chunk_begin + static_cast<size_t>(local_index)];
+      float* distances = chunk_distances.data() +
+                         static_cast<size_t>(local_index) * static_cast<size_t>(nlist);
+      for (uint32_t i = 0; i < nlist; ++i) {
+        distances[static_cast<size_t>(i)] =
+            (rec.x - main_centroids.row(static_cast<Eigen::Index>(i)).transpose()).squaredNorm();
+      }
     }
-    std::partial_sort(dists.begin(),
-                      dists.begin() + static_cast<std::ptrdiff_t>(top_r),
-                      dists.end(),
-                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    distance_us += ElapsedProfilingMicros(distance_start);
 
-    const uint32_t nearest_partition = dists[0].second;
-    const float nearest_dist = dists[0].first;
-    uint32_t chosen_partition = nearest_partition;
-    float chosen_dist = nearest_dist;
-
-    if (use_balanced_append) {
-      const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
-      const double nearest_penalty = std::max(
-          0.0,
-          (static_cast<double>(projected_size[static_cast<size_t>(nearest_partition)]) + 1.0) -
-              avg_after) /
-          balance_denom;
-      const bool nearest_overloaded = nearest_penalty > 0.0;
-
-      struct CandidateState {
-        uint32_t part{0};
-        float dist{0.0f};
-        double penalty{0.0};
-        double cost{0.0};
-      };
-
-      std::vector<CandidateState> legal_candidates;
-      legal_candidates.reserve(top_r);
-      std::vector<CandidateState> healthier_candidates;
-      healthier_candidates.reserve(top_r);
-
-      for (uint32_t k = 0; k < top_r; ++k) {
-        const float dist = dists[static_cast<size_t>(k)].first;
-        const uint32_t part = dists[static_cast<size_t>(k)].second;
-        if (dist > dist_cap) {
-          continue;
+    const auto top_r_start = ProfilingClock::now();
+    #pragma omp parallel
+    {
+      AssignmentScratch scratch;
+      scratch.top_candidates.reserve(static_cast<size_t>(top_r));
+      #pragma omp for schedule(static)
+      for (int64_t local_index = 0; local_index < static_cast<int64_t>(chunk_count);
+           ++local_index) {
+        const float* distances = chunk_distances.data() +
+                                 static_cast<size_t>(local_index) * static_cast<size_t>(nlist);
+        scratch.top_candidates.clear();
+        for (uint32_t i = 0; i < nlist; ++i) {
+          InsertAssignmentTopCandidate(
+              &scratch,
+              AssignmentTopCandidate{distances[static_cast<size_t>(i)], i},
+              top_r);
         }
-        if (static_cast<double>(projected_size[static_cast<size_t>(part)]) >= hard_cap) {
-          continue;
-        }
-        CandidateState cand;
-        cand.part = part;
-        cand.dist = dist;
-        cand.penalty = std::max(
+        std::copy(scratch.top_candidates.begin(), scratch.top_candidates.end(),
+                  chunk_top_candidates.begin() +
+                      static_cast<size_t>(local_index) * static_cast<size_t>(top_r));
+      }
+    }
+    top_r_us += ElapsedProfilingMicros(top_r_start);
+
+    for (size_t local_index = 0; local_index < chunk_count; ++local_index) {
+      const auto& rec = frozen_delta.records[chunk_begin + local_index];
+      const AssignmentTopCandidate* top_candidates =
+          chunk_top_candidates.data() + local_index * static_cast<size_t>(top_r);
+
+      const uint32_t nearest_partition = top_candidates[0].part;
+      const float nearest_dist = top_candidates[0].dist;
+      uint32_t chosen_partition = nearest_partition;
+      float chosen_dist = nearest_dist;
+
+      const auto balance_start = ProfilingClock::now();
+      if (use_balanced_append) {
+        const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
+        const double nearest_penalty = std::max(
             0.0,
-            (static_cast<double>(projected_size[static_cast<size_t>(part)]) + 1.0) - avg_after) /
-                       balance_denom;
-        cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
-        legal_candidates.push_back(cand);
-        if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
-          healthier_candidates.push_back(cand);
+            (static_cast<double>(projected_size[static_cast<size_t>(nearest_partition)]) + 1.0) -
+                avg_after) /
+            balance_denom;
+        const bool nearest_overloaded = nearest_penalty > 0.0;
+
+        bool found_legal_candidate = false;
+        bool found_healthier_candidate = false;
+        AssignmentCandidateState best_legal_candidate;
+        AssignmentCandidateState best_healthier_candidate;
+        for (uint32_t k = 0; k < top_r; ++k) {
+          const float dist = top_candidates[static_cast<size_t>(k)].dist;
+          const uint32_t part = top_candidates[static_cast<size_t>(k)].part;
+          if (dist > dist_cap) {
+            continue;
+          }
+          if (static_cast<double>(projected_size[static_cast<size_t>(part)]) >= hard_cap) {
+            continue;
+          }
+          AssignmentCandidateState cand;
+          cand.part = part;
+          cand.dist = dist;
+          cand.penalty = std::max(
+              0.0,
+              (static_cast<double>(projected_size[static_cast<size_t>(part)]) + 1.0) - avg_after) /
+                         balance_denom;
+          cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
+
+          if (!found_legal_candidate || cand.cost < best_legal_candidate.cost) {
+            found_legal_candidate = true;
+            best_legal_candidate = cand;
+          }
+          if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
+            if (!found_healthier_candidate || cand.cost < best_healthier_candidate.cost) {
+              found_healthier_candidate = true;
+              best_healthier_candidate = cand;
+            }
+          }
+        }
+
+        const AssignmentCandidateState* chosen_candidate = nullptr;
+        if (found_healthier_candidate) {
+          chosen_candidate = &best_healthier_candidate;
+        } else if (found_legal_candidate) {
+          chosen_candidate = &best_legal_candidate;
+        }
+        if (chosen_candidate != nullptr) {
+          chosen_partition = chosen_candidate->part;
+          chosen_dist = chosen_candidate->dist;
         }
       }
+      balance_us += ElapsedProfilingMicros(balance_start);
 
-      const std::vector<CandidateState>& candidates =
-          healthier_candidates.empty() ? legal_candidates : healthier_candidates;
-      double best_cost = std::numeric_limits<double>::infinity();
-      bool found_candidate = false;
-      for (const auto& cand : candidates) {
-        if (!found_candidate || cand.cost < best_cost) {
-          found_candidate = true;
-          best_cost = cand.cost;
-          chosen_partition = cand.part;
-          chosen_dist = cand.dist;
-        }
+      const auto materialize_start = ProfilingClock::now();
+      DeltaAssignment item;
+      item.record = rec;
+      item.record.ivf_id = chosen_partition;
+      item.main_partition = chosen_partition;
+      item.residual_dist = chosen_dist;
+      assigned[static_cast<size_t>(chosen_partition)].push_back(std::move(item));
+      projected_size[static_cast<size_t>(chosen_partition)]++;
+      materialize_us += ElapsedProfilingMicros(materialize_start);
+
+      if (chosen_partition != nearest_partition) {
+        moved_count++;
       }
+      const double ratio =
+          nearest_dist > eps ? static_cast<double>(chosen_dist) / nearest_dist : 1.0;
+      ratio_sum += ratio;
+      ratio_max = std::max(ratio_max, ratio);
     }
-
-    DeltaAssignment item;
-    item.record = rec;
-    item.record.ivf_id = chosen_partition;
-    item.main_partition = chosen_partition;
-    item.residual_dist = chosen_dist;
-    assigned[static_cast<size_t>(chosen_partition)].push_back(std::move(item));
-    projected_size[static_cast<size_t>(chosen_partition)]++;
-
-    if (chosen_partition != nearest_partition) {
-      moved_count++;
-    }
-    const double ratio = nearest_dist > eps ? static_cast<double>(chosen_dist) / nearest_dist : 1.0;
-    ratio_sum += ratio;
-    ratio_max = std::max(ratio_max, ratio);
   }
 
   if (!frozen_delta.records.empty()) {
@@ -227,6 +339,14 @@ AssignmentDiagnostics diag;
   diag.imbalance_after = ComputeImbalanceRatio(projected_size);
   if (diag_out != nullptr) {
     *diag_out = diag;
+  }
+  if (profiling != nullptr) {
+    profiling->merge_delta_to_main_assignment_us =
+        ElapsedProfilingMicros(assignment_start);
+    profiling->merge_assignment_distance_us = distance_us;
+    profiling->merge_assignment_top_r_us = top_r_us;
+    profiling->merge_assignment_balance_us = balance_us;
+    profiling->merge_assignment_materialize_us = materialize_us;
   }
   return assigned;
 }
@@ -309,10 +429,11 @@ std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
 
 Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
     const std::vector<uint32_t>& neighborhood_partitions,
-    const std::vector<AlignedVector<VectorRecord>>& neighborhood_main_records,
+    std::vector<AlignedVector<VectorRecord>> neighborhood_main_records,
     const PartitionAssignments& assignments,
     Eigen::Ref<const MatrixRM> main_centroids,
-    const MergeOptions& options) {
+    const MergeOptions& options,
+    MergeProfiling* profiling) {
   if (neighborhood_partitions.empty()) {
     return Status::InvalidArgument("RepartitionNeighborhood: empty neighborhood");
   }
@@ -331,6 +452,9 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
     }
   }
 
+  const auto pool_start = profiling != nullptr
+                              ? ProfilingClock::now()
+                              : ProfilingClock::time_point{};
   AlignedVector<VectorRecord> pooled_records;
   size_t reserve_count = 0;
   for (const auto& records : neighborhood_main_records) {
@@ -341,9 +465,9 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
   }
   pooled_records.reserve(reserve_count);
 
-  for (const auto& records : neighborhood_main_records) {
-    for (const auto& rec : records) {
-      pooled_records.push_back(rec);
+  for (auto& records : neighborhood_main_records) {
+    for (auto& rec : records) {
+      pooled_records.push_back(std::move(rec));
     }
   }
   for (uint32_t part : neighborhood_partitions) {
@@ -351,6 +475,10 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
     for (const auto& item : delta_bucket) {
       pooled_records.push_back(item.record);
     }
+  }
+  if (profiling != nullptr) {
+    profiling->repartition_pool_us += ElapsedProfilingMicros(pool_start);
+    profiling->pooled_records += static_cast<uint64_t>(pooled_records.size());
   }
 
   std::vector<AlignedVector<VectorRecord>> repartitioned(neighborhood_n);
@@ -364,22 +492,43 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
   const double balance_denom = std::max(1.0, avg_after);
   std::vector<uint32_t> projected_size(neighborhood_n, 0u);
 
-  for (const auto& rec : pooled_records) {
+  struct CandidateState {
+    uint32_t local_idx{0};
+    double cost{0.0};
+  };
+  std::vector<std::pair<float, uint32_t>> dists;
+  dists.reserve(neighborhood_n);
+
+  for (auto& rec : pooled_records) {
     if (rec.x.size() != main_centroids.cols()) {
       return Status::InvalidArgument("RepartitionNeighborhood: record dim mismatch");
     }
-    std::vector<std::pair<float, uint32_t>> dists;
-    dists.reserve(neighborhood_n);
+    const auto distance_start = profiling != nullptr
+                                    ? ProfilingClock::now()
+                                    : ProfilingClock::time_point{};
+    dists.clear();
     for (uint32_t local_idx = 0; local_idx < neighborhood_n; ++local_idx) {
       const uint32_t part = neighborhood_partitions[static_cast<size_t>(local_idx)];
       const float dist =
           (rec.x - main_centroids.row(static_cast<Eigen::Index>(part)).transpose()).squaredNorm();
       dists.emplace_back(dist, local_idx);
     }
+    if (profiling != nullptr) {
+      profiling->repartition_distance_us += ElapsedProfilingMicros(distance_start);
+    }
+    const auto local_sort_start = profiling != nullptr
+                                      ? ProfilingClock::now()
+                                      : ProfilingClock::time_point{};
     std::sort(dists.begin(),
               dists.end(),
               [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    if (profiling != nullptr) {
+      profiling->repartition_sort_us += ElapsedProfilingMicros(local_sort_start);
+    }
 
+    const auto candidate_start = profiling != nullptr
+                                     ? ProfilingClock::now()
+                                     : ProfilingClock::time_point{};
     const uint32_t nearest_local = dists[0].second;
     const float nearest_dist = dists[0].first;
     uint32_t chosen_local = nearest_local;
@@ -392,18 +541,10 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
                                    balance_denom;
     const bool nearest_overloaded = nearest_penalty > 0.0;
 
-    struct CandidateState {
-      uint32_t local_idx{0};
-      float dist{0.0f};
-      double penalty{0.0};
-      double cost{0.0};
-    };
-
-    std::vector<CandidateState> legal_candidates;
-    legal_candidates.reserve(neighborhood_n);
-    std::vector<CandidateState> healthier_candidates;
-    healthier_candidates.reserve(neighborhood_n);
-
+    bool found_legal_candidate = false;
+    bool found_healthier_candidate = false;
+    CandidateState best_legal_candidate;
+    CandidateState best_healthier_candidate;
     for (const auto& dist_item : dists) {
       const float dist = dist_item.first;
       const uint32_t local_idx = dist_item.second;
@@ -413,43 +554,56 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
       if (static_cast<double>(projected_size[static_cast<size_t>(local_idx)]) >= hard_cap) {
         continue;
       }
-      CandidateState cand;
-      cand.local_idx = local_idx;
-      cand.dist = dist;
-      cand.penalty = std::max(
+      const double penalty = std::max(
           0.0,
           (static_cast<double>(projected_size[static_cast<size_t>(local_idx)]) + 1.0) -
               avg_after) /
-                     balance_denom;
-      cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
-      legal_candidates.push_back(cand);
-      if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
-        healthier_candidates.push_back(cand);
+          balance_denom;
+      const CandidateState cand{
+          local_idx, static_cast<double>(dist) + options.assignment_lambda * penalty};
+
+      if (!found_legal_candidate || cand.cost < best_legal_candidate.cost) {
+        found_legal_candidate = true;
+        best_legal_candidate = cand;
+      }
+      if (nearest_overloaded && penalty + 1e-12 < nearest_penalty) {
+        if (!found_healthier_candidate || cand.cost < best_healthier_candidate.cost) {
+          found_healthier_candidate = true;
+          best_healthier_candidate = cand;
+        }
       }
     }
 
-    const std::vector<CandidateState>& candidates =
-        healthier_candidates.empty() ? legal_candidates : healthier_candidates;
-    double best_cost = std::numeric_limits<double>::infinity();
-    bool found_candidate = false;
-    for (const auto& cand : candidates) {
-      if (!found_candidate || cand.cost < best_cost) {
-        found_candidate = true;
-        best_cost = cand.cost;
-        chosen_local = cand.local_idx;
-      }
+    if (found_healthier_candidate) {
+      chosen_local = best_healthier_candidate.local_idx;
+    } else if (found_legal_candidate) {
+      chosen_local = best_legal_candidate.local_idx;
+    }
+    if (profiling != nullptr) {
+      profiling->repartition_candidate_selection_us +=
+          ElapsedProfilingMicros(candidate_start);
     }
 
-    VectorRecord out = rec;
-    out.ivf_id = neighborhood_partitions[static_cast<size_t>(chosen_local)];
-    repartitioned[static_cast<size_t>(chosen_local)].push_back(std::move(out));
+    rec.ivf_id = neighborhood_partitions[static_cast<size_t>(chosen_local)];
+    repartitioned[static_cast<size_t>(chosen_local)].push_back(std::move(rec));
     projected_size[static_cast<size_t>(chosen_local)]++;
   }
 
   for (auto& bucket : repartitioned) {
+    const auto final_sort_start = profiling != nullptr
+                                      ? ProfilingClock::now()
+                                      : ProfilingClock::time_point{};
     std::sort(bucket.begin(), bucket.end(), [](const VectorRecord& lhs, const VectorRecord& rhs) {
       return lhs.doc_id < rhs.doc_id;
     });
+    if (profiling != nullptr) {
+      profiling->repartition_sort_us += ElapsedProfilingMicros(final_sort_start);
+    }
+  }
+  if (profiling != nullptr) {
+    for (const auto& bucket : repartitioned) {
+      profiling->repartitioned_records += static_cast<uint64_t>(bucket.size());
+    }
   }
   return repartitioned;
 }
@@ -462,7 +616,8 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM* base_vectors,
-    const MergeOptions& options);
+    const MergeOptions& options,
+    MergeProfiling* profiling);
 
 Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
@@ -696,7 +851,7 @@ Result<PartitionPatch> prepare_partition_patch(
     const PartitionScoreResult& score_result,
     const MergeOptions& options) {
   return PreparePartitionPatchImpl(
-      main_ivf, main_versions, assignments, score_result, nullptr, options);
+      main_ivf, main_versions, assignments, score_result, nullptr, options, nullptr);
 }
 
 Result<PartitionPatch> prepare_partition_patch(
@@ -707,7 +862,7 @@ Result<PartitionPatch> prepare_partition_patch(
     const MatrixRM& base_vectors,
     const MergeOptions& options) {
   return PreparePartitionPatchImpl(
-      main_ivf, main_versions, assignments, score_result, &base_vectors, options);
+      main_ivf, main_versions, assignments, score_result, &base_vectors, options, nullptr);
 }
 
 Result<PartitionPatch> PreparePartitionPatchImpl(
@@ -716,10 +871,12 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM* base_vectors,
-    const MergeOptions& options) {
+    const MergeOptions& options,
+    MergeProfiling* profiling) {
   if (!main_ivf) {
     return Status::InvalidArgument("prepare_partition_patch: main_ivf is null");
   }
+  std::mutex profiling_mu;
 
   if (options.assignment_mode == "balanced_append") {
     auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
@@ -744,6 +901,9 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
                 return assignments[static_cast<size_t>(lhs)].size() >
                        assignments[static_cast<size_t>(rhs)].size();
               });
+    if (profiling != nullptr) {
+      profiling->seed_partitions = static_cast<uint64_t>(seeds.size());
+    }
 
     PartitionPatch patch;
     std::vector<uint8_t> claimed(assignments.size(), 0u);
@@ -751,8 +911,14 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       if (claimed[static_cast<size_t>(seed)] != 0u) {
         continue;
       }
+      const auto neighbor_start = profiling != nullptr
+                                      ? ProfilingClock::now()
+                                      : ProfilingClock::time_point{};
       std::vector<uint32_t> neighborhood =
           TopRNeighborPartitions(seed, centroids_res.value(), options.assignment_top_r);
+      if (profiling != nullptr) {
+        profiling->top_r_neighbor_us += ElapsedProfilingMicros(neighbor_start);
+      }
       std::vector<uint32_t> active_neighborhood;
       active_neighborhood.reserve(neighborhood.size());
       for (uint32_t part : neighborhood) {
@@ -763,23 +929,37 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       if (active_neighborhood.empty()) {
         continue;
       }
+      if (profiling != nullptr) {
+        ++profiling->neighborhoods;
+      }
 
       std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
       neighborhood_main_records.reserve(active_neighborhood.size());
       for (uint32_t part : active_neighborhood) {
+        const auto fetch_start = profiling != nullptr
+                                     ? ProfilingClock::now()
+                                     : ProfilingClock::time_point{};
         auto main_records_res =
             FetchPartitionRecordsForMerge(main_ivf, main_versions, part, base_vectors);
+        if (profiling != nullptr) {
+          profiling->fetch_main_records_us += ElapsedProfilingMicros(fetch_start);
+        }
         if (!main_records_res.ok()) {
           return main_records_res.status();
+        }
+        if (profiling != nullptr) {
+          profiling->main_records_loaded +=
+              static_cast<uint64_t>(main_records_res.value().size());
         }
         neighborhood_main_records.push_back(std::move(main_records_res.value()));
       }
 
       auto repartition_res = RepartitionNeighborhood(active_neighborhood,
-                                                     neighborhood_main_records,
+                                                     std::move(neighborhood_main_records),
                                                      assignments,
                                                      centroids_res.value(),
-                                                     options);
+                                                     options,
+                                                     profiling);
       if (!repartition_res.ok()) {
         return repartition_res.status();
       }
@@ -788,6 +968,12 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
         patch.partition_ids.push_back(active_neighborhood[i]);
         patch.replacement_records.push_back(std::move(repartitioned[i]));
         claimed[static_cast<size_t>(active_neighborhood[i])] = 1u;
+      }
+    }
+    if (profiling != nullptr) {
+      profiling->patch_records = 0;
+      for (const auto& records : patch.replacement_records) {
+        profiling->patch_records += static_cast<uint64_t>(records.size());
       }
     }
     return patch;
@@ -827,14 +1013,26 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     }
     const uint32_t p = active_partitions[static_cast<size_t>(i)];
     const auto& delta_bucket = assignments[static_cast<size_t>(p)];
+    const auto fetch_start = profiling != nullptr
+                                 ? ProfilingClock::now()
+                                 : ProfilingClock::time_point{};
     auto main_records_res =
         FetchPartitionRecordsForMerge(main_ivf, main_versions, p, base_vectors);
+    if (profiling != nullptr) {
+      std::lock_guard<std::mutex> lock(profiling_mu);
+      profiling->fetch_main_records_us += ElapsedProfilingMicros(fetch_start);
+    }
     if (!main_records_res.ok()) {
       std::lock_guard<std::mutex> lock(err_mu);
       if (!failed.exchange(true)) {
         first_error = main_records_res.status();
       }
       continue;
+    }
+    if (profiling != nullptr) {
+      std::lock_guard<std::mutex> lock(profiling_mu);
+      profiling->main_records_loaded +=
+          static_cast<uint64_t>(main_records_res.value().size());
     }
     Result<AlignedVector<VectorRecord>> merged_res =
         recluster_flags[static_cast<size_t>(p)] != 0
@@ -851,6 +1049,12 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
   }
   if (failed.load(std::memory_order_relaxed)) {
     return first_error;
+  }
+  if (profiling != nullptr) {
+    profiling->patch_records = 0;
+    for (const auto& records : patch.replacement_records) {
+      profiling->patch_records += static_cast<uint64_t>(records.size());
+    }
   }
   return patch;
 }
@@ -889,44 +1093,80 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
+  MergeProfiling profiling;
+  profiling.frozen_records = static_cast<uint64_t>(frozen_delta.records.size());
   Timer merge_compute_timer;
   auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
   if (!centroids_res.ok()) {
     return centroids_res.status();
   }
+  profiling.effective_nlist = static_cast<uint32_t>(centroids_res.value().rows());
   auto sizes_res = main_ivf->GetPartitionSizes(main_versions);
   if (!sizes_res.ok()) {
     return sizes_res.status();
   }
   AssignmentDiagnostics assignment_diag;
   auto assign_res = assign_delta_to_main_centroids_for_merge(
-      frozen_delta, centroids_res.value(), sizes_res.value(), options, &assignment_diag);
+      frozen_delta,
+      centroids_res.value(),
+      sizes_res.value(),
+      options,
+      &assignment_diag,
+      &profiling);
   if (!assign_res.ok()) {
     return assign_res.status();
   }
+  Timer stats_timer;
   auto stats_res = compute_partition_stats(assign_res.value(), sizes_res.value());
   if (!stats_res.ok()) {
     return stats_res.status();
   }
+  profiling.stats_us = stats_timer.ElapsedMicros();
+  Timer scoring_timer;
   auto score_res = score_partitions(
       stats_res.value(), options.alpha, options.beta, options.recluster_threshold);
   if (!score_res.ok()) {
     return score_res.status();
   }
+  profiling.scoring_us = scoring_timer.ElapsedMicros();
+  Timer patch_prepare_timer;
   auto patch_res = PreparePartitionPatchImpl(
-      main_ivf, main_versions, assign_res.value(), score_res.value(), base_vectors, options);
+      main_ivf,
+      main_versions,
+      assign_res.value(),
+      score_res.value(),
+      base_vectors,
+      options,
+      &profiling);
   if (!patch_res.ok()) {
     return patch_res.status();
   }
+  profiling.patch_prepare_us = patch_prepare_timer.ElapsedMicros();
   const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
+  Timer commit_timer;
   Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value());
   if (!commit.ok()) {
     return commit;
+  }
+  profiling.commit_us = commit_timer.ElapsedMicros();
+  profiling.patch_records = 0;
+  for (const auto& records : patch_res.value().replacement_records) {
+    profiling.patch_records += static_cast<uint64_t>(records.size());
   }
   auto codebook_ms_res = main_ivf->GetLastPatchPQReencodeMs(main_versions);
   if (!codebook_ms_res.ok()) {
     return codebook_ms_res.status();
   }
+  auto patch_profile_res = main_ivf->GetLastPatchProfiling(main_versions);
+  if (!patch_profile_res.ok()) {
+    return patch_profile_res.status();
+  }
+  const PatchProfiling& patch_profile = patch_profile_res.value();
+  profiling.pq_codes_reused = patch_profile.pq_codes_reused;
+  profiling.pq_codes_reencoded = patch_profile.pq_codes_reencoded;
+  profiling.pq_code_assignment_us = patch_profile.pq_code_assignment_us;
+  profiling.pq_code_copy_or_reuse_us = patch_profile.pq_code_copy_or_reuse_us;
+  profiling.pq_list_flatten_us = patch_profile.pq_list_flatten_us;
 
   MergeReport report;
   report.frozen_records = static_cast<uint32_t>(frozen_delta.records.size());
@@ -935,6 +1175,7 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   report.recluster_partitions = static_cast<uint32_t>(score_res.value().recluster_partitions.size());
   report.merge_compute_ms = merge_compute_ms;
   report.codebook_rebuild_ms = codebook_ms_res.value();
+  report.profiling = profiling;
   report.moved_delta_ratio = assignment_diag.moved_delta_ratio;
   report.avg_assignment_dist_ratio = assignment_diag.avg_assignment_dist_ratio;
   report.max_assignment_dist_ratio = assignment_diag.max_assignment_dist_ratio;

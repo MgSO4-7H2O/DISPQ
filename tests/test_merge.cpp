@@ -328,6 +328,27 @@ int main() {
   assert(report_res.ok());
   assert(report_res.value().frozen_records == 3);
   assert(report_res.value().patch_partitions == 3);
+  assert(report_res.value().profiling.effective_nlist == 3);
+  assert(report_res.value().profiling.frozen_records == 3);
+  assert(report_res.value().profiling.seed_partitions > 0);
+  assert(report_res.value().profiling.neighborhoods > 0);
+  assert(report_res.value().profiling.main_records_loaded > 0);
+  assert(report_res.value().profiling.pooled_records > 0);
+  assert(report_res.value().profiling.repartitioned_records > 0);
+  assert(report_res.value().profiling.patch_records > 0);
+  assert(report_res.value().profiling.pq_codes_reused > 0);
+  assert(report_res.value().profiling.pq_codes_reencoded > 0);
+  assert(report_res.value().profiling.pq_codes_reused +
+             report_res.value().profiling.pq_codes_reencoded ==
+         report_res.value().profiling.patch_records);
+  assert(report_res.value().profiling.pq_code_copy_or_reuse_us >= 0.0);
+  assert(report_res.value().profiling.merge_delta_to_main_assignment_us >= 0.0);
+  assert(report_res.value().profiling.merge_assignment_distance_us >= 0.0);
+  assert(report_res.value().profiling.merge_assignment_top_r_us >= 0.0);
+  assert(report_res.value().profiling.merge_assignment_balance_us >= 0.0);
+  assert(report_res.value().profiling.merge_assignment_materialize_us >= 0.0);
+  assert(report_res.value().profiling.repartition_distance_us >= 0.0);
+  assert(report_res.value().profiling.pq_code_assignment_us >= 0.0);
 
   auto sizes_after_full_res = fx2.main_ivf->GetPartitionSizes(fx2.main_versions);
   assert(sizes_after_full_res.ok());

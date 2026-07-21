@@ -60,6 +60,11 @@ int main() {
   assert(ivf->Add(recs).ok());
 
   VersionSet routes = rec.versions;
+  auto ingest_profile = ivf->GetLastIngestProfiling(routes);
+  assert(ingest_profile.ok());
+  assert(ingest_profile.value().records == recs.size());
+  assert(ingest_profile.value().assignment_us >= 0.0);
+
   auto search_res = ivf->Search(xw, 2, 1, routes, 0);
   assert(search_res.ok());
   assert(search_res.value().scanned_candidates >= search_res.value().topk.size());

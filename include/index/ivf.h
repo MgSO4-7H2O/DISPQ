@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -63,6 +64,9 @@ struct OnlinePQUpdateStats {
   double nqe_baseline{0.0};
   double qe_ratio{1.0};
   double codebook_drift_l2{0.0};
+  // Wall-clock time spent assigning inserted records to this IVF's own lists.
+  // This is distinct from merge-time frozen-delta-to-main assignment.
+  double insert_assignment_us{0.0};
   double record_build_ms{0.0};
   double insert_ms{0.0};
   double insert_encode_ms{0.0};
@@ -73,6 +77,13 @@ struct OnlinePQUpdateStats {
   double codebook_update_ms{0.0};
   double reencode_ms{0.0};
   double maintenance_ms{0.0};
+};
+
+struct IngestProfiling {
+  uint64_t records{0};
+  double assignment_us{0.0};
+  double encode_us{0.0};
+  double commit_us{0.0};
 };
 
 struct PQRuntimeState {
@@ -92,6 +103,15 @@ struct PQRuntimeState {
 struct PartitionPatch {
   std::vector<uint32_t> partition_ids;
   std::vector<AlignedVector<VectorRecord>> replacement_records;
+};
+
+struct PatchProfiling {
+  double pq_code_assignment_us{0.0};
+  double pq_code_copy_or_reuse_us{0.0};
+  double pq_list_flatten_us{0.0};
+  uint64_t patch_records{0};
+  uint64_t pq_codes_reused{0};
+  uint64_t pq_codes_reencoded{0};
 };
 
 class IVFIndex {
@@ -163,6 +183,10 @@ class IVFIndex {
   virtual Status CommitPartitionPatch(const VersionSet& route_versions,
                                       const PartitionPatch& patch) = 0;
   virtual Result<double> GetLastPatchPQReencodeMs(
+      const VersionSet& route_versions) const = 0;
+  virtual Result<PatchProfiling> GetLastPatchProfiling(
+      const VersionSet& route_versions) const = 0;
+  virtual Result<IngestProfiling> GetLastIngestProfiling(
       const VersionSet& route_versions) const = 0;
 
   virtual Result<std::vector<uint8_t>> Serialize() const = 0;

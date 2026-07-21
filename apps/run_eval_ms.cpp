@@ -1471,6 +1471,8 @@ int main(int argc, char** argv) {
 
   double init_ms = 0.0;
   double total_update_ms = 0.0;
+  double total_delta_ingest_assignment_us = 0.0;
+  uint64_t total_delta_ingest_assignment_records = 0;
   double total_merge_ms = 0.0;
   double total_global_rebuild_ms = 0.0;
 
@@ -1614,6 +1616,42 @@ int main(int argc, char** argv) {
               << ", merge_compute_ms=" << res.value().merge_compute_ms
               << ", codebook_rebuild_ms=" << res.value().codebook_rebuild_ms
               << ", merge_ms=" << elapsed
+              << std::endl;
+    const auto& profile = res.value().profiling;
+    std::cout << "[MERGE_PROFILE] effective_nlist=" << profile.effective_nlist
+              << ", frozen_records=" << profile.frozen_records
+              << ", seed_partitions=" << profile.seed_partitions
+              << ", neighborhoods=" << profile.neighborhoods
+              << ", main_records_loaded=" << profile.main_records_loaded
+              << ", pooled_records=" << profile.pooled_records
+              << ", repartitioned_records=" << profile.repartitioned_records
+              << ", patch_records=" << profile.patch_records
+              << ", pq_codes_reused=" << profile.pq_codes_reused
+              << ", pq_codes_reencoded=" << profile.pq_codes_reencoded
+              << ", merge_delta_to_main_assignment_us="
+              << profile.merge_delta_to_main_assignment_us
+              << ", merge_assignment_distance_us="
+              << profile.merge_assignment_distance_us
+              << ", merge_assignment_top_r_us="
+              << profile.merge_assignment_top_r_us
+              << ", merge_assignment_balance_us="
+              << profile.merge_assignment_balance_us
+              << ", merge_assignment_materialize_us="
+              << profile.merge_assignment_materialize_us
+              << ", stats_us=" << profile.stats_us
+              << ", scoring_us=" << profile.scoring_us
+              << ", top_r_neighbor_us=" << profile.top_r_neighbor_us
+              << ", fetch_main_records_us=" << profile.fetch_main_records_us
+              << ", repartition_pool_us=" << profile.repartition_pool_us
+              << ", repartition_distance_us=" << profile.repartition_distance_us
+              << ", repartition_candidate_selection_us="
+              << profile.repartition_candidate_selection_us
+              << ", repartition_sort_us=" << profile.repartition_sort_us
+              << ", patch_prepare_us=" << profile.patch_prepare_us
+              << ", commit_us=" << profile.commit_us
+              << ", pq_code_assignment_us=" << profile.pq_code_assignment_us
+              << ", pq_code_copy_or_reuse_us=" << profile.pq_code_copy_or_reuse_us
+              << ", pq_list_flatten_us=" << profile.pq_list_flatten_us
               << std::endl;
 
     frozen_delta.reset();
@@ -2077,6 +2115,14 @@ int main(int argc, char** argv) {
       total_update_ms += add_ms;
       pending_update_ms += add_ms;
       last_pq_stats = add.value();
+      total_delta_ingest_assignment_us += last_pq_stats.insert_assignment_us;
+      total_delta_ingest_assignment_records += last_pq_stats.processed_vectors;
+      std::cout << "[STREAM_PROFILE] begin=" << cur
+                << ", end=" << chunk_end
+                << ", delta_ingest_assignment_us="
+                << last_pq_stats.insert_assignment_us
+                << ", records=" << last_pq_stats.processed_vectors
+                << std::endl;
 
       active_delta->rows += (chunk_end - cur);
       cur = chunk_end;
@@ -2357,6 +2403,10 @@ int main(int argc, char** argv) {
             << (snapshots.empty() ? 0.0 : snapshots.back().recall)
             << ", update_ms=" << total_update_ms
             << ", merge_ms=" << total_merge_ms
+            << ", delta_ingest_assignment_us="
+            << total_delta_ingest_assignment_us
+            << ", delta_ingest_assignment_records="
+            << total_delta_ingest_assignment_records
             << ", merge_count=" << merge_count
             << ", global_rebuild_ms=" << total_global_rebuild_ms
             << ", summary=" << summary_path

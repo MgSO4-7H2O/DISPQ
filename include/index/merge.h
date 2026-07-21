@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -63,6 +64,38 @@ struct DistributionSummary {
   double max{0.0};
 };
 
+struct MergeProfiling {
+  uint32_t effective_nlist{0};
+  uint64_t frozen_records{0};
+  uint64_t seed_partitions{0};
+  uint64_t neighborhoods{0};
+  uint64_t main_records_loaded{0};
+  uint64_t pooled_records{0};
+  uint64_t repartitioned_records{0};
+  uint64_t patch_records{0};
+  uint64_t pq_codes_reused{0};
+  uint64_t pq_codes_reencoded{0};
+
+  double merge_delta_to_main_assignment_us{0.0};
+  double merge_assignment_distance_us{0.0};
+  double merge_assignment_top_r_us{0.0};
+  double merge_assignment_balance_us{0.0};
+  double merge_assignment_materialize_us{0.0};
+  double stats_us{0.0};
+  double scoring_us{0.0};
+  double top_r_neighbor_us{0.0};
+  double fetch_main_records_us{0.0};
+  double repartition_pool_us{0.0};
+  double repartition_distance_us{0.0};
+  double repartition_candidate_selection_us{0.0};
+  double repartition_sort_us{0.0};
+  double patch_prepare_us{0.0};
+  double commit_us{0.0};
+  double pq_code_assignment_us{0.0};
+  double pq_code_copy_or_reuse_us{0.0};
+  double pq_list_flatten_us{0.0};
+};
+
 struct MergeReport {
   uint32_t frozen_records{0};
   uint32_t patch_partitions{0};
@@ -75,6 +108,7 @@ struct MergeReport {
   double max_assignment_dist_ratio{1.0};
   double imbalance_before{0.0};
   double imbalance_after{0.0};
+  MergeProfiling profiling;
   DistributionSummary score_summary;
   DistributionSummary residual_summary;
   DistributionSummary growth_summary;

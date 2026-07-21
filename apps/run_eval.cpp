@@ -771,7 +771,8 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
                        uint32_t begin,
                        uint32_t end,
                        uint32_t dim,
-                       const VersionSet& versions) {
+                       const VersionSet& versions,
+                       IngestProfiling* profiling = nullptr) {
   if (!ivf) {
     return Status::InvalidArgument("AddRangeToIndex: null ivf");
   }
@@ -799,6 +800,16 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
     const Status add_status = ivf->AddBatch(records, block_end == end);
     if (!add_status.ok()) {
       return add_status;
+    }
+    if (profiling != nullptr) {
+      auto block_profile = ivf->GetLastIngestProfiling(versions);
+      if (!block_profile.ok()) {
+        return block_profile.status();
+      }
+      profiling->records += block_profile.value().records;
+      profiling->assignment_us += block_profile.value().assignment_us;
+      profiling->encode_us += block_profile.value().encode_us;
+      profiling->commit_us += block_profile.value().commit_us;
     }
     block_begin = block_end;
   }
@@ -2126,6 +2137,9 @@ int main(int argc, char** argv) {
     active_delta->rows = delta_train_rows;
   }
 
+  double total_delta_ingest_assignment_us = 0.0;
+  uint64_t total_delta_ingest_assignment_records = 0;
+
   auto ActivatePendingDeltaFromSubsequentWindow = [&](uint32_t end_row) -> Result<double> {
     if (!pending_active_train || active_delta.has_value()) {
       return 0.0;
@@ -2157,15 +2171,26 @@ int main(int argc, char** argv) {
     }
     DeltaShard shard = active_res.value();
     Timer delta_seed_insert_timer;
+    IngestProfiling delta_seed_profile;
     const Status add_delta_seed = AddRangeToIndex(shard.ivf,
                                                   X_whitened,
                                                   train_begin,
                                                   train_begin + train_rows,
                                                   config.dim,
-                                                  shard.versions);
+                                                  shard.versions,
+                                                  &delta_seed_profile);
     if (!add_delta_seed.ok()) {
       return add_delta_seed;
     }
+    total_delta_ingest_assignment_us += delta_seed_profile.assignment_us;
+    total_delta_ingest_assignment_records += delta_seed_profile.records;
+    std::cout << "[STREAM_PROFILE] phase=delta_activation"
+              << ", begin=" << train_begin
+              << ", end=" << (train_begin + train_rows)
+              << ", delta_ingest_assignment_us="
+              << delta_seed_profile.assignment_us
+              << ", records=" << delta_seed_profile.records
+              << std::endl;
     const double delta_seed_insert_ms = delta_seed_insert_timer.ElapsedMillis();
     shard.rows = train_rows;
     active_delta = std::move(shard);
@@ -2999,6 +3024,14 @@ int main(int argc, char** argv) {
           return 1;
         }
         last_online_pq_stats = add_res.value();
+        total_delta_ingest_assignment_us += last_online_pq_stats.insert_assignment_us;
+        total_delta_ingest_assignment_records += last_online_pq_stats.processed_vectors;
+        std::cout << "[STREAM_PROFILE] begin=" << begin
+                  << ", end=" << end
+                  << ", delta_ingest_assignment_us="
+                  << last_online_pq_stats.insert_assignment_us
+                  << ", records=" << last_online_pq_stats.processed_vectors
+                  << std::endl;
         online_pq_rollup.batches++;
         online_pq_rollup.sum_nqe_batch += last_online_pq_stats.nqe_batch;
         online_pq_rollup.sum_qe_ratio += last_online_pq_stats.qe_ratio;
@@ -3267,6 +3300,42 @@ int main(int argc, char** argv) {
                   << ", merge_compute_ms=" << merge_res.value().merge_compute_ms
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
+        const auto& profile = merge_res.value().profiling;
+        std::cout << "[MERGE_PROFILE] effective_nlist=" << profile.effective_nlist
+                  << ", frozen_records=" << profile.frozen_records
+                  << ", seed_partitions=" << profile.seed_partitions
+                  << ", neighborhoods=" << profile.neighborhoods
+                  << ", main_records_loaded=" << profile.main_records_loaded
+                  << ", pooled_records=" << profile.pooled_records
+                  << ", repartitioned_records=" << profile.repartitioned_records
+                  << ", patch_records=" << profile.patch_records
+                  << ", pq_codes_reused=" << profile.pq_codes_reused
+                  << ", pq_codes_reencoded=" << profile.pq_codes_reencoded
+                  << ", merge_delta_to_main_assignment_us="
+                  << profile.merge_delta_to_main_assignment_us
+                  << ", merge_assignment_distance_us="
+                  << profile.merge_assignment_distance_us
+                  << ", merge_assignment_top_r_us="
+                  << profile.merge_assignment_top_r_us
+                  << ", merge_assignment_balance_us="
+                  << profile.merge_assignment_balance_us
+                  << ", merge_assignment_materialize_us="
+                  << profile.merge_assignment_materialize_us
+                  << ", stats_us=" << profile.stats_us
+                  << ", scoring_us=" << profile.scoring_us
+                  << ", top_r_neighbor_us=" << profile.top_r_neighbor_us
+                  << ", fetch_main_records_us=" << profile.fetch_main_records_us
+                  << ", repartition_pool_us=" << profile.repartition_pool_us
+                  << ", repartition_distance_us=" << profile.repartition_distance_us
+                  << ", repartition_candidate_selection_us="
+                  << profile.repartition_candidate_selection_us
+                  << ", repartition_sort_us=" << profile.repartition_sort_us
+                  << ", patch_prepare_us=" << profile.patch_prepare_us
+                  << ", commit_us=" << profile.commit_us
+                  << ", pq_code_assignment_us=" << profile.pq_code_assignment_us
+                  << ", pq_code_copy_or_reuse_us=" << profile.pq_code_copy_or_reuse_us
+                  << ", pq_list_flatten_us=" << profile.pq_list_flatten_us
+                  << std::endl;
         frozen_delta.reset();
         frozen_trigger_decision.reset();
         snapshot_state_changed = true;
@@ -3399,6 +3468,10 @@ int main(int argc, char** argv) {
             << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
             << "; Query QPS=" << final_metrics.query_qps
             << ", Update throughput=" << final_metrics.update_throughput_vecps << " vec/s"
+            << std::endl;
+  std::cout << "[STREAM_PROFILE_TOTAL] delta_ingest_assignment_us="
+            << total_delta_ingest_assignment_us
+            << ", records=" << total_delta_ingest_assignment_records
             << std::endl;
   std::cout << "[GLOBAL REBUILD] enabled=" << std::boolalpha << config.enable_global_rebuild
             << ", count=" << global_rebuild_count << "/" << config.global_rebuild_max_count
@@ -3563,6 +3636,10 @@ int main(int argc, char** argv) {
     ofs << "    \"update_delete_ms\": " << total_update_delete_ms << ",\n";
     ofs << "    \"update_codebook_update_ms\": " << total_update_codebook_update_ms << ",\n";
     ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
+    ofs << "    \"delta_ingest_assignment_us\": "
+        << total_delta_ingest_assignment_us << ",\n";
+    ofs << "    \"delta_ingest_assignment_records\": "
+        << total_delta_ingest_assignment_records << ",\n";
     ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
     ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
     ofs << "    \"initial_used_prebuilt_index\": "
@@ -3808,6 +3885,10 @@ int main(int argc, char** argv) {
   ofs << "    \"update_delete_ms\": " << total_update_delete_ms << ",\n";
   ofs << "    \"update_codebook_update_ms\": " << total_update_codebook_update_ms << ",\n";
   ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
+  ofs << "    \"delta_ingest_assignment_us\": "
+      << total_delta_ingest_assignment_us << ",\n";
+  ofs << "    \"delta_ingest_assignment_records\": "
+      << total_delta_ingest_assignment_records << ",\n";
   ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
   ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
   ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";

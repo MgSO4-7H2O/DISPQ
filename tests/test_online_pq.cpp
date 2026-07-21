@@ -96,6 +96,7 @@ int main() {
   auto no_update_res = ivf_online->AddWithOnlinePQ(records_online, no_update_opt);
   assert(no_update_res.ok());
   assert(!no_update_res.value().updated_codebook);
+  assert(no_update_res.value().insert_assignment_us >= 0.0);
 
   auto state_after_no_update = ivf_online->GetPQRuntimeState(versions_online);
   assert(state_after_no_update.ok());
