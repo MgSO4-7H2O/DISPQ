@@ -64,6 +64,34 @@ struct DistributionSummary {
   double max{0.0};
 };
 
+struct MergeProfiling {
+  uint32_t effective_nlist{0};
+  uint64_t frozen_records{0};
+  uint64_t seed_partitions{0};
+  uint64_t neighborhoods{0};
+  uint64_t main_records_loaded{0};
+  uint64_t pooled_records{0};
+  uint64_t repartitioned_records{0};
+  uint64_t patch_records{0};
+  uint64_t assignment_distance_evaluations{0};
+  uint64_t assignment_workspace_bytes{0};
+  uint32_t assignment_chunk_records{0};
+  uint32_t assignment_chunk_count{0};
+  double merge_delta_to_main_assignment_us{0.0};
+  double merge_assignment_distance_us{0.0};
+  double merge_assignment_top_r_us{0.0};
+  double merge_assignment_balance_us{0.0};
+  double merge_assignment_materialize_us{0.0};
+  double stats_us{0.0};
+  double scoring_us{0.0};
+  double top_r_neighbor_us{0.0};
+  double fetch_main_records_us{0.0};
+  double repartition_us{0.0};
+  double patch_prepare_us{0.0};
+  double commit_us{0.0};
+  double pq_code_assignment_us{0.0};
+};
+
 struct MergeReport {
   uint32_t frozen_records{0};
   uint32_t patch_partitions{0};
@@ -79,6 +107,7 @@ struct MergeReport {
   DistributionSummary score_summary;
   DistributionSummary residual_summary;
   DistributionSummary growth_summary;
+  MergeProfiling profiling;
   std::vector<PartitionStats> stats;
   PartitionScoreResult scoring;
 };

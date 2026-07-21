@@ -14,6 +14,10 @@ class Timer {
     return std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
   }
 
+  double ElapsedMicros() const {
+    return std::chrono::duration<double, std::micro>(Clock::now() - start_).count();
+  }
+
  private:
   using Clock = std::chrono::steady_clock;
   Clock::time_point start_;

@@ -56,6 +56,46 @@ struct Fixture {
   MatrixRM vector_store;
 };
 
+class CountingBatchAccessor final : public VectorAccessor {
+ public:
+  explicit CountingBatchAccessor(const MatrixRM& vectors) : vectors_(vectors) {}
+
+  uint32_t dim() const override { return static_cast<uint32_t>(vectors_.cols()); }
+
+  Result<Eigen::VectorXf> GetVector(DocId doc_id) const override {
+    ++get_vector_calls;
+    if (static_cast<Eigen::Index>(doc_id) >= vectors_.rows()) {
+      return Status::InvalidArgument("CountingBatchAccessor::GetVector: doc_id out of range");
+    }
+    return Eigen::VectorXf(vectors_.row(static_cast<Eigen::Index>(doc_id)).transpose());
+  }
+
+  Status Materialize(const std::vector<DocId>& doc_ids, MatrixRM* out) const override {
+    ++materialize_calls;
+    if (out == nullptr) {
+      return Status::InvalidArgument("CountingBatchAccessor::Materialize: null output");
+    }
+    MatrixRM rows(static_cast<Eigen::Index>(doc_ids.size()), vectors_.cols());
+    for (size_t i = 0; i < doc_ids.size(); ++i) {
+      const DocId doc_id = doc_ids[i];
+      if (static_cast<Eigen::Index>(doc_id) >= vectors_.rows()) {
+        return Status::InvalidArgument(
+            "CountingBatchAccessor::Materialize: doc_id out of range");
+      }
+      rows.row(static_cast<Eigen::Index>(i)) =
+          vectors_.row(static_cast<Eigen::Index>(doc_id));
+    }
+    *out = std::move(rows);
+    return Status::OK();
+  }
+
+  mutable uint32_t get_vector_calls{0};
+  mutable uint32_t materialize_calls{0};
+
+ private:
+  const MatrixRM& vectors_;
+};
+
 AlignedVector<VectorRecord> MakePartitionRecordsFromStore(const std::shared_ptr<IVFIndex>& ivf,
                                                           const VersionSet& versions,
                                                           uint32_t partition_id,
@@ -328,6 +368,33 @@ int main() {
   assert(report_res.ok());
   assert(report_res.value().frozen_records == 3);
   assert(report_res.value().patch_partitions == 3);
+  const auto& profiling = report_res.value().profiling;
+  assert(profiling.effective_nlist == 3);
+  assert(profiling.frozen_records == 3);
+  assert(profiling.seed_partitions > 0);
+  assert(profiling.neighborhoods > 0);
+  assert(profiling.main_records_loaded > 0);
+  assert(profiling.pooled_records ==
+         profiling.main_records_loaded + profiling.frozen_records);
+  assert(profiling.repartitioned_records == 7);
+  assert(profiling.patch_records == 7);
+  assert(profiling.assignment_distance_evaluations == 9);
+  assert(profiling.assignment_workspace_bytes > 0);
+  assert(profiling.assignment_chunk_records >= profiling.frozen_records);
+  assert(profiling.assignment_chunk_count == 1);
+  assert(profiling.merge_delta_to_main_assignment_us >= 0.0);
+  assert(profiling.merge_assignment_distance_us >= 0.0);
+  assert(profiling.merge_assignment_top_r_us >= 0.0);
+  assert(profiling.merge_assignment_balance_us >= 0.0);
+  assert(profiling.merge_assignment_materialize_us >= 0.0);
+  assert(profiling.stats_us >= 0.0);
+  assert(profiling.scoring_us >= 0.0);
+  assert(profiling.top_r_neighbor_us >= 0.0);
+  assert(profiling.fetch_main_records_us >= 0.0);
+  assert(profiling.repartition_us >= 0.0);
+  assert(profiling.patch_prepare_us >= 0.0);
+  assert(profiling.commit_us >= 0.0);
+  assert(profiling.pq_code_assignment_us >= 0.0);
 
   auto sizes_after_full_res = fx2.main_ivf->GetPartitionSizes(fx2.main_versions);
   assert(sizes_after_full_res.ok());
@@ -336,7 +403,27 @@ int main() {
   assert(sizes_after_full[1] == 3);
   assert(sizes_after_full[2] == 1);
 
-  // 7) balanced_append should prefer a healthier nearby list when the nearest
+  // The large-data accessor path should fetch vectors in batches. This covers
+  // both frozen-delta materialization and main-partition materialization.
+  Fixture fx_accessor = BuildFixture();
+  CountingBatchAccessor accessor(fx_accessor.vector_store);
+  auto accessor_report_res = merge_frozen_delta_into_main(
+      fx_accessor.main_ivf,
+      fx_accessor.main_versions,
+      fx_accessor.delta_ivf,
+      fx_accessor.delta_versions,
+      accessor,
+      options);
+  assert(accessor_report_res.ok());
+  assert(accessor_report_res.value().frozen_records == 3);
+  assert(accessor_report_res.value().patch_partitions == 3);
+  assert(accessor.materialize_calls > 1);
+  assert(accessor.get_vector_calls == 0);
+  auto accessor_sizes_res = fx_accessor.main_ivf->GetPartitionSizes(fx_accessor.main_versions);
+  assert(accessor_sizes_res.ok());
+  assert(accessor_sizes_res.value() == sizes_after_full);
+
+  // 8) balanced_append should prefer a healthier nearby list when the nearest
   // list is already overloaded relative to local average.
   Fixture fx3 = BuildHealthierNeighborFixture();
   MergeOptions constrained_options;

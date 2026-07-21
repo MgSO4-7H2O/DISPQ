@@ -857,6 +857,7 @@ struct MergeEventRecord {
   double merge_compute_ms{0.0};
   double merge_ms{0.0};
   double codebook_rebuild_ms{0.0};
+  MergeProfiling profiling;
 };
 
 struct MergeTriggerDecision {
@@ -4887,6 +4888,7 @@ int main(int argc, char** argv) {
         merge_event.merge_compute_ms = merge_res.value().merge_compute_ms;
         merge_event.merge_ms = merge_commit_ms;
         merge_event.codebook_rebuild_ms = merge_res.value().codebook_rebuild_ms;
+        merge_event.profiling = merge_res.value().profiling;
         merge_events.push_back(merge_event);
         {
           std::ostringstream line;
@@ -4904,6 +4906,24 @@ int main(int argc, char** argv) {
                << R"(,"merge_compute_ms":)" << merge_event.merge_compute_ms
                << R"(,"merge_ms":)" << merge_event.merge_ms
                << R"(,"codebook_rebuild_ms":)" << merge_event.codebook_rebuild_ms
+               << R"(,"merge_assignment_us":)"
+               << merge_event.profiling.merge_delta_to_main_assignment_us
+               << R"(,"merge_assignment_distance_us":)"
+               << merge_event.profiling.merge_assignment_distance_us
+               << R"(,"merge_assignment_top_r_us":)"
+               << merge_event.profiling.merge_assignment_top_r_us
+               << R"(,"merge_assignment_balance_us":)"
+               << merge_event.profiling.merge_assignment_balance_us
+               << R"(,"merge_assignment_materialize_us":)"
+               << merge_event.profiling.merge_assignment_materialize_us
+               << R"(,"merge_top_r_neighbor_us":)"
+               << merge_event.profiling.top_r_neighbor_us
+               << R"(,"merge_fetch_main_records_us":)"
+               << merge_event.profiling.fetch_main_records_us
+               << R"(,"merge_repartition_us":)" << merge_event.profiling.repartition_us
+               << R"(,"merge_patch_prepare_us":)"
+               << merge_event.profiling.patch_prepare_us
+               << R"(,"merge_commit_us":)" << merge_event.profiling.commit_us
                << R"(,"patched_partitions":)" << merge_event.patched_partitions
                << R"(,"append_partitions":)" << merge_event.append_partitions
                << R"(,"recluster_partitions":)" << merge_event.recluster_partitions
@@ -4948,6 +4968,41 @@ int main(int argc, char** argv) {
                   << ", merge_compute_ms=" << merge_res.value().merge_compute_ms
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
+        const auto& merge_profile = merge_res.value().profiling;
+        std::cout << "[MERGE_PROFILE] effective_nlist=" << merge_profile.effective_nlist
+                  << ", frozen_records=" << merge_profile.frozen_records
+                  << ", seed_partitions=" << merge_profile.seed_partitions
+                  << ", neighborhoods=" << merge_profile.neighborhoods
+                  << ", main_records_loaded=" << merge_profile.main_records_loaded
+                  << ", pooled_records=" << merge_profile.pooled_records
+                  << ", repartitioned_records=" << merge_profile.repartitioned_records
+                  << ", patch_records=" << merge_profile.patch_records
+                  << ", assignment_distance_evaluations="
+                  << merge_profile.assignment_distance_evaluations
+                  << ", assignment_workspace_bytes="
+                  << merge_profile.assignment_workspace_bytes
+                  << ", assignment_chunk_records="
+                  << merge_profile.assignment_chunk_records
+                  << ", assignment_chunk_count=" << merge_profile.assignment_chunk_count
+                  << ", merge_delta_to_main_assignment_us="
+                  << merge_profile.merge_delta_to_main_assignment_us
+                  << ", merge_assignment_distance_us="
+                  << merge_profile.merge_assignment_distance_us
+                  << ", merge_assignment_top_r_us="
+                  << merge_profile.merge_assignment_top_r_us
+                  << ", merge_assignment_balance_us="
+                  << merge_profile.merge_assignment_balance_us
+                  << ", merge_assignment_materialize_us="
+                  << merge_profile.merge_assignment_materialize_us
+                  << ", stats_us=" << merge_profile.stats_us
+                  << ", scoring_us=" << merge_profile.scoring_us
+                  << ", top_r_neighbor_us=" << merge_profile.top_r_neighbor_us
+                  << ", fetch_main_records_us=" << merge_profile.fetch_main_records_us
+                  << ", repartition_us=" << merge_profile.repartition_us
+                  << ", patch_prepare_us=" << merge_profile.patch_prepare_us
+                  << ", commit_us=" << merge_profile.commit_us
+                  << ", pq_code_assignment_us=" << merge_profile.pq_code_assignment_us
+                  << std::endl;
 
         frozen_delta.reset();
         frozen_trigger_decision.reset();
@@ -5410,7 +5465,47 @@ int main(int argc, char** argv) {
       ofs << "      \"pre_replacement_ms\": " << ev.pre_replacement_ms << ",\n";
       ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
       ofs << "      \"merge_ms\": " << ev.merge_ms << ",\n";
-      ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << "\n";
+      ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << ",\n";
+      ofs << "      \"profiling\": {\n";
+      ofs << "        \"effective_nlist\": " << ev.profiling.effective_nlist << ",\n";
+      ofs << "        \"frozen_records\": " << ev.profiling.frozen_records << ",\n";
+      ofs << "        \"seed_partitions\": " << ev.profiling.seed_partitions << ",\n";
+      ofs << "        \"neighborhoods\": " << ev.profiling.neighborhoods << ",\n";
+      ofs << "        \"main_records_loaded\": "
+          << ev.profiling.main_records_loaded << ",\n";
+      ofs << "        \"pooled_records\": " << ev.profiling.pooled_records << ",\n";
+      ofs << "        \"repartitioned_records\": "
+          << ev.profiling.repartitioned_records << ",\n";
+      ofs << "        \"patch_records\": " << ev.profiling.patch_records << ",\n";
+      ofs << "        \"assignment_distance_evaluations\": "
+          << ev.profiling.assignment_distance_evaluations << ",\n";
+      ofs << "        \"assignment_workspace_bytes\": "
+          << ev.profiling.assignment_workspace_bytes << ",\n";
+      ofs << "        \"assignment_chunk_records\": "
+          << ev.profiling.assignment_chunk_records << ",\n";
+      ofs << "        \"assignment_chunk_count\": "
+          << ev.profiling.assignment_chunk_count << ",\n";
+      ofs << "        \"merge_delta_to_main_assignment_us\": "
+          << ev.profiling.merge_delta_to_main_assignment_us << ",\n";
+      ofs << "        \"merge_assignment_distance_us\": "
+          << ev.profiling.merge_assignment_distance_us << ",\n";
+      ofs << "        \"merge_assignment_top_r_us\": "
+          << ev.profiling.merge_assignment_top_r_us << ",\n";
+      ofs << "        \"merge_assignment_balance_us\": "
+          << ev.profiling.merge_assignment_balance_us << ",\n";
+      ofs << "        \"merge_assignment_materialize_us\": "
+          << ev.profiling.merge_assignment_materialize_us << ",\n";
+      ofs << "        \"stats_us\": " << ev.profiling.stats_us << ",\n";
+      ofs << "        \"scoring_us\": " << ev.profiling.scoring_us << ",\n";
+      ofs << "        \"top_r_neighbor_us\": " << ev.profiling.top_r_neighbor_us << ",\n";
+      ofs << "        \"fetch_main_records_us\": "
+          << ev.profiling.fetch_main_records_us << ",\n";
+      ofs << "        \"repartition_us\": " << ev.profiling.repartition_us << ",\n";
+      ofs << "        \"patch_prepare_us\": " << ev.profiling.patch_prepare_us << ",\n";
+      ofs << "        \"commit_us\": " << ev.profiling.commit_us << ",\n";
+      ofs << "        \"pq_code_assignment_us\": "
+          << ev.profiling.pq_code_assignment_us << "\n";
+      ofs << "      }\n";
       ofs << "    }";
       if (i + 1 < merge_events.size()) {
         ofs << ",";
@@ -5776,7 +5871,47 @@ int main(int argc, char** argv) {
         << ev.trigger_active_avg_non_empty_list << ",\n";
     ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
     ofs << "      \"codebook_rebuild_ms\": " << ev.codebook_rebuild_ms << ",\n";
-    ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
+    ofs << "      \"merge_ms\": " << ev.merge_ms << ",\n";
+    ofs << "      \"profiling\": {\n";
+    ofs << "        \"effective_nlist\": " << ev.profiling.effective_nlist << ",\n";
+    ofs << "        \"frozen_records\": " << ev.profiling.frozen_records << ",\n";
+    ofs << "        \"seed_partitions\": " << ev.profiling.seed_partitions << ",\n";
+    ofs << "        \"neighborhoods\": " << ev.profiling.neighborhoods << ",\n";
+    ofs << "        \"main_records_loaded\": "
+        << ev.profiling.main_records_loaded << ",\n";
+    ofs << "        \"pooled_records\": " << ev.profiling.pooled_records << ",\n";
+    ofs << "        \"repartitioned_records\": "
+        << ev.profiling.repartitioned_records << ",\n";
+    ofs << "        \"patch_records\": " << ev.profiling.patch_records << ",\n";
+    ofs << "        \"assignment_distance_evaluations\": "
+        << ev.profiling.assignment_distance_evaluations << ",\n";
+    ofs << "        \"assignment_workspace_bytes\": "
+        << ev.profiling.assignment_workspace_bytes << ",\n";
+    ofs << "        \"assignment_chunk_records\": "
+        << ev.profiling.assignment_chunk_records << ",\n";
+    ofs << "        \"assignment_chunk_count\": "
+        << ev.profiling.assignment_chunk_count << ",\n";
+    ofs << "        \"merge_delta_to_main_assignment_us\": "
+        << ev.profiling.merge_delta_to_main_assignment_us << ",\n";
+    ofs << "        \"merge_assignment_distance_us\": "
+        << ev.profiling.merge_assignment_distance_us << ",\n";
+    ofs << "        \"merge_assignment_top_r_us\": "
+        << ev.profiling.merge_assignment_top_r_us << ",\n";
+    ofs << "        \"merge_assignment_balance_us\": "
+        << ev.profiling.merge_assignment_balance_us << ",\n";
+    ofs << "        \"merge_assignment_materialize_us\": "
+        << ev.profiling.merge_assignment_materialize_us << ",\n";
+    ofs << "        \"stats_us\": " << ev.profiling.stats_us << ",\n";
+    ofs << "        \"scoring_us\": " << ev.profiling.scoring_us << ",\n";
+    ofs << "        \"top_r_neighbor_us\": " << ev.profiling.top_r_neighbor_us << ",\n";
+    ofs << "        \"fetch_main_records_us\": "
+        << ev.profiling.fetch_main_records_us << ",\n";
+    ofs << "        \"repartition_us\": " << ev.profiling.repartition_us << ",\n";
+    ofs << "        \"patch_prepare_us\": " << ev.profiling.patch_prepare_us << ",\n";
+    ofs << "        \"commit_us\": " << ev.profiling.commit_us << ",\n";
+    ofs << "        \"pq_code_assignment_us\": "
+        << ev.profiling.pq_code_assignment_us << "\n";
+    ofs << "      }\n";
     ofs << "    }";
     if (i + 1 < merge_events.size()) {
       ofs << ",";

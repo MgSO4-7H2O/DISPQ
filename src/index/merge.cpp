@@ -72,6 +72,49 @@ struct AssignmentDiagnostics {
   double imbalance_after{0.0};
 };
 
+struct AssignmentTopCandidate {
+  float dist{0.0f};
+  uint32_t part{0};
+};
+
+struct AssignmentCandidateState {
+  uint32_t part{0};
+  float dist{0.0f};
+  double penalty{0.0};
+  double cost{0.0};
+};
+
+struct AssignmentScratch {
+  std::vector<AssignmentTopCandidate> top_candidates;
+};
+
+bool IsAssignmentCandidateLess(const AssignmentTopCandidate& lhs,
+                               const AssignmentTopCandidate& rhs) {
+  if (lhs.dist != rhs.dist) {
+    return lhs.dist < rhs.dist;
+  }
+  return lhs.part < rhs.part;
+}
+
+void InsertAssignmentTopCandidate(AssignmentScratch* scratch,
+                                  AssignmentTopCandidate candidate,
+                                  uint32_t top_r) {
+  auto& top_candidates = scratch->top_candidates;
+  if (top_candidates.size() == static_cast<size_t>(top_r) &&
+      !IsAssignmentCandidateLess(candidate, top_candidates.back())) {
+    return;
+  }
+  const auto insert_pos = std::lower_bound(
+      top_candidates.begin(), top_candidates.end(), candidate,
+      [](const AssignmentTopCandidate& lhs, const AssignmentTopCandidate& rhs) {
+        return IsAssignmentCandidateLess(lhs, rhs);
+      });
+  top_candidates.insert(insert_pos, candidate);
+  if (top_candidates.size() > static_cast<size_t>(top_r)) {
+    top_candidates.pop_back();
+  }
+}
+
 double ComputeImbalanceRatio(const std::vector<uint32_t>& sizes) {
   if (sizes.empty()) {
     return 0.0;
@@ -91,7 +134,8 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     Eigen::Ref<const MatrixRM> main_centroids,
     const std::vector<uint32_t>& main_partition_sizes,
     const MergeOptions& options,
-    AssignmentDiagnostics* diag_out) {
+    AssignmentDiagnostics* diag_out,
+    MergeProfiling* profiling) {
   if (main_centroids.rows() == 0 || main_centroids.cols() == 0) {
     return Status::InvalidArgument("assign_delta_to_main_centroids_for_merge: empty main_centroids");
   }
@@ -100,7 +144,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
         "assign_delta_to_main_centroids_for_merge: main_partition_sizes size mismatch");
   }
 
-AssignmentDiagnostics diag;
+  AssignmentDiagnostics diag;
   diag.imbalance_before = ComputeImbalanceRatio(main_partition_sizes);
 
   const uint32_t nlist = static_cast<uint32_t>(main_centroids.rows());
@@ -120,102 +164,181 @@ AssignmentDiagnostics diag;
   uint32_t moved_count = 0;
   double ratio_sum = 0.0;
   double ratio_max = 1.0;
-
   for (const auto& rec : frozen_delta.records) {
     if (rec.x.size() != main_centroids.cols()) {
       return Status::InvalidArgument(
           "assign_delta_to_main_centroids_for_merge: record dim mismatch with main centroids");
     }
+  }
 
-    std::vector<std::pair<float, uint32_t>> dists;
-    dists.reserve(static_cast<size_t>(nlist));
-    for (uint32_t i = 0; i < nlist; ++i) {
-      const float dist =
-          (rec.x - main_centroids.row(static_cast<Eigen::Index>(i)).transpose()).squaredNorm();
-      dists.emplace_back(dist, i);
+  constexpr size_t kMaxAssignmentChunkBytes = 64ULL * 1024ULL * 1024ULL;
+  constexpr size_t kMaxAssignmentChunkRecords = 16384;
+  const size_t bytes_per_record =
+      static_cast<size_t>(nlist) * sizeof(float) +
+      static_cast<size_t>(top_r) * sizeof(AssignmentTopCandidate) +
+      sizeof(uint32_t) + sizeof(float);
+  const size_t chunk_records = std::max<size_t>(
+      1,
+      std::min(kMaxAssignmentChunkRecords,
+               kMaxAssignmentChunkBytes / std::max<size_t>(1, bytes_per_record)));
+  std::vector<float> chunk_distances;
+  std::vector<AssignmentTopCandidate> chunk_top_candidates;
+  std::vector<uint32_t> chunk_chosen_partitions;
+  std::vector<float> chunk_chosen_distances;
+  if (!frozen_delta.records.empty()) {
+    chunk_distances.resize(chunk_records * static_cast<size_t>(nlist));
+    chunk_top_candidates.resize(chunk_records * static_cast<size_t>(top_r));
+    chunk_chosen_partitions.resize(chunk_records);
+    chunk_chosen_distances.resize(chunk_records);
+  }
+
+  double distance_us = 0.0;
+  double top_r_us = 0.0;
+  double balance_us = 0.0;
+  double materialize_us = 0.0;
+  uint32_t chunk_count_total = 0;
+  Timer assignment_timer;
+
+  for (size_t chunk_begin = 0; chunk_begin < frozen_delta.records.size();
+       chunk_begin += chunk_records) {
+    const size_t chunk_count =
+        std::min(chunk_records, frozen_delta.records.size() - chunk_begin);
+    ++chunk_count_total;
+
+    Timer distance_timer;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t local_index = 0; local_index < static_cast<int64_t>(chunk_count);
+         ++local_index) {
+      const auto& rec =
+          frozen_delta.records[chunk_begin + static_cast<size_t>(local_index)];
+      float* distances = chunk_distances.data() +
+                         static_cast<size_t>(local_index) * static_cast<size_t>(nlist);
+      for (uint32_t i = 0; i < nlist; ++i) {
+        distances[static_cast<size_t>(i)] =
+            (rec.x - main_centroids.row(static_cast<Eigen::Index>(i)).transpose())
+                .squaredNorm();
+      }
     }
-    std::partial_sort(dists.begin(),
-                      dists.begin() + static_cast<std::ptrdiff_t>(top_r),
-                      dists.end(),
-                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    distance_us += distance_timer.ElapsedMicros();
 
-    const uint32_t nearest_partition = dists[0].second;
-    const float nearest_dist = dists[0].first;
-    uint32_t chosen_partition = nearest_partition;
-    float chosen_dist = nearest_dist;
-
-    if (use_balanced_append) {
-      const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
-      const double nearest_penalty = std::max(
-          0.0,
-          (static_cast<double>(projected_size[static_cast<size_t>(nearest_partition)]) + 1.0) -
-              avg_after) /
-          balance_denom;
-      const bool nearest_overloaded = nearest_penalty > 0.0;
-
-      struct CandidateState {
-        uint32_t part{0};
-        float dist{0.0f};
-        double penalty{0.0};
-        double cost{0.0};
-      };
-
-      std::vector<CandidateState> legal_candidates;
-      legal_candidates.reserve(top_r);
-      std::vector<CandidateState> healthier_candidates;
-      healthier_candidates.reserve(top_r);
-
-      for (uint32_t k = 0; k < top_r; ++k) {
-        const float dist = dists[static_cast<size_t>(k)].first;
-        const uint32_t part = dists[static_cast<size_t>(k)].second;
-        if (dist > dist_cap) {
-          continue;
+    Timer top_r_timer;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+      AssignmentScratch scratch;
+      scratch.top_candidates.reserve(static_cast<size_t>(top_r));
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int64_t local_index = 0; local_index < static_cast<int64_t>(chunk_count);
+           ++local_index) {
+        const float* distances = chunk_distances.data() +
+                                 static_cast<size_t>(local_index) *
+                                     static_cast<size_t>(nlist);
+        scratch.top_candidates.clear();
+        for (uint32_t i = 0; i < nlist; ++i) {
+          InsertAssignmentTopCandidate(
+              &scratch,
+              AssignmentTopCandidate{distances[static_cast<size_t>(i)], i},
+              top_r);
         }
-        if (static_cast<double>(projected_size[static_cast<size_t>(part)]) >= hard_cap) {
-          continue;
-        }
-        CandidateState cand;
-        cand.part = part;
-        cand.dist = dist;
-        cand.penalty = std::max(
+        std::copy(scratch.top_candidates.begin(), scratch.top_candidates.end(),
+                  chunk_top_candidates.begin() +
+                      static_cast<size_t>(local_index) * static_cast<size_t>(top_r));
+      }
+    }
+    top_r_us += top_r_timer.ElapsedMicros();
+
+    Timer balance_timer;
+    for (size_t local_index = 0; local_index < chunk_count; ++local_index) {
+      const AssignmentTopCandidate* top_candidates =
+          chunk_top_candidates.data() + local_index * static_cast<size_t>(top_r);
+      const uint32_t nearest_partition = top_candidates[0].part;
+      const float nearest_dist = top_candidates[0].dist;
+      uint32_t chosen_partition = nearest_partition;
+      float chosen_dist = nearest_dist;
+
+      if (use_balanced_append) {
+        const float dist_cap = nearest_dist * static_cast<float>(options.assignment_gamma);
+        const double nearest_penalty = std::max(
             0.0,
-            (static_cast<double>(projected_size[static_cast<size_t>(part)]) + 1.0) - avg_after) /
-                       balance_denom;
-        cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
-        legal_candidates.push_back(cand);
-        if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
-          healthier_candidates.push_back(cand);
+            (static_cast<double>(projected_size[static_cast<size_t>(nearest_partition)]) +
+             1.0 - avg_after) /
+                balance_denom);
+        const bool nearest_overloaded = nearest_penalty > 0.0;
+        bool found_legal_candidate = false;
+        bool found_healthier_candidate = false;
+        AssignmentCandidateState best_legal_candidate;
+        AssignmentCandidateState best_healthier_candidate;
+
+        for (uint32_t k = 0; k < top_r; ++k) {
+          const float dist = top_candidates[static_cast<size_t>(k)].dist;
+          const uint32_t part = top_candidates[static_cast<size_t>(k)].part;
+          if (dist > dist_cap ||
+              static_cast<double>(projected_size[static_cast<size_t>(part)]) >= hard_cap) {
+            continue;
+          }
+          AssignmentCandidateState candidate;
+          candidate.part = part;
+          candidate.dist = dist;
+          candidate.penalty = std::max(
+              0.0,
+              (static_cast<double>(projected_size[static_cast<size_t>(part)]) + 1.0 -
+               avg_after) /
+                  balance_denom);
+          candidate.cost =
+              static_cast<double>(dist) + options.assignment_lambda * candidate.penalty;
+          if (!found_legal_candidate || candidate.cost < best_legal_candidate.cost) {
+            found_legal_candidate = true;
+            best_legal_candidate = candidate;
+          }
+          if (nearest_overloaded && candidate.penalty + 1e-12 < nearest_penalty &&
+              (!found_healthier_candidate ||
+               candidate.cost < best_healthier_candidate.cost)) {
+            found_healthier_candidate = true;
+            best_healthier_candidate = candidate;
+          }
+        }
+
+        const AssignmentCandidateState* selected = nullptr;
+        if (found_healthier_candidate) {
+          selected = &best_healthier_candidate;
+        } else if (found_legal_candidate) {
+          selected = &best_legal_candidate;
+        }
+        if (selected != nullptr) {
+          chosen_partition = selected->part;
+          chosen_dist = selected->dist;
         }
       }
 
-      const std::vector<CandidateState>& candidates =
-          healthier_candidates.empty() ? legal_candidates : healthier_candidates;
-      double best_cost = std::numeric_limits<double>::infinity();
-      bool found_candidate = false;
-      for (const auto& cand : candidates) {
-        if (!found_candidate || cand.cost < best_cost) {
-          found_candidate = true;
-          best_cost = cand.cost;
-          chosen_partition = cand.part;
-          chosen_dist = cand.dist;
-        }
+      chunk_chosen_partitions[local_index] = chosen_partition;
+      chunk_chosen_distances[local_index] = chosen_dist;
+      projected_size[static_cast<size_t>(chosen_partition)]++;
+      if (chosen_partition != nearest_partition) {
+        ++moved_count;
       }
+      const double ratio =
+          nearest_dist > eps ? static_cast<double>(chosen_dist) / nearest_dist : 1.0;
+      ratio_sum += ratio;
+      ratio_max = std::max(ratio_max, ratio);
     }
+    balance_us += balance_timer.ElapsedMicros();
 
-    DeltaAssignment item;
-    item.record = rec;
-    item.record.ivf_id = chosen_partition;
-    item.main_partition = chosen_partition;
-    item.residual_dist = chosen_dist;
-    assigned[static_cast<size_t>(chosen_partition)].push_back(std::move(item));
-    projected_size[static_cast<size_t>(chosen_partition)]++;
-
-    if (chosen_partition != nearest_partition) {
-      moved_count++;
+    Timer materialize_timer;
+    for (size_t local_index = 0; local_index < chunk_count; ++local_index) {
+      const uint32_t chosen_partition = chunk_chosen_partitions[local_index];
+      DeltaAssignment item;
+      item.record = frozen_delta.records[chunk_begin + local_index];
+      item.record.ivf_id = chosen_partition;
+      item.main_partition = chosen_partition;
+      item.residual_dist = chunk_chosen_distances[local_index];
+      assigned[static_cast<size_t>(chosen_partition)].push_back(std::move(item));
     }
-    const double ratio = nearest_dist > eps ? static_cast<double>(chosen_dist) / nearest_dist : 1.0;
-    ratio_sum += ratio;
-    ratio_max = std::max(ratio_max, ratio);
+    materialize_us += materialize_timer.ElapsedMicros();
   }
 
   if (!frozen_delta.records.empty()) {
@@ -227,6 +350,22 @@ AssignmentDiagnostics diag;
   diag.imbalance_after = ComputeImbalanceRatio(projected_size);
   if (diag_out != nullptr) {
     *diag_out = diag;
+  }
+  if (profiling != nullptr) {
+    profiling->merge_delta_to_main_assignment_us = assignment_timer.ElapsedMicros();
+    profiling->merge_assignment_distance_us = distance_us;
+    profiling->merge_assignment_top_r_us = top_r_us;
+    profiling->merge_assignment_balance_us = balance_us;
+    profiling->merge_assignment_materialize_us = materialize_us;
+    profiling->assignment_distance_evaluations =
+        static_cast<uint64_t>(frozen_delta.records.size()) * static_cast<uint64_t>(nlist);
+    profiling->assignment_workspace_bytes =
+        frozen_delta.records.empty()
+            ? 0
+            : static_cast<uint64_t>(chunk_records) * static_cast<uint64_t>(bytes_per_record);
+    profiling->assignment_chunk_records = static_cast<uint32_t>(std::min<size_t>(
+        chunk_records, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    profiling->assignment_chunk_count = chunk_count_total;
   }
   return assigned;
 }
@@ -253,29 +392,37 @@ Status AppendVectorRecordFromStore(DocId doc_id,
 }
 
 
-Status AppendVectorRecordFromAccessor(DocId doc_id,
-                                      const VersionSet& versions,
-                                      uint32_t ivf_id,
-                                      const VectorAccessor& vector_accessor,
-                                      AlignedVector<VectorRecord>* out) {
-  if (out == nullptr) {
-    return Status::InvalidArgument("AppendVectorRecordFromAccessor: null output");
+Result<AlignedVector<VectorRecord>> MaterializeVectorRecordsFromAccessor(
+    const std::vector<DocId>& doc_ids,
+    const VersionSet& versions,
+    uint32_t ivf_id,
+    const VectorAccessor& vector_accessor) {
+  MatrixRM rows;
+  Status materialize = vector_accessor.Materialize(doc_ids, &rows);
+  if (!materialize.ok()) {
+    return materialize;
   }
-  auto vec_res = vector_accessor.GetVector(doc_id);
-  if (!vec_res.ok()) {
-    return vec_res.status();
+  const uint32_t dim = vector_accessor.dim();
+  if (rows.rows() != static_cast<Eigen::Index>(doc_ids.size()) ||
+      rows.cols() != static_cast<Eigen::Index>(dim)) {
+    return Status::InvalidArgument(
+        "MaterializeVectorRecordsFromAccessor: materialized shape mismatch");
   }
-  VectorRecord rec;
-  rec.doc_id = doc_id;
-  rec.dim = vector_accessor.dim();
-  rec.versions = versions;
-  rec.ivf_id = ivf_id;
-  rec.x = std::move(vec_res.value());
-  if (static_cast<uint32_t>(rec.x.size()) != rec.dim) {
-    return Status::InvalidArgument("AppendVectorRecordFromAccessor: dimension mismatch");
+
+  AlignedVector<VectorRecord> records(doc_ids.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && doc_ids.size() > 1)
+#endif
+  for (int64_t i = 0; i < static_cast<int64_t>(doc_ids.size()); ++i) {
+    VectorRecord rec;
+    rec.doc_id = doc_ids[static_cast<size_t>(i)];
+    rec.dim = dim;
+    rec.versions = versions;
+    rec.ivf_id = ivf_id;
+    rec.x = rows.row(static_cast<Eigen::Index>(i)).transpose();
+    records[static_cast<size_t>(i)] = std::move(rec);
   }
-  out->push_back(std::move(rec));
-  return Status::OK();
+  return records;
 }
 
 Result<AlignedVector<VectorRecord>> FetchPartitionRecordsForMerge(
@@ -322,16 +469,8 @@ Result<AlignedVector<VectorRecord>> FetchPartitionRecordsForMergeAccessor(
   if (!doc_ids_res.ok()) {
     return doc_ids_res.status();
   }
-  AlignedVector<VectorRecord> records;
-  records.reserve(doc_ids_res.value().size());
-  for (DocId doc_id : doc_ids_res.value()) {
-    Status append = AppendVectorRecordFromAccessor(
-        doc_id, versions, partition_id, *vector_accessor, &records);
-    if (!append.ok()) {
-      return append;
-    }
-  }
-  return records;
+  return MaterializeVectorRecordsFromAccessor(
+      doc_ids_res.value(), versions, partition_id, *vector_accessor);
 }
 
 std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
@@ -363,7 +502,7 @@ std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
 
 Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
     const std::vector<uint32_t>& neighborhood_partitions,
-    const std::vector<AlignedVector<VectorRecord>>& neighborhood_main_records,
+    std::vector<AlignedVector<VectorRecord>> neighborhood_main_records,
     const PartitionAssignments& assignments,
     Eigen::Ref<const MatrixRM> main_centroids,
     const MergeOptions& options) {
@@ -395,9 +534,9 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
   }
   pooled_records.reserve(reserve_count);
 
-  for (const auto& records : neighborhood_main_records) {
-    for (const auto& rec : records) {
-      pooled_records.push_back(rec);
+  for (auto& records : neighborhood_main_records) {
+    for (auto& rec : records) {
+      pooled_records.push_back(std::move(rec));
     }
   }
   for (uint32_t part : neighborhood_partitions) {
@@ -418,12 +557,18 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
   const double balance_denom = std::max(1.0, avg_after);
   std::vector<uint32_t> projected_size(neighborhood_n, 0u);
 
-  for (const auto& rec : pooled_records) {
+  struct CandidateState {
+    uint32_t local_idx{0};
+    double cost{0.0};
+  };
+  std::vector<std::pair<float, uint32_t>> dists;
+  dists.reserve(neighborhood_n);
+
+  for (auto& rec : pooled_records) {
     if (rec.x.size() != main_centroids.cols()) {
       return Status::InvalidArgument("RepartitionNeighborhood: record dim mismatch");
     }
-    std::vector<std::pair<float, uint32_t>> dists;
-    dists.reserve(neighborhood_n);
+    dists.clear();
     for (uint32_t local_idx = 0; local_idx < neighborhood_n; ++local_idx) {
       const uint32_t part = neighborhood_partitions[static_cast<size_t>(local_idx)];
       const float dist =
@@ -446,17 +591,10 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
                                    balance_denom;
     const bool nearest_overloaded = nearest_penalty > 0.0;
 
-    struct CandidateState {
-      uint32_t local_idx{0};
-      float dist{0.0f};
-      double penalty{0.0};
-      double cost{0.0};
-    };
-
-    std::vector<CandidateState> legal_candidates;
-    legal_candidates.reserve(neighborhood_n);
-    std::vector<CandidateState> healthier_candidates;
-    healthier_candidates.reserve(neighborhood_n);
+    bool found_legal_candidate = false;
+    bool found_healthier_candidate = false;
+    CandidateState best_legal_candidate;
+    CandidateState best_healthier_candidate;
 
     for (const auto& dist_item : dists) {
       const float dist = dist_item.first;
@@ -467,36 +605,33 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
       if (static_cast<double>(projected_size[static_cast<size_t>(local_idx)]) >= hard_cap) {
         continue;
       }
-      CandidateState cand;
-      cand.local_idx = local_idx;
-      cand.dist = dist;
-      cand.penalty = std::max(
+      const double penalty = std::max(
           0.0,
           (static_cast<double>(projected_size[static_cast<size_t>(local_idx)]) + 1.0) -
               avg_after) /
                      balance_denom;
-      cand.cost = static_cast<double>(dist) + options.assignment_lambda * cand.penalty;
-      legal_candidates.push_back(cand);
-      if (nearest_overloaded && cand.penalty + 1e-12 < nearest_penalty) {
-        healthier_candidates.push_back(cand);
+      const CandidateState cand{
+          local_idx, static_cast<double>(dist) + options.assignment_lambda * penalty};
+      if (!found_legal_candidate || cand.cost < best_legal_candidate.cost) {
+        found_legal_candidate = true;
+        best_legal_candidate = cand;
+      }
+      if (nearest_overloaded && penalty + 1e-12 < nearest_penalty) {
+        if (!found_healthier_candidate || cand.cost < best_healthier_candidate.cost) {
+          found_healthier_candidate = true;
+          best_healthier_candidate = cand;
+        }
       }
     }
 
-    const std::vector<CandidateState>& candidates =
-        healthier_candidates.empty() ? legal_candidates : healthier_candidates;
-    double best_cost = std::numeric_limits<double>::infinity();
-    bool found_candidate = false;
-    for (const auto& cand : candidates) {
-      if (!found_candidate || cand.cost < best_cost) {
-        found_candidate = true;
-        best_cost = cand.cost;
-        chosen_local = cand.local_idx;
-      }
+    if (found_healthier_candidate) {
+      chosen_local = best_healthier_candidate.local_idx;
+    } else if (found_legal_candidate) {
+      chosen_local = best_legal_candidate.local_idx;
     }
 
-    VectorRecord out = rec;
-    out.ivf_id = neighborhood_partitions[static_cast<size_t>(chosen_local)];
-    repartitioned[static_cast<size_t>(chosen_local)].push_back(std::move(out));
+    rec.ivf_id = neighborhood_partitions[static_cast<size_t>(chosen_local)];
+    repartitioned[static_cast<size_t>(chosen_local)].push_back(std::move(rec));
     projected_size[static_cast<size_t>(chosen_local)]++;
   }
 
@@ -516,7 +651,8 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM* base_vectors,
-    const MergeOptions& options);
+    const MergeOptions& options,
+    MergeProfiling* profiling);
 
 Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
@@ -530,7 +666,8 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const VectorAccessor* vector_accessor,
-    const MergeOptions& options);
+    const MergeOptions& options,
+    MergeProfiling* profiling);
 
 Result<MergeReport> MergeFrozenDeltaIntoMainImplAccessor(
     const std::shared_ptr<IVFIndex>& main_ivf,
@@ -585,15 +722,13 @@ Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
   if (!doc_ids_res.ok()) {
     return doc_ids_res.status();
   }
-  FrozenDelta out;
-  out.records.reserve(doc_ids_res.value().size());
-  for (DocId doc_id : doc_ids_res.value()) {
-    Status append = AppendVectorRecordFromAccessor(
-        doc_id, delta_versions, 0, vector_accessor, &out.records);
-    if (!append.ok()) {
-      return append;
-    }
+  auto records_res = MaterializeVectorRecordsFromAccessor(
+      doc_ids_res.value(), delta_versions, 0, vector_accessor);
+  if (!records_res.ok()) {
+    return records_res.status();
   }
+  FrozenDelta out;
+  out.records = std::move(records_res.value());
   return out;
 }
 
@@ -788,7 +923,7 @@ Result<PartitionPatch> prepare_partition_patch(
     const PartitionScoreResult& score_result,
     const MergeOptions& options) {
   return PreparePartitionPatchImpl(
-      main_ivf, main_versions, assignments, score_result, nullptr, options);
+      main_ivf, main_versions, assignments, score_result, nullptr, options, nullptr);
 }
 
 Result<PartitionPatch> prepare_partition_patch(
@@ -799,7 +934,7 @@ Result<PartitionPatch> prepare_partition_patch(
     const MatrixRM& base_vectors,
     const MergeOptions& options) {
   return PreparePartitionPatchImpl(
-      main_ivf, main_versions, assignments, score_result, &base_vectors, options);
+      main_ivf, main_versions, assignments, score_result, &base_vectors, options, nullptr);
 }
 
 Result<PartitionPatch> PreparePartitionPatchImpl(
@@ -808,7 +943,8 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM* base_vectors,
-    const MergeOptions& options) {
+    const MergeOptions& options,
+    MergeProfiling* profiling) {
   if (!main_ivf) {
     return Status::InvalidArgument("prepare_partition_patch: main_ivf is null");
   }
@@ -836,6 +972,9 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
                 return assignments[static_cast<size_t>(lhs)].size() >
                        assignments[static_cast<size_t>(rhs)].size();
               });
+    if (profiling != nullptr) {
+      profiling->seed_partitions += static_cast<uint64_t>(seeds.size());
+    }
 
     PartitionPatch patch;
     std::vector<uint8_t> claimed(assignments.size(), 0u);
@@ -843,8 +982,12 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       if (claimed[static_cast<size_t>(seed)] != 0u) {
         continue;
       }
+      Timer neighbor_timer;
       std::vector<uint32_t> neighborhood =
           TopRNeighborPartitions(seed, centroids_res.value(), options.assignment_top_r);
+      if (profiling != nullptr) {
+        profiling->top_r_neighbor_us += neighbor_timer.ElapsedMicros();
+      }
       std::vector<uint32_t> active_neighborhood;
       active_neighborhood.reserve(neighborhood.size());
       for (uint32_t part : neighborhood) {
@@ -855,27 +998,56 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       if (active_neighborhood.empty()) {
         continue;
       }
+      if (profiling != nullptr) {
+        ++profiling->neighborhoods;
+      }
 
       std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
       neighborhood_main_records.reserve(active_neighborhood.size());
       for (uint32_t part : active_neighborhood) {
+        Timer fetch_timer;
         auto main_records_res =
             FetchPartitionRecordsForMerge(main_ivf, main_versions, part, base_vectors);
+        if (profiling != nullptr) {
+          profiling->fetch_main_records_us += fetch_timer.ElapsedMicros();
+        }
         if (!main_records_res.ok()) {
           return main_records_res.status();
+        }
+        if (profiling != nullptr) {
+          profiling->main_records_loaded +=
+              static_cast<uint64_t>(main_records_res.value().size());
         }
         neighborhood_main_records.push_back(std::move(main_records_res.value()));
       }
 
+      if (profiling != nullptr) {
+        uint64_t pooled = 0;
+        for (size_t i = 0; i < active_neighborhood.size(); ++i) {
+          pooled += static_cast<uint64_t>(neighborhood_main_records[i].size());
+          pooled += static_cast<uint64_t>(
+              assignments[static_cast<size_t>(active_neighborhood[i])].size());
+        }
+        profiling->pooled_records += pooled;
+      }
+      Timer repartition_timer;
       auto repartition_res = RepartitionNeighborhood(active_neighborhood,
-                                                     neighborhood_main_records,
+                                                     std::move(neighborhood_main_records),
                                                      assignments,
                                                      centroids_res.value(),
                                                      options);
+      if (profiling != nullptr) {
+        profiling->repartition_us += repartition_timer.ElapsedMicros();
+      }
       if (!repartition_res.ok()) {
         return repartition_res.status();
       }
       std::vector<AlignedVector<VectorRecord>> repartitioned = std::move(repartition_res.value());
+      if (profiling != nullptr) {
+        for (const auto& records : repartitioned) {
+          profiling->repartitioned_records += static_cast<uint64_t>(records.size());
+        }
+      }
       for (size_t i = 0; i < active_neighborhood.size(); ++i) {
         patch.partition_ids.push_back(active_neighborhood[i]);
         patch.replacement_records.push_back(std::move(repartitioned[i]));
@@ -906,6 +1078,14 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
   if (active_partitions.empty()) {
     return patch;
   }
+  if (profiling != nullptr) {
+    profiling->seed_partitions += static_cast<uint64_t>(active_partitions.size());
+    profiling->neighborhoods += static_cast<uint64_t>(active_partitions.size());
+  }
+  std::vector<double> fetch_profile_us(
+      profiling != nullptr ? active_partitions.size() : 0, 0.0);
+  std::vector<double> repartition_profile_us(
+      profiling != nullptr ? active_partitions.size() : 0, 0.0);
 
   std::atomic<bool> failed{false};
   std::mutex err_mu;
@@ -919,8 +1099,12 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     }
     const uint32_t p = active_partitions[static_cast<size_t>(i)];
     const auto& delta_bucket = assignments[static_cast<size_t>(p)];
+    Timer fetch_timer;
     auto main_records_res =
         FetchPartitionRecordsForMerge(main_ivf, main_versions, p, base_vectors);
+    if (profiling != nullptr) {
+      fetch_profile_us[static_cast<size_t>(i)] = fetch_timer.ElapsedMicros();
+    }
     if (!main_records_res.ok()) {
       std::lock_guard<std::mutex> lock(err_mu);
       if (!failed.exchange(true)) {
@@ -928,6 +1112,7 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       }
       continue;
     }
+    Timer repartition_timer;
     Result<AlignedVector<VectorRecord>> merged_res =
         recluster_flags[static_cast<size_t>(p)] != 0
             ? merge_partition_recluster(p, main_records_res.value(), delta_bucket, options)
@@ -939,10 +1124,26 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       }
       continue;
     }
+    if (profiling != nullptr) {
+      repartition_profile_us[static_cast<size_t>(i)] = repartition_timer.ElapsedMicros();
+    }
     patch.replacement_records[static_cast<size_t>(i)] = std::move(merged_res.value());
   }
   if (failed.load(std::memory_order_relaxed)) {
     return first_error;
+  }
+  if (profiling != nullptr) {
+    for (size_t i = 0; i < active_partitions.size(); ++i) {
+      const uint64_t replacement_size =
+          static_cast<uint64_t>(patch.replacement_records[i].size());
+      const uint64_t delta_size = static_cast<uint64_t>(
+          assignments[static_cast<size_t>(active_partitions[i])].size());
+      profiling->fetch_main_records_us += fetch_profile_us[i];
+      profiling->repartition_us += repartition_profile_us[i];
+      profiling->main_records_loaded += replacement_size - delta_size;
+      profiling->pooled_records += replacement_size;
+      profiling->repartitioned_records += replacement_size;
+    }
   }
   return patch;
 }
@@ -953,7 +1154,8 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const VectorAccessor* vector_accessor,
-    const MergeOptions& options) {
+    const MergeOptions& options,
+    MergeProfiling* profiling) {
   if (!main_ivf) {
     return Status::InvalidArgument("prepare_partition_patch: main_ivf is null");
   }
@@ -981,6 +1183,9 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
                 return assignments[static_cast<size_t>(lhs)].size() >
                        assignments[static_cast<size_t>(rhs)].size();
               });
+    if (profiling != nullptr) {
+      profiling->seed_partitions += static_cast<uint64_t>(seeds.size());
+    }
 
     PartitionPatch patch;
     std::vector<uint8_t> claimed(assignments.size(), 0u);
@@ -988,8 +1193,12 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
       if (claimed[static_cast<size_t>(seed)] != 0u) {
         continue;
       }
+      Timer neighbor_timer;
       std::vector<uint32_t> neighborhood =
           TopRNeighborPartitions(seed, centroids_res.value(), options.assignment_top_r);
+      if (profiling != nullptr) {
+        profiling->top_r_neighbor_us += neighbor_timer.ElapsedMicros();
+      }
       std::vector<uint32_t> active_neighborhood;
       active_neighborhood.reserve(neighborhood.size());
       for (uint32_t part : neighborhood) {
@@ -1000,27 +1209,56 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
       if (active_neighborhood.empty()) {
         continue;
       }
+      if (profiling != nullptr) {
+        ++profiling->neighborhoods;
+      }
 
       std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
       neighborhood_main_records.reserve(active_neighborhood.size());
       for (uint32_t part : active_neighborhood) {
+        Timer fetch_timer;
         auto main_records_res =
             FetchPartitionRecordsForMergeAccessor(main_ivf, main_versions, part, vector_accessor);
+        if (profiling != nullptr) {
+          profiling->fetch_main_records_us += fetch_timer.ElapsedMicros();
+        }
         if (!main_records_res.ok()) {
           return main_records_res.status();
+        }
+        if (profiling != nullptr) {
+          profiling->main_records_loaded +=
+              static_cast<uint64_t>(main_records_res.value().size());
         }
         neighborhood_main_records.push_back(std::move(main_records_res.value()));
       }
 
+      if (profiling != nullptr) {
+        uint64_t pooled = 0;
+        for (size_t i = 0; i < active_neighborhood.size(); ++i) {
+          pooled += static_cast<uint64_t>(neighborhood_main_records[i].size());
+          pooled += static_cast<uint64_t>(
+              assignments[static_cast<size_t>(active_neighborhood[i])].size());
+        }
+        profiling->pooled_records += pooled;
+      }
+      Timer repartition_timer;
       auto repartition_res = RepartitionNeighborhood(active_neighborhood,
-                                                     neighborhood_main_records,
+                                                     std::move(neighborhood_main_records),
                                                      assignments,
                                                      centroids_res.value(),
                                                      options);
+      if (profiling != nullptr) {
+        profiling->repartition_us += repartition_timer.ElapsedMicros();
+      }
       if (!repartition_res.ok()) {
         return repartition_res.status();
       }
       std::vector<AlignedVector<VectorRecord>> repartitioned = std::move(repartition_res.value());
+      if (profiling != nullptr) {
+        for (const auto& records : repartitioned) {
+          profiling->repartitioned_records += static_cast<uint64_t>(records.size());
+        }
+      }
       for (size_t i = 0; i < active_neighborhood.size(); ++i) {
         patch.partition_ids.push_back(active_neighborhood[i]);
         patch.replacement_records.push_back(std::move(repartitioned[i]));
@@ -1051,6 +1289,14 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
   if (active_partitions.empty()) {
     return patch;
   }
+  if (profiling != nullptr) {
+    profiling->seed_partitions += static_cast<uint64_t>(active_partitions.size());
+    profiling->neighborhoods += static_cast<uint64_t>(active_partitions.size());
+  }
+  std::vector<double> fetch_profile_us(
+      profiling != nullptr ? active_partitions.size() : 0, 0.0);
+  std::vector<double> repartition_profile_us(
+      profiling != nullptr ? active_partitions.size() : 0, 0.0);
 
   std::atomic<bool> failed{false};
   std::mutex err_mu;
@@ -1064,8 +1310,12 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
     }
     const uint32_t p = active_partitions[static_cast<size_t>(i)];
     const auto& delta_bucket = assignments[static_cast<size_t>(p)];
+    Timer fetch_timer;
     auto main_records_res =
         FetchPartitionRecordsForMergeAccessor(main_ivf, main_versions, p, vector_accessor);
+    if (profiling != nullptr) {
+      fetch_profile_us[static_cast<size_t>(i)] = fetch_timer.ElapsedMicros();
+    }
     if (!main_records_res.ok()) {
       std::lock_guard<std::mutex> lock(err_mu);
       if (!failed.exchange(true)) {
@@ -1073,6 +1323,7 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
       }
       continue;
     }
+    Timer repartition_timer;
     Result<AlignedVector<VectorRecord>> merged_res =
         recluster_flags[static_cast<size_t>(p)] != 0
             ? merge_partition_recluster(p, main_records_res.value(), delta_bucket, options)
@@ -1084,10 +1335,26 @@ Result<PartitionPatch> PreparePartitionPatchImplAccessor(
       }
       continue;
     }
+    if (profiling != nullptr) {
+      repartition_profile_us[static_cast<size_t>(i)] = repartition_timer.ElapsedMicros();
+    }
     patch.replacement_records[static_cast<size_t>(i)] = std::move(merged_res.value());
   }
   if (failed.load(std::memory_order_relaxed)) {
     return first_error;
+  }
+  if (profiling != nullptr) {
+    for (size_t i = 0; i < active_partitions.size(); ++i) {
+      const uint64_t replacement_size =
+          static_cast<uint64_t>(patch.replacement_records[i].size());
+      const uint64_t delta_size = static_cast<uint64_t>(
+          assignments[static_cast<size_t>(active_partitions[i])].size());
+      profiling->fetch_main_records_us += fetch_profile_us[i];
+      profiling->repartition_us += repartition_profile_us[i];
+      profiling->main_records_loaded += replacement_size - delta_size;
+      profiling->pooled_records += replacement_size;
+      profiling->repartitioned_records += replacement_size;
+    }
   }
   return patch;
 }
@@ -1135,40 +1402,65 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
+  MergeProfiling profiling;
+  profiling.frozen_records = static_cast<uint64_t>(frozen_delta.records.size());
   Timer merge_compute_timer;
   auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
   if (!centroids_res.ok()) {
     return centroids_res.status();
   }
+  profiling.effective_nlist = static_cast<uint32_t>(centroids_res.value().rows());
   auto sizes_res = main_ivf->GetPartitionSizes(main_versions);
   if (!sizes_res.ok()) {
     return sizes_res.status();
   }
   AssignmentDiagnostics assignment_diag;
   auto assign_res = assign_delta_to_main_centroids_for_merge(
-      frozen_delta, centroids_res.value(), sizes_res.value(), options, &assignment_diag);
+      frozen_delta,
+      centroids_res.value(),
+      sizes_res.value(),
+      options,
+      &assignment_diag,
+      &profiling);
   if (!assign_res.ok()) {
     return assign_res.status();
   }
+  Timer stats_timer;
   auto stats_res = compute_partition_stats(assign_res.value(), sizes_res.value());
   if (!stats_res.ok()) {
     return stats_res.status();
   }
+  profiling.stats_us = stats_timer.ElapsedMicros();
+  Timer scoring_timer;
   auto score_res = score_partitions(
       stats_res.value(), options.alpha, options.beta, options.recluster_threshold);
   if (!score_res.ok()) {
     return score_res.status();
   }
+  profiling.scoring_us = scoring_timer.ElapsedMicros();
+  Timer patch_prepare_timer;
   auto patch_res = PreparePartitionPatchImpl(
-      main_ivf, main_versions, assign_res.value(), score_res.value(), base_vectors, options);
+      main_ivf,
+      main_versions,
+      assign_res.value(),
+      score_res.value(),
+      base_vectors,
+      options,
+      &profiling);
   if (!patch_res.ok()) {
     return patch_res.status();
   }
+  profiling.patch_prepare_us = patch_prepare_timer.ElapsedMicros();
+  for (const auto& records : patch_res.value().replacement_records) {
+    profiling.patch_records += static_cast<uint64_t>(records.size());
+  }
   const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
+  Timer commit_timer;
   Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value());
   if (!commit.ok()) {
     return commit;
   }
+  profiling.commit_us = commit_timer.ElapsedMicros();
   auto codebook_ms_res = main_ivf->GetLastPatchPQReencodeMs(main_versions);
   if (!codebook_ms_res.ok()) {
     return codebook_ms_res.status();
@@ -1181,6 +1473,8 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   report.recluster_partitions = static_cast<uint32_t>(score_res.value().recluster_partitions.size());
   report.merge_compute_ms = merge_compute_ms;
   report.codebook_rebuild_ms = codebook_ms_res.value();
+  profiling.pq_code_assignment_us = codebook_ms_res.value() * 1000.0;
+  report.profiling = profiling;
   report.moved_delta_ratio = assignment_diag.moved_delta_ratio;
   report.avg_assignment_dist_ratio = assignment_diag.avg_assignment_dist_ratio;
   report.max_assignment_dist_ratio = assignment_diag.max_assignment_dist_ratio;
@@ -1219,40 +1513,65 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImplAccessor(const std::shared_ptr<I
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
+  MergeProfiling profiling;
+  profiling.frozen_records = static_cast<uint64_t>(frozen_delta.records.size());
   Timer merge_compute_timer;
   auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
   if (!centroids_res.ok()) {
     return centroids_res.status();
   }
+  profiling.effective_nlist = static_cast<uint32_t>(centroids_res.value().rows());
   auto sizes_res = main_ivf->GetPartitionSizes(main_versions);
   if (!sizes_res.ok()) {
     return sizes_res.status();
   }
   AssignmentDiagnostics assignment_diag;
   auto assign_res = assign_delta_to_main_centroids_for_merge(
-      frozen_delta, centroids_res.value(), sizes_res.value(), options, &assignment_diag);
+      frozen_delta,
+      centroids_res.value(),
+      sizes_res.value(),
+      options,
+      &assignment_diag,
+      &profiling);
   if (!assign_res.ok()) {
     return assign_res.status();
   }
+  Timer stats_timer;
   auto stats_res = compute_partition_stats(assign_res.value(), sizes_res.value());
   if (!stats_res.ok()) {
     return stats_res.status();
   }
+  profiling.stats_us = stats_timer.ElapsedMicros();
+  Timer scoring_timer;
   auto score_res = score_partitions(
       stats_res.value(), options.alpha, options.beta, options.recluster_threshold);
   if (!score_res.ok()) {
     return score_res.status();
   }
+  profiling.scoring_us = scoring_timer.ElapsedMicros();
+  Timer patch_prepare_timer;
   auto patch_res = PreparePartitionPatchImplAccessor(
-      main_ivf, main_versions, assign_res.value(), score_res.value(), vector_accessor, options);
+      main_ivf,
+      main_versions,
+      assign_res.value(),
+      score_res.value(),
+      vector_accessor,
+      options,
+      &profiling);
   if (!patch_res.ok()) {
     return patch_res.status();
   }
+  profiling.patch_prepare_us = patch_prepare_timer.ElapsedMicros();
+  for (const auto& records : patch_res.value().replacement_records) {
+    profiling.patch_records += static_cast<uint64_t>(records.size());
+  }
   const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
+  Timer commit_timer;
   Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value());
   if (!commit.ok()) {
     return commit;
   }
+  profiling.commit_us = commit_timer.ElapsedMicros();
   auto codebook_ms_res = main_ivf->GetLastPatchPQReencodeMs(main_versions);
   if (!codebook_ms_res.ok()) {
     return codebook_ms_res.status();
@@ -1265,6 +1584,8 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImplAccessor(const std::shared_ptr<I
   report.recluster_partitions = static_cast<uint32_t>(score_res.value().recluster_partitions.size());
   report.merge_compute_ms = merge_compute_ms;
   report.codebook_rebuild_ms = codebook_ms_res.value();
+  profiling.pq_code_assignment_us = codebook_ms_res.value() * 1000.0;
+  report.profiling = profiling;
   report.moved_delta_ratio = assignment_diag.moved_delta_ratio;
   report.avg_assignment_dist_ratio = assignment_diag.avg_assignment_dist_ratio;
   report.max_assignment_dist_ratio = assignment_diag.max_assignment_dist_ratio;
