@@ -146,6 +146,7 @@ struct IndexData {
   Eigen::VectorXf routing_centroid_norms;
   std::vector<MatrixRM> pq_codebooks;
   std::vector<MatrixRM> pq_codebooks_soa;
+  std::vector<std::vector<DocId>> doc_ids_by_list;
   std::vector<std::vector<uint8_t>> pq_codes_by_list;
   std::vector<ListPQCodesSoA> pq_codes_soa_by_list;
   bool use_precomputed_table{false};
@@ -513,6 +514,17 @@ bool HasContiguousPQCodesForList(const IndexData& data, uint32_t list_id) {
   return flat.size() == data.lists[static_cast<size_t>(list_id)].size() * data.M;
 }
 
+bool HasCompactDocIdsForList(const IndexData& data, uint32_t list_id) {
+  if (!data.use_pq) {
+    return false;
+  }
+  if (list_id >= data.lists.size() || list_id >= data.doc_ids_by_list.size()) {
+    return false;
+  }
+  return data.doc_ids_by_list[static_cast<size_t>(list_id)].size() ==
+         data.lists[static_cast<size_t>(list_id)].size();
+}
+
 bool HasPQCodebookSoA(const IndexData& data) {
   if (!HasValidPQSubspaces(data) || data.Ks == 0 ||
       data.pq_codebooks_soa.size() != data.M) {
@@ -539,6 +551,12 @@ bool HasSoAPQCodesForList(const IndexData& data, uint32_t list_id) {
   const size_t rows = data.lists[static_cast<size_t>(list_id)].size();
   return soa.rows == rows && soa.stride >= rows &&
          soa.codes.size() == static_cast<size_t>(data.M) * soa.stride;
+}
+
+bool HasCompactPQListForSearch(const IndexData& data, uint32_t list_id) {
+  return HasCompactDocIdsForList(data, list_id) &&
+         (HasSoAPQCodesForList(data, list_id) ||
+          HasContiguousPQCodesForList(data, list_id));
 }
 
 void ClearListPQCodesSoA(IndexData* data, uint32_t list_id) {
@@ -589,12 +607,18 @@ void RebuildListPQCodes(IndexData* data, uint32_t list_id) {
   if (data->pq_codes_by_list.size() != data->lists.size()) {
     data->pq_codes_by_list.resize(data->lists.size());
   }
+  if (data->doc_ids_by_list.size() != data->lists.size()) {
+    data->doc_ids_by_list.resize(data->lists.size());
+  }
   if (data->pq_codes_soa_by_list.size() != data->lists.size()) {
     data->pq_codes_soa_by_list.resize(data->lists.size());
   }
   const auto& list = data->lists[static_cast<size_t>(list_id)];
+  auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
   auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
   auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+  doc_ids.clear();
+  doc_ids.reserve(list.size());
   flat.clear();
   flat.reserve(list.size() * data->M);
   soa.rows = list.size();
@@ -603,10 +627,12 @@ void RebuildListPQCodes(IndexData* data, uint32_t list_id) {
   for (size_t row = 0; row < list.size(); ++row) {
     const auto& entry = list[row];
     if (entry.pq_code.size() != data->M) {
+      doc_ids.clear();
       flat.clear();
       ClearListPQCodesSoA(data, list_id);
       return;
     }
+    doc_ids.push_back(entry.doc_id);
     flat.insert(flat.end(), entry.pq_code.begin(), entry.pq_code.end());
     for (uint32_t m = 0; m < data->M; ++m) {
       soa.codes[static_cast<size_t>(m) * soa.stride + row] =
@@ -615,16 +641,23 @@ void RebuildListPQCodes(IndexData* data, uint32_t list_id) {
   }
 }
 
-void AppendListPQCodeSoA(IndexData* data,
-                         uint32_t list_id,
-                         size_t rows_before,
-                         const std::vector<uint8_t>& code) {
+void AppendListPQCaches(IndexData* data,
+                        uint32_t list_id,
+                        size_t rows_before,
+                        const ListEntry& entry) {
   if (data == nullptr || !data->use_pq || data->M == 0 || list_id >= data->lists.size()) {
     return;
   }
+  const std::vector<uint8_t>& code = entry.pq_code;
   if (code.size() != data->M) {
+    if (list_id < data->doc_ids_by_list.size()) {
+      data->doc_ids_by_list[static_cast<size_t>(list_id)].clear();
+    }
     ClearListPQCodesSoA(data, list_id);
     return;
+  }
+  if (data->doc_ids_by_list.size() != data->lists.size()) {
+    data->doc_ids_by_list.resize(data->lists.size());
   }
   if (data->pq_codes_soa_by_list.size() != data->lists.size()) {
     data->pq_codes_soa_by_list.resize(data->lists.size());
@@ -634,13 +667,16 @@ void AppendListPQCodeSoA(IndexData* data,
     return;
   }
 
+  auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
   auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
-  const bool appendable = soa.rows == rows_before && soa.stride >= rows_before &&
+  const bool appendable = doc_ids.size() == rows_before &&
+                          soa.rows == rows_before && soa.stride >= rows_before &&
                           soa.codes.size() == static_cast<size_t>(data->M) * soa.stride;
   if (!appendable) {
     RebuildListPQCodes(data, list_id);
     return;
   }
+  doc_ids.push_back(entry.doc_id);
   ReserveListPQCodesSoA(data, list_id, rows_before + 1);
   auto& reserved = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
   if (reserved.rows != rows_before || reserved.stride < rows_before + 1 ||
@@ -662,22 +698,30 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   if (!HasContiguousPQCodesForList(*data, list_id)) {
     RebuildListPQCodes(data, list_id);
   }
+  if (!HasCompactDocIdsForList(*data, list_id)) {
+    RebuildListPQCodes(data, list_id);
+  }
   if (!HasSoAPQCodesForList(*data, list_id)) {
     RebuildListPQCodes(data, list_id);
   }
-  if (list_id >= data->pq_codes_by_list.size() ||
+  if (list_id >= data->doc_ids_by_list.size() ||
+      list_id >= data->pq_codes_by_list.size() ||
       list_id >= data->pq_codes_soa_by_list.size()) {
     return;
   }
+  auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
   auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
   if (flat.size() % data->M != 0) {
     RebuildListPQCodes(data, list_id);
   }
   size_t rows = flat.size() / data->M;
-  if (pos >= rows) {
+  if (pos >= rows || doc_ids.size() != rows) {
     RebuildListPQCodes(data, list_id);
     rows = flat.size() / data->M;
-    if (flat.size() % data->M != 0 || pos >= rows) {
+    if (flat.size() % data->M != 0 ||
+        list_id >= data->doc_ids_by_list.size() ||
+        data->doc_ids_by_list[static_cast<size_t>(list_id)].size() != rows ||
+        pos >= rows) {
       return;
     }
   }
@@ -690,11 +734,14 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
     return;
   }
   const size_t last = rows - 1;
+  auto& updated_doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
   if (pos != last) {
+    updated_doc_ids[pos] = updated_doc_ids[last];
     std::copy_n(flat.data() + last * data->M,
                 data->M,
                 flat.data() + pos * data->M);
   }
+  updated_doc_ids.resize(last);
   flat.resize(last * data->M);
 
   auto& updated_soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
@@ -815,6 +862,10 @@ SearchResult SearchSingleQuery(const IndexData& data,
       }
     }
     const auto& list = data.lists[static_cast<size_t>(list_id)];
+    const bool use_compact_pq_scan = use_pq && HasCompactPQListForSearch(data, list_id);
+    const std::vector<DocId>* compact_doc_ids =
+        use_compact_pq_scan ? &data.doc_ids_by_list[static_cast<size_t>(list_id)] : nullptr;
+    const size_t list_size = use_compact_pq_scan ? compact_doc_ids->size() : list.size();
     const bool use_contiguous_codes = use_pq && HasContiguousPQCodesForList(data, list_id);
     const uint8_t* contiguous_codes =
         use_contiguous_codes ? data.pq_codes_by_list[static_cast<size_t>(list_id)].data() : nullptr;
@@ -822,67 +873,74 @@ SearchResult SearchSingleQuery(const IndexData& data,
         use_vectorized_code_soa_scan && HasSoAPQCodesForList(data, list_id);
     const ListPQCodesSoA* soa_codes =
         use_soa_codes ? &data.pq_codes_soa_by_list[static_cast<size_t>(list_id)] : nullptr;
-    if (soa_codes != nullptr && !list.empty()) {
-      soa_scan_dists.resize(list.size());
+    if (soa_codes != nullptr && list_size > 0) {
+      soa_scan_dists.resize(list_size);
       internal::ScanPQCodesSoA(distance_table.data(),
                                soa_codes->codes.data(),
                                data.M,
                                data.Ks,
                                soa_codes->stride,
-                               list.size(),
+                               list_size,
                                soa_scan_dists.data());
     }
-    for (size_t li = 0; li < list.size(); ++li) {
-      const auto& entry = list[li];
+    for (size_t li = 0; li < list_size; ++li) {
       ++scanned;
-      Candidate cand;
-      cand.doc_id = entry.doc_id;
+      DocId doc_id = 0;
+      float approx_dist = 0.0f;
       if (use_pq) {
-        float approx = 0.0f;
+        doc_id = use_compact_pq_scan ? (*compact_doc_ids)[li] : list[li].doc_id;
         if (soa_codes != nullptr) {
-          approx = soa_scan_dists[li];
+          approx_dist = soa_scan_dists[li];
         } else {
           const uint8_t* code_ptr = nullptr;
           if (use_contiguous_codes) {
             code_ptr = contiguous_codes + li * data.M;
-          } else if (entry.pq_code.size() == data.M) {
-            code_ptr = entry.pq_code.data();
+          } else if (list[li].pq_code.size() == data.M) {
+            code_ptr = list[li].pq_code.data();
           }
           if (code_ptr == nullptr) {
             continue;
           }
-          approx = use_fast_scan
-                       ? AccumulateDistanceFastScan(distance_table.data(), code_ptr, data.M, data.Ks)
-                       : 0.0f;
+          approx_dist =
+              use_fast_scan ? AccumulateDistanceFastScan(distance_table.data(), code_ptr, data.M, data.Ks)
+                            : 0.0f;
           if (!use_fast_scan) {
             for (uint32_t m = 0; m < data.M; ++m) {
               const uint8_t code = code_ptr[m];
-              approx += distance_table[static_cast<size_t>(m) * data.Ks + code];
+              approx_dist += distance_table[static_cast<size_t>(m) * data.Ks + code];
             }
           }
         }
         if (use_precomputed_table) {
-          approx += coarse_dist;
+          approx_dist += coarse_dist;
         }
-        cand.approx_dist = approx;
       } else {
+        const auto& entry = list[li];
+        doc_id = entry.doc_id;
         const float dot = entry.vector.dot(qw);
-        cand.approx_dist = qnorm + entry.norm - 2.0f * dot;
+        approx_dist = qnorm + entry.norm - 2.0f * dot;
       }
-      cand.rerank_dist = cand.approx_dist;
-      cand.versions = entry.versions;
-      cand.versions.index_version = data.version;
-      cand.from_new = from_new;
       if (collect_scan_trace) {
-        scanned_doc_ids.push_back(cand.doc_id);
-        scanned_approx_dists.push_back(cand.approx_dist);
+        scanned_doc_ids.push_back(doc_id);
+        scanned_approx_dists.push_back(approx_dist);
       }
-      if (heap.size() < topk) {
+      if (heap.size() < topk ||
+          (!heap.empty() && approx_dist < heap.front().approx_dist)) {
+        const auto& entry = list[li];
+        Candidate cand;
+        cand.doc_id = doc_id;
+        cand.approx_dist = approx_dist;
+        cand.rerank_dist = approx_dist;
+        cand.versions = entry.versions;
+        cand.versions.index_version = data.version;
+        cand.from_new = from_new;
+        if (heap.size() == topk) {
+          std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+          heap.back() = std::move(cand);
+          std::push_heap(heap.begin(), heap.end(), heap_cmp);
+          continue;
+        }
         heap.push_back(std::move(cand));
-        std::push_heap(heap.begin(), heap.end(), heap_cmp);
-      } else if (!heap.empty() && cand.approx_dist < heap.front().approx_dist) {
-        std::pop_heap(heap.begin(), heap.end(), heap_cmp);
-        heap.back() = std::move(cand);
         std::push_heap(heap.begin(), heap.end(), heap_cmp);
       }
     }
@@ -979,9 +1037,11 @@ class KMeansIVFIndex : public IVFIndex {
     }
     data->lists.clear();
     data->lists.resize(nlist);
+    data->doc_ids_by_list.clear();
     data->pq_codes_by_list.clear();
     data->pq_codes_soa_by_list.clear();
     if (data->use_pq) {
+      data->doc_ids_by_list.resize(nlist);
       data->pq_codes_by_list.resize(nlist);
       data->pq_codes_soa_by_list.resize(nlist);
     }
@@ -2218,6 +2278,12 @@ class KMeansIVFIndex : public IVFIndex {
       }
       if (data->use_pq) {
         RebuildListPQCodes(data, list_id);
+        if (list_id < data->doc_ids_by_list.size()) {
+          auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
+          if (doc_ids.capacity() > doc_ids.size() * 2 + 1024) {
+            doc_ids.shrink_to_fit();
+          }
+        }
         if (list_id < data->pq_codes_by_list.size()) {
           auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
           if (flat.capacity() > flat.size() * 2 + 1024) {
@@ -2293,6 +2359,9 @@ class KMeansIVFIndex : public IVFIndex {
   void CommitPendingLocked(IndexData* data,
                            const std::vector<int>& centroids,
                            AlignedVector<ListEntry>* entries) {
+    if (data->use_pq && data->doc_ids_by_list.size() != data->lists.size()) {
+      data->doc_ids_by_list.resize(data->lists.size());
+    }
     if (data->use_pq && data->pq_codes_by_list.size() != data->lists.size()) {
       data->pq_codes_by_list.resize(data->lists.size());
     }
@@ -2313,11 +2382,14 @@ class KMeansIVFIndex : public IVFIndex {
           const size_t expected_before_push = rows_before_push * data->M;
           if (flat.size() == expected_before_push) {
             flat.insert(flat.end(), list.back().pq_code.begin(), list.back().pq_code.end());
-            AppendListPQCodeSoA(data, list_id, rows_before_push, list.back().pq_code);
+            AppendListPQCaches(data, list_id, rows_before_push, list.back());
           } else {
             RebuildListPQCodes(data, list_id);
           }
         } else {
+          if (list_id < data->doc_ids_by_list.size()) {
+            data->doc_ids_by_list[static_cast<size_t>(list_id)].clear();
+          }
           flat.clear();
           ClearListPQCodesSoA(data, list_id);
         }
