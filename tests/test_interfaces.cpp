@@ -1,5 +1,6 @@
 #undef NDEBUG
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -123,8 +124,11 @@ int main() {
   cands[0].doc_id = 0;
   auto rerank_status = RerankL2(sample, &cands, [&](DocId) -> Result<Eigen::VectorXf> {
     return sample;
+  }, [&](DocId) -> Result<float> {
+    return sample.squaredNorm();
   });
   assert(rerank_status.ok());
+  assert(std::fabs(cands[0].rerank_dist) < 1e-6f);
 
   {
     const std::string tmp_fvecs = "test_vectors.fvecs";

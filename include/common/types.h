@@ -45,4 +45,9 @@ struct VectorRecord {
   Eigen::VectorXf x;
 };
 
+inline float SquaredL2FromNormDot(float a_norm, float b_norm, float dot) {
+  const float dist = a_norm + b_norm - 2.0f * dot;
+  return dist >= 0.0f ? dist : 0.0f;
+}
+
 }  // namespace ann

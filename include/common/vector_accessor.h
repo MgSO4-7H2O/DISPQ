@@ -16,6 +16,13 @@ class VectorAccessor {
   virtual ~VectorAccessor() = default;
   virtual uint32_t dim() const = 0;
   virtual Result<Eigen::VectorXf> GetVector(DocId doc_id) const = 0;
+  virtual Result<float> GetNorm(DocId doc_id) const {
+    auto vec_res = GetVector(doc_id);
+    if (!vec_res.ok()) {
+      return vec_res.status();
+    }
+    return vec_res.value().squaredNorm();
+  }
 
   virtual Status Materialize(const std::vector<DocId>& doc_ids, MatrixRM* out) const {
     if (out == nullptr) {
@@ -50,6 +57,13 @@ class MatrixVectorAccessor final : public VectorAccessor {
       return Status::InvalidArgument("MatrixVectorAccessor: doc_id out of range");
     }
     return Eigen::VectorXf(vectors_.row(static_cast<Eigen::Index>(doc_id)).transpose());
+  }
+
+  Result<float> GetNorm(DocId doc_id) const override {
+    if (static_cast<Eigen::Index>(doc_id) >= vectors_.rows()) {
+      return Status::InvalidArgument("MatrixVectorAccessor: doc_id out of range");
+    }
+    return vectors_.row(static_cast<Eigen::Index>(doc_id)).squaredNorm();
   }
 
   Status Materialize(const std::vector<DocId>& doc_ids, MatrixRM* out) const override {

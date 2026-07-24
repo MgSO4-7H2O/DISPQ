@@ -390,6 +390,7 @@ class WhitenedVectorCache final : public VectorAccessor {
     Block block;
     block.ids = doc_ids;
     block.data = vectors;
+    block.norms = vectors.rowwise().squaredNorm();
     block.live = static_cast<uint32_t>(doc_ids.size());
     uint32_t block_id = static_cast<uint32_t>(blocks_.size());
     if (!free_blocks_.empty()) {
@@ -428,6 +429,7 @@ class WhitenedVectorCache final : public VectorAccessor {
       if (block.live == 0) {
         block.ids.clear();
         block.data.resize(0, 0);
+        block.norms.resize(0);
         free_blocks_.push_back(loc.block);
       }
       locations_.erase(it);
@@ -449,6 +451,23 @@ class WhitenedVectorCache final : public VectorAccessor {
       return Status::Internal("WhitenedVectorCache::GetVector: corrupt row index");
     }
     return Eigen::VectorXf(block.data.row(static_cast<Eigen::Index>(loc.row)).transpose());
+  }
+
+  Result<float> GetNorm(DocId doc_id) const override {
+    auto it = locations_.find(doc_id);
+    if (it == locations_.end()) {
+      return Status::NotFound("WhitenedVectorCache::GetNorm: missing doc_id");
+    }
+    const Location loc = it->second;
+    if (loc.block >= blocks_.size()) {
+      return Status::Internal("WhitenedVectorCache::GetNorm: corrupt block index");
+    }
+    const Block& block = blocks_[loc.block];
+    if (loc.row >= block.ids.size() || block.ids[loc.row] != doc_id ||
+        loc.row >= static_cast<uint32_t>(block.norms.size())) {
+      return Status::Internal("WhitenedVectorCache::GetNorm: corrupt row index");
+    }
+    return block.norms(static_cast<Eigen::Index>(loc.row));
   }
 
   Status Materialize(const std::vector<DocId>& doc_ids, MatrixRM* out) const override {
@@ -481,6 +500,7 @@ class WhitenedVectorCache final : public VectorAccessor {
   struct Block {
     std::vector<DocId> ids;
     MatrixRM data;
+    Eigen::VectorXf norms;
     uint32_t live{0};
   };
 
@@ -1597,7 +1617,8 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
                                bool exact_rerank_enable,
                                const std::vector<uint32_t>& rerank_candidates_per_route,
                                Eigen::Ref<const Eigen::VectorXf> query_whitened,
-                               const MatrixRM& base_whitened) {
+                               const MatrixRM& base_whitened,
+                               const Eigen::VectorXf& base_norms) {
   SearchResult out;
   if (partial_results.empty() || topk == 0) {
     return out;
@@ -1647,18 +1668,20 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
 
   if (exact_rerank_enable) {
     for (const auto& cand : merged) {
-      if (cand.doc_id >= static_cast<DocId>(base_whitened.rows())) {
+      if (cand.doc_id >= static_cast<DocId>(base_whitened.rows()) ||
+          cand.doc_id >= static_cast<DocId>(base_norms.size())) {
         return Status::InvalidArgument("MergeTopK: doc id out of range for exact rerank");
       }
     }
+    const float query_norm = query_whitened.squaredNorm();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (!omp_in_parallel() && merged.size() > 1)
 #endif
     for (int64_t i = 0; i < static_cast<int64_t>(merged.size()); ++i) {
       auto& cand = merged[static_cast<size_t>(i)];
-      const Eigen::VectorXf diff =
-          query_whitened - base_whitened.row(static_cast<Eigen::Index>(cand.doc_id)).transpose();
-      cand.rerank_dist = diff.squaredNorm();
+      const Eigen::Index doc_idx = static_cast<Eigen::Index>(cand.doc_id);
+      const float dot = base_whitened.row(doc_idx).dot(query_whitened);
+      cand.rerank_dist = SquaredL2FromNormDot(query_norm, base_norms(doc_idx), dot);
     }
     if (merged.size() > topk) {
       std::nth_element(merged.begin(),
@@ -1739,13 +1762,18 @@ Result<SearchResult> MergeTopKAccessor(const std::vector<SearchResult>& partial_
   };
 
   if (exact_rerank_enable) {
+    const float query_norm = query_whitened.squaredNorm();
     for (auto& cand : merged) {
       auto vec_res = base_vectors.GetVector(cand.doc_id);
       if (!vec_res.ok()) {
         return vec_res.status();
       }
-      const Eigen::VectorXf diff = query_whitened - vec_res.value();
-      cand.rerank_dist = diff.squaredNorm();
+      auto norm_res = base_vectors.GetNorm(cand.doc_id);
+      if (!norm_res.ok()) {
+        return norm_res.status();
+      }
+      cand.rerank_dist =
+          SquaredL2FromNormDot(query_norm, norm_res.value(), query_whitened.dot(vec_res.value()));
     }
     if (merged.size() > topk) {
       std::nth_element(merged.begin(),
@@ -1773,6 +1801,7 @@ Result<SearchResult> MergeTopKAccessor(const std::vector<SearchResult>& partial_
 
 Result<EvalMetrics> EvaluateState(const Config& config,
                                   const MatrixRM& base_whitened,
+                                  const Eigen::VectorXf& base_norms,
                                   uint32_t seen_rows,
                                   uint32_t new_begin,
                                   uint32_t new_end,
@@ -1788,6 +1817,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                   const SearchParams& params) {
   if (seen_rows == 0 || seen_rows > static_cast<uint32_t>(base_whitened.rows())) {
     return Status::InvalidArgument("EvaluateState: invalid seen_rows");
+  }
+  if (seen_rows > static_cast<uint32_t>(base_norms.size())) {
+    return Status::InvalidArgument("EvaluateState: invalid base_norms");
   }
   if (main_rows == 0 || main_rows > seen_rows) {
     return Status::InvalidArgument("EvaluateState: invalid main_rows");
@@ -1993,7 +2025,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                 enable_exact_rerank,
                                 route_rerank_candidates,
                                 q,
-                                base_whitened);
+                                base_whitened,
+                                base_norms);
     if (!merged_res.ok()) {
       std::lock_guard<std::mutex> lock(error_mu);
       if (!failed.exchange(true)) {
@@ -2090,11 +2123,13 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       exact_ranked.reserve(approx_by_doc.size());
       const Eigen::VectorXf qv =
           queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
+      const float qnorm = qv.squaredNorm();
       for (const auto& kv : approx_by_doc) {
         approx_ranked.push_back({kv.second, kv.first});
-        const Eigen::VectorXf diff =
-            qv - base_whitened.row(static_cast<Eigen::Index>(kv.first)).transpose();
-        exact_ranked.push_back({diff.squaredNorm(), kv.first});
+        const Eigen::Index doc_idx = static_cast<Eigen::Index>(kv.first);
+        const float dot = base_whitened.row(doc_idx).dot(qv);
+        exact_ranked.push_back(
+            {SquaredL2FromNormDot(qnorm, base_norms(doc_idx), dot), kv.first});
       }
       std::sort(approx_ranked.begin(), approx_ranked.end(),
                 [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -2707,14 +2742,19 @@ Result<EvalMetrics> EvaluateStateStreaming(const Config& config,
       exact_ranked.reserve(approx_by_doc.size());
       const Eigen::VectorXf qv =
           queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
+      const float qnorm = qv.squaredNorm();
       for (const auto& kv : approx_by_doc) {
         approx_ranked.push_back({kv.second, kv.first});
         auto vec_res = base_vectors.GetVector(kv.first);
         if (!vec_res.ok()) {
           return vec_res.status();
         }
-        const Eigen::VectorXf diff = qv - vec_res.value();
-        exact_ranked.push_back({diff.squaredNorm(), kv.first});
+        auto norm_res = base_vectors.GetNorm(kv.first);
+        if (!norm_res.ok()) {
+          return norm_res.status();
+        }
+        exact_ranked.push_back(
+            {SquaredL2FromNormDot(qnorm, norm_res.value(), qv.dot(vec_res.value())), kv.first});
       }
       std::sort(approx_ranked.begin(), approx_ranked.end(),
                 [](const auto& a, const auto& b) { return a.first < b.first; });
