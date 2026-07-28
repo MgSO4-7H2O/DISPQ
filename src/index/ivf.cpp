@@ -95,6 +95,15 @@ class PagedDocLocationMap {
 
   size_t size() const { return size_; }
 
+  uint64_t MemoryBytes() const {
+    return static_cast<uint64_t>(sizeof(*this)) +
+           static_cast<uint64_t>(pages_.bucket_count()) *
+               static_cast<uint64_t>(sizeof(void*)) +
+           static_cast<uint64_t>(pages_.size()) *
+               static_cast<uint64_t>(sizeof(Page) + sizeof(uint32_t) +
+                                     sizeof(std::unique_ptr<Page>) + sizeof(void*));
+  }
+
  private:
   static constexpr uint32_t kPageBits = 8;
   static constexpr uint32_t kPageSize = 1u << kPageBits;
@@ -165,6 +174,76 @@ struct IndexData {
   uint64_t ntotal{0};
   double last_patch_pq_reencode_ms{0.0};
 };
+
+uint64_t MatrixStorageBytes(const MatrixRM& matrix) {
+  return static_cast<uint64_t>(matrix.size()) * static_cast<uint64_t>(sizeof(float));
+}
+
+uint64_t VectorStorageBytes(const Eigen::VectorXf& vector) {
+  return static_cast<uint64_t>(vector.size()) * static_cast<uint64_t>(sizeof(float));
+}
+
+template <typename T>
+uint64_t StdVectorStorageBytes(const std::vector<T>& values) {
+  return static_cast<uint64_t>(values.capacity()) * static_cast<uint64_t>(sizeof(T));
+}
+
+IVFMemoryUsage EstimateIndexDataMemoryUsage(const IndexData& data) {
+  IVFMemoryUsage usage;
+  usage.routing_centroids_bytes = MatrixStorageBytes(data.routing_centroids);
+  usage.routing_centroid_norms_bytes = VectorStorageBytes(data.routing_centroid_norms);
+  usage.container_overhead_bytes +=
+      static_cast<uint64_t>(sizeof(IndexData)) +
+      StdVectorStorageBytes(data.pq_sub_offsets) +
+      StdVectorStorageBytes(data.pq_codebooks) +
+      StdVectorStorageBytes(data.pq_codebooks_soa) +
+      StdVectorStorageBytes(data.doc_ids_by_list) +
+      StdVectorStorageBytes(data.pq_codes_by_list) +
+      StdVectorStorageBytes(data.pq_codes_soa_by_list) +
+      StdVectorStorageBytes(data.pq_precomputed_table) +
+      StdVectorStorageBytes(data.pq_counts) +
+      StdVectorStorageBytes(data.lists);
+
+  for (const MatrixRM& codebook : data.pq_codebooks) {
+    usage.pq_codebooks_bytes += MatrixStorageBytes(codebook);
+  }
+  for (const MatrixRM& codebook_soa : data.pq_codebooks_soa) {
+    usage.pq_codebooks_soa_bytes += MatrixStorageBytes(codebook_soa);
+  }
+  for (const auto& counts : data.pq_counts) {
+    usage.pq_counts_bytes += StdVectorStorageBytes(counts);
+  }
+  usage.pq_precomputed_table_bytes = StdVectorStorageBytes(data.pq_precomputed_table);
+
+  for (const auto& list : data.lists) {
+    usage.list_entries_bytes +=
+        static_cast<uint64_t>(list.capacity()) * static_cast<uint64_t>(sizeof(ListEntry));
+    for (const ListEntry& entry : list) {
+      usage.list_vectors_bytes += VectorStorageBytes(entry.vector);
+      usage.list_pq_codes_bytes += StdVectorStorageBytes(entry.pq_code);
+    }
+  }
+  for (const auto& doc_ids : data.doc_ids_by_list) {
+    usage.compact_doc_ids_bytes += StdVectorStorageBytes(doc_ids);
+  }
+  for (const auto& codes : data.pq_codes_by_list) {
+    usage.compact_pq_codes_bytes += StdVectorStorageBytes(codes);
+  }
+  for (const auto& soa : data.pq_codes_soa_by_list) {
+    usage.soa_pq_codes_bytes +=
+        static_cast<uint64_t>(sizeof(ListPQCodesSoA)) + StdVectorStorageBytes(soa.codes);
+  }
+  usage.doc_locations_bytes = data.doc_locations.MemoryBytes();
+
+  usage.total_bytes = usage.routing_centroids_bytes + usage.routing_centroid_norms_bytes +
+                      usage.pq_codebooks_bytes + usage.pq_codebooks_soa_bytes +
+                      usage.pq_counts_bytes + usage.pq_precomputed_table_bytes +
+                      usage.list_entries_bytes + usage.list_vectors_bytes +
+                      usage.list_pq_codes_bytes + usage.compact_doc_ids_bytes +
+                      usage.compact_pq_codes_bytes + usage.soa_pq_codes_bytes +
+                      usage.doc_locations_bytes + usage.container_overhead_bytes;
+  return usage;
+}
 
 std::vector<uint32_t> MakeUniformPQSubOffsets(uint32_t dim, uint32_t M) {
   std::vector<uint32_t> offsets(static_cast<size_t>(M) + 1, 0);
@@ -2038,6 +2117,16 @@ class KMeansIVFIndex : public IVFIndex {
           static_cast<uint32_t>(data.lists[static_cast<size_t>(list_id)].size());
     }
     return sizes;
+  }
+
+  Result<IVFMemoryUsage> EstimateMemoryUsage(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("EstimateMemoryUsage: index version not built");
+    }
+    return EstimateIndexDataMemoryUsage(*it->second);
   }
 
   Status CommitPartitionPatch(const VersionSet& route_versions,

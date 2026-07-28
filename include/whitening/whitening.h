@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -17,6 +18,11 @@ class WhiteningModel {
 
   // NTS: Fits statistics for a new version using batched data (X shape: n x dim, row-major).
   virtual Result<VersionId> Fit(Eigen::Ref<const MatrixRM> X) = 0;
+
+  // NTS: Fits a new version from precomputed population mean/covariance.
+  virtual Result<VersionId> FitFromMeanCov(Eigen::Ref<const Eigen::VectorXf> mean,
+                                           Eigen::Ref<const MatrixRM> covariance,
+                                           uint64_t sample_count) = 0;
 
   // TS: Applies the whitening transform corresponding to version -> out_xw.
   virtual Result<void> Transform(Eigen::Ref<const Eigen::VectorXf> x,

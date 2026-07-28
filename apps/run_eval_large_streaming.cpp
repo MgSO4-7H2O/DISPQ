@@ -29,6 +29,7 @@
 #include "common/timer.h"
 #include "common/types.h"
 #include "common/vector_accessor.h"
+#include "eval_memory.h"
 #include "eval/metrics.h"
 #include "index/ivf.h"
 #include "index/merge.h"
@@ -347,6 +348,231 @@ class FvecsRandomAccessReader {
   uint64_t record_bytes_{0};
 };
 
+void ReleaseMatrix(MatrixRM* matrix) {
+  if (matrix == nullptr) {
+    return;
+  }
+  MatrixRM empty;
+  matrix->swap(empty);
+}
+
+struct MeanCovStats {
+  Eigen::VectorXf mean;
+  MatrixRM covariance;
+  uint64_t count{0};
+  double read_ms{0.0};
+};
+
+class MeanCovAccumulator {
+ public:
+  explicit MeanCovAccumulator(uint32_t dim)
+      : dim_(dim),
+        sum_(Eigen::VectorXd::Zero(static_cast<Eigen::Index>(dim))),
+        cross_(Eigen::MatrixXd::Zero(static_cast<Eigen::Index>(dim),
+                                     static_cast<Eigen::Index>(dim))) {}
+
+  Status Add(Eigen::Ref<const MatrixRM> rows) {
+    if (rows.rows() == 0) {
+      return Status::OK();
+    }
+    if (static_cast<uint32_t>(rows.cols()) != dim_) {
+      return Status::InvalidArgument("MeanCovAccumulator::Add: dimension mismatch");
+    }
+    const Eigen::VectorXf block_sum = rows.colwise().sum();
+    sum_ += block_sum.cast<double>();
+    const MatrixRM block_cross = rows.transpose() * rows;
+    cross_ += block_cross.cast<double>();
+    count_ += static_cast<uint64_t>(rows.rows());
+    return Status::OK();
+  }
+
+  Result<MeanCovStats> Finish() const {
+    if (count_ == 0) {
+      return Status::InvalidArgument("MeanCovAccumulator::Finish: no samples");
+    }
+    const Eigen::VectorXd mean_d = sum_ / static_cast<double>(count_);
+    Eigen::MatrixXd cov_d = cross_ / static_cast<double>(count_);
+    cov_d.noalias() -= mean_d * mean_d.transpose();
+    MeanCovStats stats;
+    stats.mean = mean_d.cast<float>();
+    stats.covariance = cov_d.cast<float>();
+    stats.count = count_;
+    return stats;
+  }
+
+ private:
+  uint32_t dim_{0};
+  uint64_t count_{0};
+  Eigen::VectorXd sum_;
+  Eigen::MatrixXd cross_;
+};
+
+Result<MeanCovStats> ComputeMeanCovForRange(const FvecsRandomAccessReader& reader,
+                                            uint32_t begin,
+                                            uint32_t rows) {
+  if (begin > reader.count() || rows > reader.count() - begin) {
+    return Status::InvalidArgument("ComputeMeanCovForRange: range out of bounds");
+  }
+  MeanCovAccumulator accumulator(reader.dim());
+  double read_ms = 0.0;
+  for (uint32_t offset = 0; offset < rows;) {
+    const uint32_t chunk = std::min<uint32_t>(kAddBlockRows, rows - offset);
+    Timer read_timer;
+    auto block_res = reader.ReadRange(begin + offset, chunk);
+    if (!block_res.ok()) {
+      return block_res.status();
+    }
+    read_ms += read_timer.ElapsedMillis();
+    Status add = accumulator.Add(block_res.value());
+    if (!add.ok()) {
+      return add;
+    }
+    offset += chunk;
+  }
+  auto stats_res = accumulator.Finish();
+  if (!stats_res.ok()) {
+    return stats_res.status();
+  }
+  MeanCovStats stats = std::move(stats_res.value());
+  stats.read_ms = read_ms;
+  return stats;
+}
+
+Result<MeanCovStats> ComputeMeanCovForDocIds(const FvecsRandomAccessReader& reader,
+                                             const std::vector<DocId>& doc_ids) {
+  if (doc_ids.empty()) {
+    return Status::InvalidArgument("ComputeMeanCovForDocIds: empty doc_ids");
+  }
+  MeanCovAccumulator accumulator(reader.dim());
+  double read_ms = 0.0;
+  size_t pos = 0;
+  while (pos < doc_ids.size()) {
+    const DocId begin = doc_ids[pos];
+    if (begin >= reader.count()) {
+      return Status::InvalidArgument("ComputeMeanCovForDocIds: doc_id out of bounds");
+    }
+    size_t next = pos + 1;
+    while (next < doc_ids.size() && doc_ids[next] == doc_ids[next - 1] + 1 &&
+           next - pos < kAddBlockRows) {
+      ++next;
+    }
+    const uint32_t rows = static_cast<uint32_t>(next - pos);
+    Timer read_timer;
+    auto block_res = reader.ReadRange(begin, rows);
+    if (!block_res.ok()) {
+      return block_res.status();
+    }
+    read_ms += read_timer.ElapsedMillis();
+    Status add = accumulator.Add(block_res.value());
+    if (!add.ok()) {
+      return add;
+    }
+    pos = next;
+  }
+  auto stats_res = accumulator.Finish();
+  if (!stats_res.ok()) {
+    return stats_res.status();
+  }
+  MeanCovStats stats = std::move(stats_res.value());
+  stats.read_ms = read_ms;
+  return stats;
+}
+
+Result<MatrixRM> TransformRangeToWhitened(const FvecsRandomAccessReader& reader,
+                                          uint32_t begin,
+                                          uint32_t rows,
+                                          const std::shared_ptr<WhiteningModel>& whitening,
+                                          VersionId whiten_version,
+                                          bool normalize_rows,
+                                          double* read_ms,
+                                          double* transform_ms) {
+  if (!whitening) {
+    return Status::InvalidArgument("TransformRangeToWhitened: null whitening model");
+  }
+  if (begin > reader.count() || rows > reader.count() - begin) {
+    return Status::InvalidArgument("TransformRangeToWhitened: range out of bounds");
+  }
+  MatrixRM out(static_cast<Eigen::Index>(rows), reader.dim());
+  for (uint32_t offset = 0; offset < rows;) {
+    const uint32_t chunk = std::min<uint32_t>(kAddBlockRows, rows - offset);
+    Timer read_timer;
+    auto raw_res = reader.ReadRange(begin + offset, chunk);
+    if (!raw_res.ok()) {
+      return raw_res.status();
+    }
+    if (read_ms != nullptr) {
+      *read_ms += read_timer.ElapsedMillis();
+    }
+    Timer transform_timer;
+    auto whiten_res = whitening->TransformBatch(raw_res.value(), whiten_version);
+    if (!whiten_res.ok()) {
+      return whiten_res.status();
+    }
+    MatrixRM block = std::move(whiten_res.value());
+    if (normalize_rows) {
+      NormalizeRowsL2(&block);
+    }
+    if (transform_ms != nullptr) {
+      *transform_ms += transform_timer.ElapsedMillis();
+    }
+    out.block(static_cast<Eigen::Index>(offset), 0, block.rows(), block.cols()) = block;
+    offset += chunk;
+  }
+  return out;
+}
+
+Result<MatrixRM> TransformDocIdsToWhitened(const FvecsRandomAccessReader& reader,
+                                           const std::vector<DocId>& doc_ids,
+                                           const std::shared_ptr<WhiteningModel>& whitening,
+                                           VersionId whiten_version,
+                                           bool normalize_rows,
+                                           double* read_ms,
+                                           double* transform_ms) {
+  if (!whitening) {
+    return Status::InvalidArgument("TransformDocIdsToWhitened: null whitening model");
+  }
+  MatrixRM out(static_cast<Eigen::Index>(doc_ids.size()), reader.dim());
+  if (doc_ids.empty()) {
+    return out;
+  }
+  size_t pos = 0;
+  while (pos < doc_ids.size()) {
+    const DocId begin = doc_ids[pos];
+    if (begin >= reader.count()) {
+      return Status::InvalidArgument("TransformDocIdsToWhitened: doc_id out of bounds");
+    }
+    size_t next = pos + 1;
+    while (next < doc_ids.size() && doc_ids[next] == doc_ids[next - 1] + 1 &&
+           next - pos < kAddBlockRows) {
+      ++next;
+    }
+    const uint32_t rows = static_cast<uint32_t>(next - pos);
+    Timer read_timer;
+    auto raw_res = reader.ReadRange(begin, rows);
+    if (!raw_res.ok()) {
+      return raw_res.status();
+    }
+    if (read_ms != nullptr) {
+      *read_ms += read_timer.ElapsedMillis();
+    }
+    Timer transform_timer;
+    auto whiten_res = whitening->TransformBatch(raw_res.value(), whiten_version);
+    if (!whiten_res.ok()) {
+      return whiten_res.status();
+    }
+    MatrixRM block = std::move(whiten_res.value());
+    if (normalize_rows) {
+      NormalizeRowsL2(&block);
+    }
+    if (transform_ms != nullptr) {
+      *transform_ms += transform_timer.ElapsedMillis();
+    }
+    out.block(static_cast<Eigen::Index>(pos), 0, block.rows(), block.cols()) = block;
+    pos = next;
+  }
+  return out;
+}
+
 class WhitenedVectorCache final : public VectorAccessor {
  public:
   WhitenedVectorCache() = default;
@@ -368,6 +594,12 @@ class WhitenedVectorCache final : public VectorAccessor {
   void Reserve(size_t rows) { locations_.reserve(rows); }
 
   Status AppendBatch(const std::vector<DocId>& doc_ids, const MatrixRM& vectors) {
+    std::vector<DocId> ids_copy = doc_ids;
+    MatrixRM vectors_copy = vectors;
+    return AppendBatchOwned(std::move(ids_copy), std::move(vectors_copy));
+  }
+
+  Status AppendBatchOwned(std::vector<DocId> doc_ids, MatrixRM vectors) {
     if (doc_ids.size() != static_cast<size_t>(vectors.rows())) {
       return Status::InvalidArgument("WhitenedVectorCache::AppendBatch: row count mismatch");
     }
@@ -387,18 +619,19 @@ class WhitenedVectorCache final : public VectorAccessor {
         return Status::AlreadyExists("WhitenedVectorCache::AppendBatch: duplicate doc_id");
       }
     }
+    const uint32_t row_count = static_cast<uint32_t>(doc_ids.size());
     Block block;
-    block.ids = doc_ids;
-    block.data = vectors;
-    block.norms = vectors.rowwise().squaredNorm();
-    block.live = static_cast<uint32_t>(doc_ids.size());
+    block.ids = std::move(doc_ids);
+    block.data = std::move(vectors);
+    block.norms = block.data.rowwise().squaredNorm();
+    block.live = row_count;
     uint32_t block_id = static_cast<uint32_t>(blocks_.size());
     if (!free_blocks_.empty()) {
       block_id = free_blocks_.back();
       free_blocks_.pop_back();
     }
-    for (uint32_t i = 0; i < static_cast<uint32_t>(doc_ids.size()); ++i) {
-      locations_[doc_ids[static_cast<size_t>(i)]] = Location{block_id, i};
+    for (uint32_t i = 0; i < row_count; ++i) {
+      locations_[block.ids[static_cast<size_t>(i)]] = Location{block_id, i};
     }
     if (block_id == blocks_.size()) {
       blocks_.push_back(std::move(block));
@@ -406,6 +639,36 @@ class WhitenedVectorCache final : public VectorAccessor {
       blocks_[block_id] = std::move(block);
     }
     return Status::OK();
+  }
+
+  std::vector<ann::eval_memory::MemoryComponent> EstimateMemoryComponents(
+      const std::string& prefix) const {
+    uint64_t block_container = static_cast<uint64_t>(blocks_.capacity()) *
+                               static_cast<uint64_t>(sizeof(Block));
+    uint64_t ids_bytes = 0;
+    uint64_t data_bytes = 0;
+    uint64_t norms_bytes = 0;
+    for (const Block& block : blocks_) {
+      ids_bytes += ann::eval_memory::StdVectorBytes(block.ids);
+      data_bytes += ann::eval_memory::MatrixBytes(block.data);
+      norms_bytes += ann::eval_memory::VectorBytes(block.norms);
+    }
+    const uint64_t free_bytes = ann::eval_memory::StdVectorBytes(free_blocks_);
+    const uint64_t location_bytes =
+        static_cast<uint64_t>(locations_.bucket_count()) * static_cast<uint64_t>(sizeof(void*)) +
+        static_cast<uint64_t>(locations_.size()) *
+            static_cast<uint64_t>(sizeof(DocId) + sizeof(Location) + 2 * sizeof(void*));
+    std::vector<ann::eval_memory::MemoryComponent> components;
+    components.push_back({prefix + ".blocks", block_container});
+    components.push_back({prefix + ".ids", ids_bytes});
+    components.push_back({prefix + ".vectors", data_bytes});
+    components.push_back({prefix + ".norms", norms_bytes});
+    components.push_back({prefix + ".free_blocks", free_bytes});
+    components.push_back({prefix + ".locations", location_bytes});
+    components.push_back({prefix + ".total",
+                          block_container + ids_bytes + data_bytes + norms_bytes +
+                              free_bytes + location_bytes});
+    return components;
   }
 
   Status RemoveDocIds(const std::vector<DocId>& doc_ids) {
@@ -3221,6 +3484,41 @@ int main(int argc, char** argv) {
             << ", stream_batch_size=" << insert_step
             << ", streaming_mode=" << config.streaming_mode << std::endl;
 
+  std::string config_name = std::filesystem::path(config_path).stem().string();
+  std::string dataset_name = dataset_label;
+  std::string metric_name = "default";
+  if (base_dataset_path) {
+    std::filesystem::path p(*base_dataset_path);
+    std::vector<std::string> parts;
+    for (const auto& part : p) {
+      parts.push_back(part.string());
+    }
+
+    for (size_t i = 0; i < parts.size(); ++i) {
+      if (parts[i] == "data" && i + 2 < parts.size()) {
+        dataset_name = parts[i + 1];
+
+        std::string metric;
+        for (size_t j = i + 2; j + 1 < parts.size(); ++j) {
+          if (!metric.empty()) metric += "_";
+          metric += parts[j];
+        }
+        if (!metric.empty()) metric_name = metric;
+        break;
+      }
+    }
+  }
+
+  std::filesystem::path results_dir =
+      std::filesystem::path("result") / dataset_name / metric_name / config_name;
+  std::error_code ec;
+  std::filesystem::create_directories(results_dir, ec);
+  const std::filesystem::path memory_trace_path = results_dir / "memory_trace.json";
+  std::cout << "[INFO] Memory trace will be written to " << memory_trace_path << std::endl;
+  const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+
   SearchParams params;
   params.topk = config.topk;
   params.nprobe = config.nprobe;
@@ -3245,6 +3543,44 @@ int main(int argc, char** argv) {
   vector_cache.Reserve(static_cast<size_t>(main_max_rows) + static_cast<size_t>(delta_train_rows) * 2 + 1024);
   uint32_t main_rows_current = main_rows_initial;
   uint32_t next_insert_idx = stream_start_idx;
+  std::deque<DocId> main_window_doc_ids;
+  std::optional<DeltaShard> active_delta;
+  std::optional<DeltaShard> frozen_delta;
+  std::deque<DocId> sliding_window_doc_ids;
+  ann::eval_memory::MemoryTraceRecorder memory_trace;
+
+  auto collect_memory_components = [&]() {
+    std::vector<ann::eval_memory::MemoryComponent> components;
+    components.push_back({"base.raw_resident", 0});
+    components.push_back({"query.raw", ann::eval_memory::MatrixBytes(Q)});
+    components.push_back({"query.whitened", ann::eval_memory::MatrixBytes(Q_whitened)});
+    components.push_back({"main.window_doc_ids",
+                          static_cast<uint64_t>(main_window_doc_ids.size()) *
+                              static_cast<uint64_t>(sizeof(DocId))});
+    components.push_back({"delta.sliding_window_doc_ids",
+                          static_cast<uint64_t>(sliding_window_doc_ids.size()) *
+                              static_cast<uint64_t>(sizeof(DocId))});
+    std::vector<ann::eval_memory::MemoryComponent> cache_components =
+        vector_cache.EstimateMemoryComponents("base.whitened_cache");
+    components.insert(components.end(), cache_components.begin(), cache_components.end());
+    ann::eval_memory::AddIVFMemoryComponents("main", main_ivf, main_versions, &components);
+    if (active_delta.has_value()) {
+      ann::eval_memory::AddIVFMemoryComponents(
+          "active_delta", active_delta->ivf, active_delta->versions, &components);
+    }
+    if (frozen_delta.has_value()) {
+      ann::eval_memory::AddIVFMemoryComponents(
+          "frozen_delta", frozen_delta->ivf, frozen_delta->versions, &components);
+    }
+    return components;
+  };
+
+  auto record_memory = [&](const std::string& stage,
+                           uint64_t active_rows,
+                           uint64_t transient_bytes = 0) {
+    memory_trace.Record(stage, active_rows, collect_memory_components(), transient_bytes);
+  };
+  record_memory("after_dataset_open", 0);
 
   double init_materialize_ms = 0.0;
   double init_whitening_ms = 0.0;
@@ -3255,35 +3591,50 @@ int main(int argc, char** argv) {
   double init_delta_build_ms = 0.0;
   double init_delta_add_ms = 0.0;
   double init_delta_wall_ms = 0.0;
-  Timer init_materialize_timer;
-  auto raw_main_res = base_reader.ReadRange(0, main_rows_initial);
-  if (!raw_main_res.ok()) {
-    std::cerr << raw_main_res.status().ToString() << std::endl;
+  Timer init_total_timer;
+  auto init_stats_res = ComputeMeanCovForRange(base_reader, 0, main_rows_initial);
+  if (!init_stats_res.ok()) {
+    std::cerr << init_stats_res.status().ToString() << std::endl;
     return 1;
   }
-  MatrixRM raw_main = std::move(raw_main_res.value());
-  init_materialize_ms = init_materialize_timer.ElapsedMillis();
-  Timer init_total_timer;
+  MeanCovStats init_stats = std::move(init_stats_res.value());
+  init_materialize_ms += init_stats.read_ms;
   Timer init_fit_timer;
-  auto whiten_version_res = whitening->Fit(raw_main);
+  auto whiten_version_res = whitening->FitFromMeanCov(
+      init_stats.mean, init_stats.covariance, init_stats.count);
   if (!whiten_version_res.ok()) {
     std::cerr << whiten_version_res.status().ToString() << std::endl;
     return 1;
   }
   whiten_version = whiten_version_res.value();
   init_whitening_ms = init_fit_timer.ElapsedMillis();
+  record_memory("after_initial_whitening_fit",
+                main_rows_initial,
+                ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
+  ReleaseMatrix(&init_stats.covariance);
+  init_stats.mean.resize(0);
 
-  Timer init_transform_timer;
-  auto main_whiten_res = whitening->TransformBatch(raw_main, whiten_version);
+  double init_main_transform_read_ms = 0.0;
+  double init_main_transform_ms = 0.0;
+  auto main_whiten_res = TransformRangeToWhitened(base_reader,
+                                                  0,
+                                                  main_rows_initial,
+                                                  whitening,
+                                                  whiten_version,
+                                                  config.use_cosine,
+                                                  &init_main_transform_read_ms,
+                                                  &init_main_transform_ms);
   if (!main_whiten_res.ok()) {
     std::cerr << main_whiten_res.status().ToString() << std::endl;
     return 1;
   }
   MatrixRM main_train = std::move(main_whiten_res.value());
-  if (config.use_cosine) {
-    NormalizeRowsL2(&main_train);
-  }
-  init_whitening_transform_ms += init_transform_timer.ElapsedMillis();
+  init_materialize_ms += init_main_transform_read_ms;
+  init_whitening_transform_ms += init_main_transform_ms;
+  record_memory("after_initial_base_transform",
+                main_rows_initial,
+                ann::eval_memory::MatrixBytes(main_train) +
+                    2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
   auto qb_res = whitening->TransformBatch(Q, whiten_version);
   if (!qb_res.ok()) {
     std::cerr << qb_res.status().ToString() << std::endl;
@@ -3296,14 +3647,8 @@ int main(int argc, char** argv) {
               << std::endl;
   }
 
-  std::deque<DocId> main_window_doc_ids;
   std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
   std::iota(main_ids.begin(), main_ids.end(), 0);
-  Status cache_main = vector_cache.AppendBatch(main_ids, main_train);
-  if (!cache_main.ok()) {
-    std::cerr << cache_main.ToString() << std::endl;
-    return 1;
-  }
   Timer init_main_build_timer;
   auto main_version_res = main_ivf->Build(main_train, main_ids, ivf_params, 0);
   if (!main_version_res.ok()) {
@@ -3319,13 +3664,16 @@ int main(int argc, char** argv) {
     return 1;
   }
   init_main_add_ms = init_main_add_timer.ElapsedMillis();
+  Status cache_main = vector_cache.AppendBatchOwned(std::move(main_ids), std::move(main_train));
+  if (!cache_main.ok()) {
+    std::cerr << cache_main.ToString() << std::endl;
+    return 1;
+  }
+  record_memory("after_initial_main_index", main_rows_initial);
   const double init_total_wall_ms = init_total_timer.ElapsedMillis();
   for (uint32_t i = 0; i < main_rows_initial; ++i) {
     main_window_doc_ids.push_back(i);
   }
-  std::optional<DeltaShard> active_delta;
-  std::optional<DeltaShard> frozen_delta;
-  std::deque<DocId> sliding_window_doc_ids;
   uint64_t evicted_main_rows_total = 0;
   uint32_t next_delta_shard_id = 2;
   bool pending_active_train = false;
@@ -3343,33 +3691,27 @@ int main(int argc, char** argv) {
   if (config.enable_streaming && rows_after_main > 0) {
     // Train delta with the reserved window, then preload the same window as existing delta docs.
     Timer init_delta_wall_timer;
-    Timer init_delta_materialize_timer;
-    auto raw_delta_res = base_reader.ReadRange(main_rows_initial, delta_train_rows);
-    if (!raw_delta_res.ok()) {
-      std::cerr << raw_delta_res.status().ToString() << std::endl;
-      return 1;
-    }
-    init_delta_materialize_ms = init_delta_materialize_timer.ElapsedMillis();
-    Timer init_delta_transform_timer;
-    auto delta_whiten_res = whitening->TransformBatch(raw_delta_res.value(), whiten_version);
+    double delta_transform_read_ms = 0.0;
+    double delta_transform_ms = 0.0;
+    auto delta_whiten_res = TransformRangeToWhitened(base_reader,
+                                                     main_rows_initial,
+                                                     delta_train_rows,
+                                                     whitening,
+                                                     whiten_version,
+                                                     config.use_cosine,
+                                                     &delta_transform_read_ms,
+                                                     &delta_transform_ms);
     if (!delta_whiten_res.ok()) {
       std::cerr << delta_whiten_res.status().ToString() << std::endl;
       return 1;
     }
     MatrixRM delta_train = std::move(delta_whiten_res.value());
-    if (config.use_cosine) {
-      NormalizeRowsL2(&delta_train);
-    }
-    init_whitening_transform_ms += init_delta_transform_timer.ElapsedMillis();
+    init_delta_materialize_ms = delta_transform_read_ms;
+    init_whitening_transform_ms += delta_transform_ms;
     std::vector<DocId> delta_seed_ids;
     delta_seed_ids.reserve(delta_train_rows);
     for (uint32_t i = main_rows_initial; i < stream_start_idx; ++i) {
       delta_seed_ids.push_back(i);
-    }
-    Status cache_delta = vector_cache.AppendBatch(delta_seed_ids, delta_train);
-    if (!cache_delta.ok()) {
-      std::cerr << cache_delta.ToString() << std::endl;
-      return 1;
     }
     IVFParams delta_params = ivf_params;
     delta_params.nlist = std::max(1u, delta_ivf_nlist);
@@ -3394,7 +3736,14 @@ int main(int argc, char** argv) {
     }
     init_delta_add_ms = init_delta_add_timer.ElapsedMillis();
     active_delta->rows = delta_train_rows;
+    Status cache_delta =
+        vector_cache.AppendBatchOwned(std::move(delta_seed_ids), std::move(delta_train));
+    if (!cache_delta.ok()) {
+      std::cerr << cache_delta.ToString() << std::endl;
+      return 1;
+    }
     init_delta_wall_ms = init_delta_wall_timer.ElapsedMillis();
+    record_memory("after_initial_delta_seed", stream_start_idx);
   }
 
   auto ActivatePendingDeltaFromSubsequentWindow =
@@ -3420,33 +3769,27 @@ int main(int argc, char** argv) {
     }
     Timer activation_wall_timer;
     const uint32_t train_begin = pending_active_train_begin;
-    Timer materialize_timer;
-    auto raw_delta_res = base_reader.ReadRange(train_begin, train_rows);
-    if (!raw_delta_res.ok()) {
-      return raw_delta_res.status();
-    }
-    metrics.materialize_ms = materialize_timer.ElapsedMillis();
-    Timer whitening_timer;
-    auto delta_whiten_res = whitening->TransformBatch(raw_delta_res.value(), whiten_version);
+    double transform_read_ms = 0.0;
+    double transform_ms = 0.0;
+    auto delta_whiten_res = TransformRangeToWhitened(base_reader,
+                                                     train_begin,
+                                                     train_rows,
+                                                     whitening,
+                                                     whiten_version,
+                                                     config.use_cosine,
+                                                     &transform_read_ms,
+                                                     &transform_ms);
     if (!delta_whiten_res.ok()) {
       return delta_whiten_res.status();
     }
     MatrixRM delta_train = std::move(delta_whiten_res.value());
-    if (config.use_cosine) {
-      NormalizeRowsL2(&delta_train);
-    }
-    metrics.whitening_ms = whitening_timer.ElapsedMillis();
+    metrics.materialize_ms = transform_read_ms;
+    metrics.whitening_ms = transform_ms;
     std::vector<DocId> train_doc_ids;
     train_doc_ids.reserve(train_rows);
     for (uint32_t i = train_begin; i < train_begin + train_rows; ++i) {
       train_doc_ids.push_back(i);
     }
-    Timer cache_timer;
-    Status cache_delta = vector_cache.AppendBatch(train_doc_ids, delta_train);
-    if (!cache_delta.ok()) {
-      return cache_delta;
-    }
-    metrics.cache_ms = cache_timer.ElapsedMillis();
     IVFParams delta_params = ivf_params;
     delta_params.nlist = std::max(1u, delta_ivf_nlist);
     delta_params.kmeans_iterations = kDeltaKMeansIterationsDefault;
@@ -3469,6 +3812,13 @@ int main(int argc, char** argv) {
     }
     metrics.insert_ms = insert_timer.ElapsedMillis();
     shard.rows = train_rows;
+    Timer cache_timer;
+    Status cache_delta =
+        vector_cache.AppendBatchOwned(std::move(train_doc_ids), std::move(delta_train));
+    if (!cache_delta.ok()) {
+      return cache_delta;
+    }
+    metrics.cache_ms = cache_timer.ElapsedMillis();
     active_delta = std::move(shard);
     pending_active_train = false;
     pending_active_train_begin = 0;
@@ -3476,6 +3826,7 @@ int main(int argc, char** argv) {
     for (uint32_t i = train_begin; i < train_begin + train_rows; ++i) {
       sliding_window_doc_ids.push_back(i);
     }
+    record_memory("activate_delta", train_begin + train_rows);
     std::cout << "[MERGE] activate_delta shard=" << active_delta->shard_id
               << ", warmup_rows=" << train_rows << std::endl;
     metrics.wall_ms = activation_wall_timer.ElapsedMillis();
@@ -3520,6 +3871,7 @@ int main(int argc, char** argv) {
               << ", imbalance_ratio=" << (trigger_info != nullptr ? trigger_info->imbalance_value : 0.0)
               << ", start background-style merge window training from row="
               << pending_active_train_begin << std::endl;
+    record_memory("freeze_delta", end_row);
     return Status::OK();
   };
   const double init_rebuild_ms = init_whitening_ms + init_whitening_transform_ms +
@@ -3887,21 +4239,26 @@ int main(int argc, char** argv) {
     whitening_fit_ids.erase(std::unique(whitening_fit_ids.begin(), whitening_fit_ids.end()),
                             whitening_fit_ids.end());
 
-    Timer fit_materialize_timer;
-    auto raw_fit_res = base_reader.ReadDocIds(whitening_fit_ids);
-    if (!raw_fit_res.ok()) {
-      return raw_fit_res.status();
+    auto fit_stats_res = ComputeMeanCovForDocIds(base_reader, whitening_fit_ids);
+    if (!fit_stats_res.ok()) {
+      return fit_stats_res.status();
     }
-    MatrixRM whitening_fit_rows = std::move(raw_fit_res.value());
-    const double fit_materialize_ms = fit_materialize_timer.ElapsedMillis();
+    MeanCovStats fit_stats = std::move(fit_stats_res.value());
+    const double fit_materialize_ms = fit_stats.read_ms;
 
     Timer fit_timer;
-    auto new_whiten_res = whitening->Fit(whitening_fit_rows);
+    auto new_whiten_res =
+        whitening->FitFromMeanCov(fit_stats.mean, fit_stats.covariance, fit_stats.count);
     if (!new_whiten_res.ok()) {
       return new_whiten_res.status();
     }
     const VersionId new_whiten_version = new_whiten_res.value();
     const double whitening_ms = fit_timer.ElapsedMillis();
+    ReleaseMatrix(&fit_stats.covariance);
+    fit_stats.mean.resize(0);
+    record_memory("global_rebuild_after_fit",
+                  seen_rows,
+                  ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
 
     Timer query_transform_timer;
     auto qb_res = whitening->TransformBatch(Q, new_whiten_version);
@@ -3920,43 +4277,24 @@ int main(int argc, char** argv) {
     double transform_materialize_ms = 0.0;
     double whitening_transform_ms = 0.0;
     double cache_ms = 0.0;
-    auto transform_doc_ids = [&](const std::vector<DocId>& doc_ids,
-                                 MatrixRM* out) -> Status {
-      Timer materialize_timer;
-      auto raw_res = base_reader.ReadDocIds(doc_ids);
-      if (!raw_res.ok()) {
-        return raw_res.status();
-      }
-      transform_materialize_ms += materialize_timer.ElapsedMillis();
-      Timer whitening_transform_timer;
-      auto w_res = whitening->TransformBatch(raw_res.value(), new_whiten_version);
-      if (!w_res.ok()) {
-        return w_res.status();
-      }
-      MatrixRM whitened = std::move(w_res.value());
-      if (config.use_cosine) {
-        NormalizeRowsL2(&whitened);
-      }
-      whitening_transform_ms += whitening_transform_timer.ElapsedMillis();
-      Timer cache_timer;
-      Status cache_status = rebuilt_cache.AppendBatch(doc_ids, whitened);
-      if (!cache_status.ok()) {
-        return cache_status;
-      }
-      cache_ms += cache_timer.ElapsedMillis();
-      if (out != nullptr) {
-        *out = std::move(whitened);
-      }
-      return Status::OK();
+    auto transform_doc_ids = [&](const std::vector<DocId>& doc_ids) -> Result<MatrixRM> {
+      return TransformDocIdsToWhitened(base_reader,
+                                       doc_ids,
+                                       whitening,
+                                       new_whiten_version,
+                                       config.use_cosine,
+                                       &transform_materialize_ms,
+                                       &whitening_transform_ms);
     };
 
     Timer main_materialize_timer;
-    MatrixRM main_train;
-    Status main_transform = transform_doc_ids(main_ids, &main_train);
-    if (!main_transform.ok()) {
-      return main_transform;
+    auto main_train_res = transform_doc_ids(main_ids);
+    if (!main_train_res.ok()) {
+      return main_train_res.status();
     }
+    MatrixRM main_train = std::move(main_train_res.value());
     const double main_materialize_ms = main_materialize_timer.ElapsedMillis();
+    const size_t main_id_count = main_ids.size();
 
     auto rebuilt_main_ivf = CreateIVFIndex();
     Timer main_build_timer;
@@ -3973,10 +4311,17 @@ int main(int argc, char** argv) {
       return main_add;
     }
     const double main_add_ms = main_add_timer.ElapsedMillis();
+    Timer main_cache_timer;
+    Status main_cache =
+        rebuilt_cache.AppendBatchOwned(std::move(main_ids), std::move(main_train));
+    if (!main_cache.ok()) {
+      return main_cache;
+    }
+    cache_ms += main_cache_timer.ElapsedMillis();
     IndexRebuildResult main_rebuild;
     main_rebuild.ivf = std::move(rebuilt_main_ivf);
     main_rebuild.versions = rebuilt_main_versions;
-    main_rebuild.rows = static_cast<uint32_t>(main_ids.size());
+    main_rebuild.rows = static_cast<uint32_t>(main_id_count);
     main_rebuild.materialize_ms = main_materialize_ms;
     main_rebuild.build_ms = main_build_ms;
     main_rebuild.add_ms = main_add_ms;
@@ -3994,11 +4339,12 @@ int main(int argc, char** argv) {
     double delta_seed_ms = 0.0;
     if (!active_doc_ids.empty()) {
       Timer delta_timer;
-      MatrixRM active_train;
-      Status active_transform = transform_doc_ids(active_doc_ids, &active_train);
-      if (!active_transform.ok()) {
-        return active_transform;
+      auto active_train_res = transform_doc_ids(active_doc_ids);
+      if (!active_train_res.ok()) {
+        return active_train_res.status();
       }
+      MatrixRM active_train = std::move(active_train_res.value());
+      const uint32_t active_rows = static_cast<uint32_t>(active_doc_ids.size());
       auto active_res = BuildDeltaShard(active_train,
                                         delta_params,
                                         new_whiten_version,
@@ -4015,21 +4361,29 @@ int main(int argc, char** argv) {
       if (!active_add.ok()) {
         return active_add;
       }
-      rebuilt_active_delta->rows = static_cast<uint32_t>(active_doc_ids.size());
+      rebuilt_active_delta->rows = active_rows;
       for (DocId doc_id : active_doc_ids) {
         rebuilt_sliding_window_doc_ids.push_back(doc_id);
       }
+      Timer cache_timer;
+      Status cache_status =
+          rebuilt_cache.AppendBatchOwned(std::move(active_doc_ids), std::move(active_train));
+      if (!cache_status.ok()) {
+        return cache_status;
+      }
+      cache_ms += cache_timer.ElapsedMillis();
       rebuilt_pending_active_train = false;
       rebuilt_pending_active_train_begin = 0;
       delta_seed_ms += delta_timer.ElapsedMillis();
     }
     if (!frozen_doc_ids.empty()) {
       Timer delta_timer;
-      MatrixRM frozen_train;
-      Status frozen_transform = transform_doc_ids(frozen_doc_ids, &frozen_train);
-      if (!frozen_transform.ok()) {
-        return frozen_transform;
+      auto frozen_train_res = transform_doc_ids(frozen_doc_ids);
+      if (!frozen_train_res.ok()) {
+        return frozen_train_res.status();
       }
+      MatrixRM frozen_train = std::move(frozen_train_res.value());
+      const uint32_t frozen_rows = static_cast<uint32_t>(frozen_doc_ids.size());
       auto frozen_res = BuildDeltaShard(frozen_train,
                                         delta_params,
                                         new_whiten_version,
@@ -4046,7 +4400,14 @@ int main(int argc, char** argv) {
       if (!frozen_add.ok()) {
         return frozen_add;
       }
-      rebuilt_frozen_delta->rows = static_cast<uint32_t>(frozen_doc_ids.size());
+      rebuilt_frozen_delta->rows = frozen_rows;
+      Timer cache_timer;
+      Status cache_status =
+          rebuilt_cache.AppendBatchOwned(std::move(frozen_doc_ids), std::move(frozen_train));
+      if (!cache_status.ok()) {
+        return cache_status;
+      }
+      cache_ms += cache_timer.ElapsedMillis();
       delta_seed_ms += delta_timer.ElapsedMillis();
     }
 
@@ -4062,6 +4423,7 @@ int main(int argc, char** argv) {
     pending_active_train_begin = rebuilt_pending_active_train_begin;
     sliding_window_doc_ids = std::move(rebuilt_sliding_window_doc_ids);
     last_online_pq_stats = OnlinePQUpdateStats{};
+    record_memory("global_rebuild_done", seen_rows);
 
     const double wall_total_ms = total_timer.ElapsedMillis();
     const double total_ms =
@@ -4153,41 +4515,6 @@ int main(int argc, char** argv) {
               << ", total_ms=" << total_ms << std::endl;
     return Status::OK();
   };
-
-  std::string config_name = std::filesystem::path(config_path).stem().string();
-
-  std::string dataset_name = dataset_label;
-  std::string metric_name = "default";
-  
-  if (base_dataset_path) {
-    std::filesystem::path p(*base_dataset_path);
-    std::vector<std::string> parts;
-    for (const auto& part : p) {
-      parts.push_back(part.string());
-    }
-  
-    for (size_t i = 0; i < parts.size(); ++i) {
-      if (parts[i] == "data" && i + 2 < parts.size()) {
-        dataset_name = parts[i + 1];
-  
-        std::string metric;
-        for (size_t j = i + 2; j + 1 < parts.size(); ++j) {
-          if (!metric.empty()) metric += "_";
-          metric += parts[j];
-        }
-        if (!metric.empty()) metric_name = metric;
-        break;
-      }
-    }
-  }
-  
-  std::filesystem::path results_dir =
-      std::filesystem::path("result") / dataset_name / metric_name / config_name;
-  std::error_code ec;
-  std::filesystem::create_directories(results_dir, ec);
-  const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
-                      std::chrono::system_clock::now().time_since_epoch())
-                      .count();
 
   progress_ts = static_cast<uint64_t>(ts);
   const std::filesystem::path progress_path = results_dir / "online_eval.progress.jsonl";
@@ -4437,6 +4764,7 @@ int main(int argc, char** argv) {
          << "}";
     write_progress_jsonl(line.str());
     snapshots.push_back(std::move(snap));
+    record_memory("snapshot", active_rows);
     last_snapshot_active_rows = active_rows;
     return Status::OK();
   };
@@ -4527,29 +4855,23 @@ int main(int argc, char** argv) {
         for (uint32_t i = begin; i < end; ++i) {
           insert_doc_ids.push_back(i);
         }
-        Timer materialize_timer;
-        auto raw_batch_res = base_reader.ReadRange(begin, chunk);
-        if (!raw_batch_res.ok()) {
-          std::cerr << raw_batch_res.status().ToString() << std::endl;
-          return 1;
-        }
-        step_materialize_ms = materialize_timer.ElapsedMillis();
-        Timer whitening_timer;
-        auto whiten_batch_res = whitening->TransformBatch(raw_batch_res.value(), whiten_version);
+        double transform_read_ms = 0.0;
+        double transform_ms = 0.0;
+        auto whiten_batch_res = TransformRangeToWhitened(base_reader,
+                                                         begin,
+                                                         chunk,
+                                                         whitening,
+                                                         whiten_version,
+                                                         config.use_cosine,
+                                                         &transform_read_ms,
+                                                         &transform_ms);
         if (!whiten_batch_res.ok()) {
           std::cerr << whiten_batch_res.status().ToString() << std::endl;
           return 1;
         }
         MatrixRM insert_whitened = std::move(whiten_batch_res.value());
-        if (config.use_cosine) {
-          NormalizeRowsL2(&insert_whitened);
-        }
-        Status cache_insert = vector_cache.AppendBatch(insert_doc_ids, insert_whitened);
-        if (!cache_insert.ok()) {
-          std::cerr << cache_insert.ToString() << std::endl;
-          return 1;
-        }
-        step_whitening_ms = whitening_timer.ElapsedMillis();
+        step_materialize_ms = transform_read_ms;
+        step_whitening_ms = transform_ms;
 
         Result<OnlinePQUpdateStats> add_res = OnlinePQUpdateStats{};
         if (use_sliding_window) {
@@ -4596,6 +4918,12 @@ int main(int argc, char** argv) {
         }
         online_pq_rollup.updated_subspaces += last_online_pq_stats.updated_subspaces;
         online_pq_rollup.updated_codewords += last_online_pq_stats.updated_codewords;
+        Status cache_insert =
+            vector_cache.AppendBatchOwned(std::move(insert_doc_ids), std::move(insert_whitened));
+        if (!cache_insert.ok()) {
+          std::cerr << cache_insert.ToString() << std::endl;
+          return 1;
+        }
         if (use_sliding_window) {
           const uint32_t deleted_rows = static_cast<uint32_t>(delete_doc_ids.size());
           if (!delete_doc_ids.empty()) {
@@ -5046,6 +5374,7 @@ int main(int argc, char** argv) {
 
         frozen_delta.reset();
         frozen_trigger_decision.reset();
+        record_memory("merge_commit_done", next_insert_idx);
         snapshot_state_changed = true;
       }
 
@@ -5395,6 +5724,24 @@ int main(int argc, char** argv) {
 
   const bool debug_output_enabled =
       config.enable_miss_diag || config.enable_rerank_source_diag || config.enable_latency_debug;
+  auto write_memory_trace = [&]() -> Status {
+    record_memory("final", std::min<uint32_t>(next_insert_idx, nx));
+    const std::vector<ann::eval_memory::MemoryComponent> metadata = {
+        {"base_rows", nx},
+        {"base_dim", config.dim},
+        {"base_raw_full_dataset_bytes",
+         ann::eval_memory::MatrixActiveBytes(nx, config.dim)},
+        {"query_rows", static_cast<uint64_t>(Q.rows())},
+        {"query_dim", static_cast<uint64_t>(Q.cols())},
+        {"main_index_rows_initial", main_rows_initial},
+        {"main_max_rows", main_max_rows},
+        {"delta_train_rows", delta_train_rows},
+        {"stream_start_row", stream_start_idx},
+        {"stream_rows", total_stream_rows},
+        {"memory_block_rows", kAddBlockRows},
+        {"raw_base_is_resident", 0}};
+    return memory_trace.WriteJson(memory_trace_path.string(), metadata);
+  };
   if (!debug_output_enabled) {
     ofs << "{\n";
     ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
@@ -5613,7 +5960,13 @@ int main(int argc, char** argv) {
     ofs << "  ]\n";
     ofs << "}\n";
 
+    Status memory_status = write_memory_trace();
+    if (!memory_status.ok()) {
+      std::cerr << memory_status.ToString() << std::endl;
+      return 1;
+    }
     std::cout << "Saved metrics to " << result_path << std::endl;
+    std::cout << "Saved memory trace to " << memory_trace_path << std::endl;
     return 0;
   }
 
@@ -6269,6 +6622,12 @@ int main(int argc, char** argv) {
   ofs << "  ]\n";
   ofs << "}\n";
 
+  Status memory_status = write_memory_trace();
+  if (!memory_status.ok()) {
+    std::cerr << memory_status.ToString() << std::endl;
+    return 1;
+  }
   std::cout << "Saved metrics to " << result_path << std::endl;
+  std::cout << "Saved memory trace to " << memory_trace_path << std::endl;
   return 0;
 }

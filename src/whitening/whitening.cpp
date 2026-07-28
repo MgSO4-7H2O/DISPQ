@@ -45,6 +45,38 @@ class ZCAWhiteningModel : public WhiteningModel {
     return version;
   }
 
+  Result<VersionId> FitFromMeanCov(Eigen::Ref<const Eigen::VectorXf> mean,
+                                   Eigen::Ref<const MatrixRM> covariance,
+                                   uint64_t sample_count) override {
+    if (sample_count == 0 || mean.size() == 0 || covariance.rows() == 0 ||
+        covariance.cols() == 0) {
+      return Status::InvalidArgument("FitFromMeanCov requires non-empty statistics");
+    }
+    if (covariance.rows() != covariance.cols() || covariance.rows() != mean.size()) {
+      return Status::InvalidArgument("FitFromMeanCov dimension mismatch");
+    }
+
+    VersionPayload payload;
+    payload.dim = static_cast<uint32_t>(mean.size());
+    payload.epsilon = kDefaultEpsilon;
+    payload.mean = mean;
+    auto status = ComputePayloadFromCov(covariance, &payload);
+    if (!status.ok()) {
+      return status;
+    }
+    std::cout << "[Whitening] dim=" << payload.dim
+              << " samples=" << sample_count
+              << " fitted_from_mean_cov=true" << std::endl;
+
+    std::unique_lock lock(mu_);
+    VersionId version = next_version_++;
+    payload.version = version;
+    versions_[version] = std::move(payload);
+    dim_ = versions_[version].dim;
+    ResetPending();
+    return version;
+  }
+
   Result<void> Transform(Eigen::Ref<const Eigen::VectorXf> x,
                          VersionId version,
                          Eigen::Ref<Eigen::VectorXf> out_xw) const override {

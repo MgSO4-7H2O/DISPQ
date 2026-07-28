@@ -92,6 +92,24 @@ struct PQRuntimeState {
   uint64_t ntotal{0};
 };
 
+struct IVFMemoryUsage {
+  uint64_t total_bytes{0};
+  uint64_t routing_centroids_bytes{0};
+  uint64_t routing_centroid_norms_bytes{0};
+  uint64_t pq_codebooks_bytes{0};
+  uint64_t pq_codebooks_soa_bytes{0};
+  uint64_t pq_counts_bytes{0};
+  uint64_t pq_precomputed_table_bytes{0};
+  uint64_t list_entries_bytes{0};
+  uint64_t list_vectors_bytes{0};
+  uint64_t list_pq_codes_bytes{0};
+  uint64_t compact_doc_ids_bytes{0};
+  uint64_t compact_pq_codes_bytes{0};
+  uint64_t soa_pq_codes_bytes{0};
+  uint64_t doc_locations_bytes{0};
+  uint64_t container_overhead_bytes{0};
+};
+
 struct PartitionPatch {
   std::vector<uint32_t> partition_ids;
   std::vector<AlignedVector<VectorRecord>> replacement_records;
@@ -167,6 +185,8 @@ class IVFIndex {
       const VersionSet& route_versions,
       uint32_t partition_id) const = 0;
   virtual Result<std::vector<uint32_t>> GetPartitionSizes(
+      const VersionSet& route_versions) const = 0;
+  virtual Result<IVFMemoryUsage> EstimateMemoryUsage(
       const VersionSet& route_versions) const = 0;
   virtual Status CommitPartitionPatch(const VersionSet& route_versions,
                                       const PartitionPatch& patch) = 0;
