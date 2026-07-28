@@ -20,6 +20,10 @@
 
 #include <Eigen/Dense>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -45,6 +49,16 @@ constexpr uint32_t kAddBlockRows = 65536;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
 constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
+
+void TrimAllocatorRetainedMemory(const char* stage) {
+#ifdef __GLIBC__
+  const int released = malloc_trim(0);
+  std::cout << "[MALLOC_TRIM] stage=" << stage
+            << ", released=" << released << std::endl;
+#else
+  (void)stage;
+#endif
+}
 
 struct DistributionStats {
   double avg{0.0};
@@ -4423,6 +4437,7 @@ int main(int argc, char** argv) {
     pending_active_train_begin = rebuilt_pending_active_train_begin;
     sliding_window_doc_ids = std::move(rebuilt_sliding_window_doc_ids);
     last_online_pq_stats = OnlinePQUpdateStats{};
+    TrimAllocatorRetainedMemory("global_rebuild_done");
     record_memory("global_rebuild_done", seen_rows);
 
     const double wall_total_ms = total_timer.ElapsedMillis();
@@ -5374,6 +5389,7 @@ int main(int argc, char** argv) {
 
         frozen_delta.reset();
         frozen_trigger_decision.reset();
+        TrimAllocatorRetainedMemory("merge_commit_done");
         record_memory("merge_commit_done", next_insert_idx);
         snapshot_state_changed = true;
       }
@@ -5725,6 +5741,7 @@ int main(int argc, char** argv) {
   const bool debug_output_enabled =
       config.enable_miss_diag || config.enable_rerank_source_diag || config.enable_latency_debug;
   auto write_memory_trace = [&]() -> Status {
+    TrimAllocatorRetainedMemory("final");
     record_memory("final", std::min<uint32_t>(next_insert_idx, nx));
     const std::vector<ann::eval_memory::MemoryComponent> metadata = {
         {"base_rows", nx},
