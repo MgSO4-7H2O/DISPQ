@@ -10,6 +10,8 @@
 
 namespace ann {
 
+class VectorAccessor;
+
 struct PQParams {
   bool enable{false};
   uint32_t M{0};
@@ -115,6 +117,34 @@ struct PartitionPatch {
   std::vector<AlignedVector<VectorRecord>> replacement_records;
 };
 
+struct CompactRecord {
+  DocId doc_id{0};
+  VersionSet versions{};
+};
+
+struct CompactPartitionPatch {
+  std::vector<uint32_t> partition_ids;
+  std::vector<std::vector<CompactRecord>> replacement_records;
+};
+
+struct CompactPatchCommitProfiling {
+  double commit_total_us{0.0};
+  double commit_validation_us{0.0};
+  double commit_reuse_classify_us{0.0};
+  double commit_materialize_us{0.0};
+  uint64_t commit_materialized_rows{0};
+  uint64_t commit_materialized_bytes{0};
+  uint64_t commit_materialize_batches{0};
+  uint32_t commit_max_materialize_rows{0};
+  double commit_pq_encode_us{0.0};
+  uint64_t pq_codes_reused{0};
+  uint64_t pq_codes_reencoded{0};
+  double commit_apply_us{0.0};
+  double pq_list_flatten_us{0.0};
+  double docmap_rebuild_us{0.0};
+  double commit_lock_hold_us{0.0};
+};
+
 class IVFIndex {
  public:
   virtual ~IVFIndex() = default;
@@ -190,6 +220,11 @@ class IVFIndex {
       const VersionSet& route_versions) const = 0;
   virtual Status CommitPartitionPatch(const VersionSet& route_versions,
                                       const PartitionPatch& patch) = 0;
+  virtual Status CommitCompactPartitionPatch(
+      const VersionSet& route_versions,
+      const CompactPartitionPatch& patch,
+      const VectorAccessor& vector_accessor,
+      CompactPatchCommitProfiling* profiling) = 0;
   virtual Result<double> GetLastPatchPQReencodeMs(
       const VersionSet& route_versions) const = 0;
 

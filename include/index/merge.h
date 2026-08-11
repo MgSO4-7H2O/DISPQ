@@ -16,7 +16,7 @@ struct FrozenDelta {
 };
 
 struct DeltaAssignment {
-  VectorRecord record;
+  uint32_t frozen_index{0};
   uint32_t main_partition{0};
   float residual_dist{0.0f};
 };
@@ -73,6 +73,8 @@ struct MergeProfiling {
   uint64_t pooled_records{0};
   uint64_t repartitioned_records{0};
   uint64_t patch_records{0};
+  uint64_t compact_patch_records{0};
+  uint64_t compact_patch_estimated_bytes{0};
   uint64_t assignment_distance_evaluations{0};
   uint64_t assignment_workspace_bytes{0};
   uint32_t assignment_chunk_records{0};
@@ -88,8 +90,28 @@ struct MergeProfiling {
   double fetch_main_records_us{0.0};
   double repartition_us{0.0};
   double patch_prepare_us{0.0};
+  double prepare_total_us{0.0};
+  double prepare_fetch_us{0.0};
+  double prepare_distance_us{0.0};
+  double prepare_balance_us{0.0};
+  double compact_emit_us{0.0};
   double commit_us{0.0};
   double pq_code_assignment_us{0.0};
+  double commit_total_us{0.0};
+  double commit_validation_us{0.0};
+  double commit_reuse_classify_us{0.0};
+  double commit_materialize_us{0.0};
+  uint64_t commit_materialized_rows{0};
+  uint64_t commit_materialized_bytes{0};
+  uint64_t commit_materialize_batches{0};
+  uint32_t commit_max_materialize_rows{0};
+  double commit_pq_encode_us{0.0};
+  uint64_t pq_codes_reused{0};
+  uint64_t pq_codes_reencoded{0};
+  double commit_apply_us{0.0};
+  double pq_list_flatten_us{0.0};
+  double docmap_rebuild_us{0.0};
+  double commit_lock_hold_us{0.0};
 };
 
 struct MergeReport {
@@ -137,23 +159,27 @@ Result<PartitionScoreResult> score_partitions(const std::vector<PartitionStats>&
 Result<AlignedVector<VectorRecord>> merge_partition_append(
     uint32_t partition_id,
     const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
     const AlignedVector<DeltaAssignment>& delta_partition_records);
 
 Result<AlignedVector<VectorRecord>> merge_partition_recluster(
     uint32_t partition_id,
     const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
     const AlignedVector<DeltaAssignment>& delta_partition_records,
     const MergeOptions& options);
 
 Result<PartitionPatch> prepare_partition_patch(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MergeOptions& options);
 Result<PartitionPatch> prepare_partition_patch(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM& base_vectors,

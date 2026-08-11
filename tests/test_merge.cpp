@@ -269,7 +269,7 @@ int main() {
   std::unordered_map<DocId, uint32_t> assigned_part;
   for (uint32_t p = 0; p < static_cast<uint32_t>(assignments.size()); ++p) {
     for (const auto& item : assignments[static_cast<size_t>(p)]) {
-      assigned_part[item.record.doc_id] = p;
+      assigned_part[frozen.records[static_cast<size_t>(item.frozen_index)].doc_id] = p;
     }
   }
   assert(assigned_part[100] == 0);
@@ -296,7 +296,7 @@ int main() {
   // 3) append merge path.
   auto p0_main_records =
       MakePartitionRecordsFromStore(fx.main_ivf, fx.main_versions, 0, fx.vector_store);
-  auto append_res = merge_partition_append(0, p0_main_records, assignments[0]);
+  auto append_res = merge_partition_append(0, p0_main_records, frozen, assignments[0]);
   assert(append_res.ok());
   assert(append_res.value().size() == p0_main_records.size() + assignments[0].size());
   {
@@ -318,7 +318,8 @@ int main() {
   options.recluster_threshold = 1.0;
   options.local_recluster_k = 2;
   options.local_kmeans_iterations = 5;
-  auto recluster_res = merge_partition_recluster(1, p1_main_records, assignments[1], options);
+  auto recluster_res =
+      merge_partition_recluster(1, p1_main_records, frozen, assignments[1], options);
   assert(recluster_res.ok());
   assert(recluster_res.value().size() == p1_main_records.size() + assignments[1].size());
   {
@@ -337,7 +338,7 @@ int main() {
 
   auto patch_res =
       prepare_partition_patch(
-          fx.main_ivf, fx.main_versions, assignments, score, fx.vector_store, options);
+          fx.main_ivf, fx.main_versions, frozen, assignments, score, fx.vector_store, options);
   assert(patch_res.ok());
   assert(patch_res.value().partition_ids.size() == 3);
   {

@@ -20,6 +20,7 @@
 #endif
 
 #include "common/timer.h"
+#include "common/vector_accessor.h"
 #include "soa_kernels.h"
 
 namespace ann {
@@ -30,6 +31,7 @@ constexpr uint32_t kDefaultSeed = 42;
 constexpr double kDefaultNQEEps = 1e-6;
 constexpr size_t kPrecomputedTableMaxBytes = (static_cast<size_t>(2) << 30);  // 2GB
 constexpr size_t kKMeansPartialMaxBytes = static_cast<size_t>(256) << 20;
+constexpr size_t kCommitMaterializeChunkRows = 65536;
 constexpr uint32_t kInvalidListId = std::numeric_limits<uint32_t>::max();
 
 struct DocLocation {
@@ -161,6 +163,7 @@ struct IndexData {
   bool use_precomputed_table{false};
   std::vector<float> pq_precomputed_table;
   std::vector<std::vector<uint64_t>> pq_counts;
+  bool pq_code_reuse_safe{true};
   double nqe_baseline{0.0};
   double nqe_ema{0.0};
   bool defer_pq_stats_to_add{false};
@@ -1832,6 +1835,7 @@ class KMeansIVFIndex : public IVFIndex {
       stats.updated_codebook = stats.updated_codewords > 0;
       stats.codebook_drift_l2 = std::sqrt(drift_sq);
       if (stats.updated_codebook) {
+        data.pq_code_reuse_safe = false;
         RebuildPQSoACache(&data);
         BuildPrecomputedTable(&data);
       }
@@ -2247,6 +2251,293 @@ class KMeansIVFIndex : public IVFIndex {
     }
     data.last_patch_pq_reencode_ms = pq_reencode_ms;
     return Status::OK();
+  }
+
+  Status CommitCompactPartitionPatch(
+      const VersionSet& route_versions,
+      const CompactPartitionPatch& patch,
+      const VectorAccessor& vector_accessor,
+      CompactPatchCommitProfiling* profiling) override {
+    CompactPatchCommitProfiling local_profile;
+    Timer commit_total_timer;
+    if (patch.partition_ids.size() != patch.replacement_records.size()) {
+      local_profile.commit_total_us = commit_total_timer.ElapsedMicros();
+      if (profiling != nullptr) {
+        *profiling = local_profile;
+      }
+      return Status::InvalidArgument(
+          "CommitCompactPartitionPatch: partition_ids size mismatch with "
+          "replacement_records");
+    }
+
+    std::unique_lock lock(mu_);
+    Timer lock_hold_timer;
+    auto finish = [&](Status status) {
+      local_profile.commit_lock_hold_us = lock_hold_timer.ElapsedMicros();
+      local_profile.commit_total_us = commit_total_timer.ElapsedMicros();
+      if (profiling != nullptr) {
+        *profiling = local_profile;
+      }
+      return status;
+    };
+
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return finish(Status::NotFound("Index version not built"));
+    }
+    IndexData& data = *it->second;
+
+    std::unordered_set<uint32_t> patch_partitions;
+    std::unordered_set<DocId> patch_doc_ids;
+    size_t replacement_total = 0;
+    uint64_t old_patch_total = 0;
+    Timer validation_timer;
+    auto validate = [&]() -> Status {
+      if (!data.use_pq || data.M == 0) {
+        return Status::InvalidArgument(
+            "CommitCompactPartitionPatch: compact commit requires PQ");
+      }
+      if (!HasValidPQSubspaces(data) || data.pq_codebooks.size() != data.M) {
+        return Status::InvalidArgument(
+            "CommitCompactPartitionPatch: invalid PQ model");
+      }
+      if (vector_accessor.dim() != data.dim) {
+        return Status::InvalidArgument(
+            "CommitCompactPartitionPatch: vector accessor dim mismatch");
+      }
+      patch_partitions.reserve(patch.partition_ids.size());
+      for (uint32_t partition_id : patch.partition_ids) {
+        if (partition_id >= data.nlist) {
+          return Status::InvalidArgument(
+              "CommitCompactPartitionPatch: partition_id out of range");
+        }
+        if (!patch_partitions.insert(partition_id).second) {
+          return Status::InvalidArgument(
+              "CommitCompactPartitionPatch: duplicate partition_id");
+        }
+        old_patch_total += data.lists[static_cast<size_t>(partition_id)].size();
+      }
+      for (const auto& records : patch.replacement_records) {
+        replacement_total += records.size();
+      }
+      patch_doc_ids.reserve(replacement_total * 2 + 1);
+      for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
+        for (const CompactRecord& rec : patch.replacement_records[i]) {
+          if (!patch_doc_ids.insert(rec.doc_id).second) {
+            return Status::AlreadyExists(
+                "CommitCompactPartitionPatch: duplicate doc_id in patch");
+          }
+          DocLocation existing;
+          if (data.doc_locations.Get(rec.doc_id, &existing) &&
+              patch_partitions.find(existing.list_id) == patch_partitions.end()) {
+            return Status::AlreadyExists(
+                "CommitCompactPartitionPatch: doc_id collides with unaffected partitions");
+          }
+        }
+      }
+      if (old_patch_total > data.ntotal) {
+        return Status::Internal(
+            "CommitCompactPartitionPatch: patched rows exceed ntotal");
+      }
+      return Status::OK();
+    };
+    Status validation_status = validate();
+    local_profile.commit_validation_us = validation_timer.ElapsedMicros();
+    if (!validation_status.ok()) {
+      return finish(validation_status);
+    }
+
+    std::vector<std::vector<uint8_t>> prepared_codes(patch.partition_ids.size());
+    for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
+      prepared_codes[i].resize(patch.replacement_records[i].size() * data.M);
+    }
+
+    struct EncodeTask {
+      DocId doc_id{0};
+      uint32_t patch_index{0};
+      uint32_t record_pos{0};
+    };
+    std::vector<EncodeTask> encode_tasks;
+    encode_tasks.reserve(kCommitMaterializeChunkRows);
+    std::vector<DocId> materialize_doc_ids;
+    materialize_doc_ids.reserve(kCommitMaterializeChunkRows);
+
+    auto flush_encode_tasks = [&]() -> Status {
+      if (encode_tasks.empty()) {
+        return Status::OK();
+      }
+      materialize_doc_ids.clear();
+      for (const EncodeTask& task : encode_tasks) {
+        materialize_doc_ids.push_back(task.doc_id);
+      }
+
+      Timer materialize_timer;
+      MatrixRM rows;
+      Status materialize_status = vector_accessor.Materialize(materialize_doc_ids, &rows);
+      local_profile.commit_materialize_us += materialize_timer.ElapsedMicros();
+      if (!materialize_status.ok()) {
+        return materialize_status;
+      }
+      if (rows.rows() != static_cast<Eigen::Index>(encode_tasks.size()) ||
+          rows.cols() != static_cast<Eigen::Index>(data.dim)) {
+        return Status::InvalidArgument(
+            "CommitCompactPartitionPatch: materialized vector shape mismatch");
+      }
+      local_profile.commit_materialized_rows += encode_tasks.size();
+      local_profile.commit_materialized_bytes +=
+          static_cast<uint64_t>(encode_tasks.size()) * data.dim * sizeof(float);
+      ++local_profile.commit_materialize_batches;
+      local_profile.commit_max_materialize_rows = std::max(
+          local_profile.commit_max_materialize_rows,
+          static_cast<uint32_t>(encode_tasks.size()));
+
+      auto encode_one = [&](size_t task_idx, Eigen::VectorXf* residual) {
+        const EncodeTask& task = encode_tasks[task_idx];
+        *residual = rows.row(static_cast<Eigen::Index>(task_idx)).transpose();
+        const uint32_t partition_id =
+            patch.partition_ids[static_cast<size_t>(task.patch_index)];
+        if (data.pq_residual) {
+          *residual -=
+              data.routing_centroids.row(static_cast<Eigen::Index>(partition_id)).transpose();
+        }
+        uint8_t* code =
+            prepared_codes[static_cast<size_t>(task.patch_index)].data() +
+            static_cast<size_t>(task.record_pos) * data.M;
+        for (uint32_t m = 0; m < data.M; ++m) {
+          const MatrixRM& codebook = data.pq_codebooks[static_cast<size_t>(m)];
+          const uint32_t subdim = PQSubDim(data, m);
+          Eigen::Map<const Eigen::VectorXf> sub(
+              residual->data() + static_cast<Eigen::Index>(PQSubOffset(data, m)),
+              static_cast<Eigen::Index>(subdim));
+          const MatrixRM* codebook_soa =
+              data.pq_codebooks_soa.size() == data.M
+                  ? &data.pq_codebooks_soa[static_cast<size_t>(m)]
+                  : nullptr;
+          code[static_cast<size_t>(m)] =
+              static_cast<uint8_t>(NearestCodeword(sub, codebook, codebook_soa, nullptr));
+        }
+      };
+
+      Timer encode_timer;
+#ifdef _OPENMP
+      if (!omp_in_parallel() && encode_tasks.size() > 1) {
+#pragma omp parallel
+        {
+          Eigen::VectorXf residual(static_cast<Eigen::Index>(data.dim));
+#pragma omp for schedule(static)
+          for (int64_t task_idx = 0;
+               task_idx < static_cast<int64_t>(encode_tasks.size());
+               ++task_idx) {
+            encode_one(static_cast<size_t>(task_idx), &residual);
+          }
+        }
+      } else
+#endif
+      {
+        Eigen::VectorXf residual(static_cast<Eigen::Index>(data.dim));
+        for (size_t task_idx = 0; task_idx < encode_tasks.size(); ++task_idx) {
+          encode_one(task_idx, &residual);
+        }
+      }
+      local_profile.commit_pq_encode_us += encode_timer.ElapsedMicros();
+      local_profile.pq_codes_reencoded += encode_tasks.size();
+      encode_tasks.clear();
+      return Status::OK();
+    };
+
+    Timer reuse_timer;
+    for (size_t patch_idx = 0; patch_idx < patch.partition_ids.size(); ++patch_idx) {
+      const uint32_t partition_id = patch.partition_ids[patch_idx];
+      const auto& records = patch.replacement_records[patch_idx];
+      for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
+        const CompactRecord& rec = records[record_pos];
+        bool reused = false;
+        DocLocation existing;
+        if (data.pq_code_reuse_safe && data.doc_locations.Get(rec.doc_id, &existing) &&
+            existing.list_id == partition_id) {
+          const auto& old_list = data.lists[static_cast<size_t>(partition_id)];
+          if (existing.offset < old_list.size()) {
+            const ListEntry& old_entry = old_list[existing.offset];
+            if (old_entry.doc_id == rec.doc_id && old_entry.pq_code.size() == data.M) {
+              std::copy_n(old_entry.pq_code.data(),
+                          data.M,
+                          prepared_codes[patch_idx].data() + record_pos * data.M);
+              reused = true;
+              ++local_profile.pq_codes_reused;
+            }
+          }
+        }
+        if (!reused) {
+          encode_tasks.push_back(EncodeTask{rec.doc_id,
+                                            static_cast<uint32_t>(patch_idx),
+                                            static_cast<uint32_t>(record_pos)});
+          if (encode_tasks.size() == kCommitMaterializeChunkRows) {
+            local_profile.commit_reuse_classify_us += reuse_timer.ElapsedMicros();
+            Status flush_status = flush_encode_tasks();
+            if (!flush_status.ok()) {
+              return finish(flush_status);
+            }
+            reuse_timer.Reset();
+          }
+        }
+      }
+    }
+    local_profile.commit_reuse_classify_us += reuse_timer.ElapsedMicros();
+    Status flush_status = flush_encode_tasks();
+    if (!flush_status.ok()) {
+      return finish(flush_status);
+    }
+
+    Timer apply_timer;
+    Timer docmap_timer;
+    for (uint32_t partition_id : patch.partition_ids) {
+      const auto& old_list = data.lists[static_cast<size_t>(partition_id)];
+      for (const ListEntry& entry : old_list) {
+        data.doc_locations.Erase(entry.doc_id);
+      }
+    }
+    local_profile.docmap_rebuild_us += docmap_timer.ElapsedMicros();
+
+    for (size_t patch_idx = 0; patch_idx < patch.partition_ids.size(); ++patch_idx) {
+      const uint32_t partition_id = patch.partition_ids[patch_idx];
+      const auto& records = patch.replacement_records[patch_idx];
+      const auto& codes = prepared_codes[patch_idx];
+      AlignedVector<ListEntry> replacement(records.size());
+      for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
+        const CompactRecord& rec = records[record_pos];
+        ListEntry entry;
+        entry.doc_id = rec.doc_id;
+        entry.versions = rec.versions;
+        entry.versions.index_version = data.version;
+        const uint8_t* code = codes.data() + record_pos * data.M;
+        entry.pq_code.assign(code, code + data.M);
+        replacement[record_pos] = std::move(entry);
+      }
+      data.lists[static_cast<size_t>(partition_id)].swap(replacement);
+      Timer flatten_timer;
+      RebuildListPQCodes(&data, partition_id);
+      local_profile.pq_list_flatten_us += flatten_timer.ElapsedMicros();
+    }
+
+    docmap_timer.Reset();
+    for (uint32_t partition_id : patch.partition_ids) {
+      const auto& list = data.lists[static_cast<size_t>(partition_id)];
+      for (size_t offset = 0; offset < list.size(); ++offset) {
+        data.doc_locations.Set(
+            list[offset].doc_id,
+            DocLocation{partition_id, static_cast<uint32_t>(offset)});
+      }
+    }
+    local_profile.docmap_rebuild_us += docmap_timer.ElapsedMicros();
+
+    data.ntotal = data.ntotal - old_patch_total + replacement_total;
+    if (data.doc_locations.size() != data.ntotal) {
+      return finish(
+          Status::Internal("CommitCompactPartitionPatch: location count mismatch"));
+    }
+    data.last_patch_pq_reencode_ms = local_profile.commit_pq_encode_us / 1000.0;
+    local_profile.commit_apply_us = apply_timer.ElapsedMicros();
+    return finish(Status::OK());
   }
 
   Result<double> GetLastPatchPQReencodeMs(

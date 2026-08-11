@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,79 @@ constexpr uint32_t kAddBlockRows = 65536;
 constexpr uint32_t kWorstQueryDiagCount = 10;
 constexpr uint32_t kSlowQueryDebugCount = 5;
 constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
+
+struct DocRange {
+  DocId begin{0};
+  DocId end{0};  // Exclusive.
+};
+
+class DocRangeQueue {
+ public:
+  void Append(DocId doc_id) { AppendRange(doc_id, doc_id + 1); }
+
+  void AppendRange(DocId begin, DocId end) {
+    if (begin == end) {
+      return;
+    }
+    if (!ranges_.empty() && ranges_.back().end == begin) {
+      ranges_.back().end = end;
+    } else {
+      ranges_.push_back({begin, end});
+    }
+    size_ += static_cast<size_t>(end - begin);
+  }
+
+  void PopFront(size_t count) {
+    size_ -= count;
+    while (count > 0) {
+      DocRange& range = ranges_.front();
+      const size_t range_size = static_cast<size_t>(range.end - range.begin);
+      if (count < range_size) {
+        range.begin += static_cast<DocId>(count);
+        return;
+      }
+      count -= range_size;
+      ranges_.pop_front();
+    }
+  }
+
+  std::vector<DocId> Materialize() const { return MaterializeFront(size_); }
+
+  std::vector<DocId> MaterializeFront(size_t count) const {
+    std::vector<DocId> doc_ids;
+    doc_ids.reserve(count);
+    for (const DocRange& range : ranges_) {
+      const size_t range_size = static_cast<size_t>(range.end - range.begin);
+      const size_t take = std::min(count - doc_ids.size(), range_size);
+      for (size_t i = 0; i < take; ++i) {
+        doc_ids.push_back(range.begin + static_cast<DocId>(i));
+      }
+      if (doc_ids.size() == count) {
+        break;
+      }
+    }
+    return doc_ids;
+  }
+
+  DocId front() const { return ranges_.front().begin; }
+  DocId back() const { return ranges_.back().end - 1; }
+  size_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+
+  void clear() {
+    ranges_.clear();
+    size_ = 0;
+  }
+
+  uint64_t EstimatedMemoryBytes() const {
+    return static_cast<uint64_t>(sizeof(*this)) +
+           static_cast<uint64_t>(ranges_.size()) * sizeof(DocRange);
+  }
+
+ private:
+  std::deque<DocRange> ranges_;
+  size_t size_{0};
+};
 
 void TrimAllocatorRetainedMemory(const char* stage) {
 #ifdef __GLIBC__
@@ -261,25 +335,34 @@ void NormalizeVectorL2(Eigen::VectorXf* x) {
 }
 
 
-class FvecsRandomAccessReader {
+class VecsRandomAccessReader {
  public:
   Result<void> Open(const std::string& path) {
     path_ = path;
+    const std::string extension = std::filesystem::path(path_).extension().string();
+    if (extension == ".fvecs") {
+      value_bytes_ = sizeof(float);
+    } else if (extension == ".bvecs") {
+      value_bytes_ = sizeof(uint8_t);
+    } else {
+      return Status::InvalidArgument(
+          "VecsRandomAccessReader: expected .fvecs or .bvecs: " + path_);
+    }
     std::ifstream ifs(path_, std::ios::binary);
     if (!ifs) {
-      return Status::IOError("FvecsRandomAccessReader: cannot open " + path_);
+      return Status::IOError("VecsRandomAccessReader: cannot open " + path_);
     }
     int32_t dim_i32 = 0;
     ifs.read(reinterpret_cast<char*>(&dim_i32), sizeof(int32_t));
     if (!ifs || dim_i32 <= 0) {
-      return Status::InvalidArgument("FvecsRandomAccessReader: invalid fvecs header");
+      return Status::InvalidArgument("VecsRandomAccessReader: invalid vector header");
     }
     dim_ = static_cast<uint32_t>(dim_i32);
-    record_bytes_ = sizeof(int32_t) + static_cast<uint64_t>(dim_) * sizeof(float);
+    record_bytes_ = sizeof(int32_t) + static_cast<uint64_t>(dim_) * value_bytes_;
     std::error_code ec;
     const uint64_t file_bytes = static_cast<uint64_t>(std::filesystem::file_size(path_, ec));
     if (ec || file_bytes < record_bytes_ || file_bytes % record_bytes_ != 0) {
-      return Status::InvalidArgument("FvecsRandomAccessReader: invalid fvecs file size");
+      return Status::InvalidArgument("VecsRandomAccessReader: invalid vector file size");
     }
     count_ = static_cast<uint32_t>(file_bytes / record_bytes_);
     return Result<void>::Ok();
@@ -290,7 +373,7 @@ class FvecsRandomAccessReader {
 
   Result<MatrixRM> ReadRange(uint32_t begin, uint32_t rows) const {
     if (begin > count_ || rows > count_ - begin) {
-      return Status::InvalidArgument("FvecsRandomAccessReader::ReadRange: range out of bounds");
+      return Status::InvalidArgument("VecsRandomAccessReader::ReadRange: range out of bounds");
     }
     MatrixRM out(static_cast<Eigen::Index>(rows), dim_);
     if (rows == 0) {
@@ -298,20 +381,31 @@ class FvecsRandomAccessReader {
     }
     std::ifstream ifs(path_, std::ios::binary);
     if (!ifs) {
-      return Status::IOError("FvecsRandomAccessReader::ReadRange: cannot open " + path_);
+      return Status::IOError("VecsRandomAccessReader::ReadRange: cannot open " + path_);
     }
     ifs.seekg(static_cast<std::streamoff>(static_cast<uint64_t>(begin) * record_bytes_),
               std::ios::beg);
+    std::vector<uint8_t> bytes(value_bytes_ == sizeof(uint8_t) ? dim_ : 0u);
     for (uint32_t r = 0; r < rows; ++r) {
       int32_t dim_i32 = 0;
       ifs.read(reinterpret_cast<char*>(&dim_i32), sizeof(int32_t));
       if (!ifs || dim_i32 != static_cast<int32_t>(dim_)) {
-        return Status::InvalidArgument("FvecsRandomAccessReader::ReadRange: dim mismatch");
+        return Status::InvalidArgument("VecsRandomAccessReader::ReadRange: dim mismatch");
       }
-      ifs.read(reinterpret_cast<char*>(out.row(static_cast<Eigen::Index>(r)).data()),
-               static_cast<std::streamsize>(dim_) * static_cast<std::streamsize>(sizeof(float)));
+      if (value_bytes_ == sizeof(float)) {
+        ifs.read(reinterpret_cast<char*>(out.row(static_cast<Eigen::Index>(r)).data()),
+                 static_cast<std::streamsize>(dim_) *
+                     static_cast<std::streamsize>(sizeof(float)));
+      } else {
+        ifs.read(reinterpret_cast<char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+        for (uint32_t c = 0; c < dim_; ++c) {
+          out(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) =
+              static_cast<float>(bytes[c]);
+        }
+      }
       if (!ifs) {
-        return Status::IOError("FvecsRandomAccessReader::ReadRange: short read");
+        return Status::IOError("VecsRandomAccessReader::ReadRange: short read");
       }
     }
     return out;
@@ -326,7 +420,7 @@ class FvecsRandomAccessReader {
     order.reserve(doc_ids.size());
     for (size_t i = 0; i < doc_ids.size(); ++i) {
       if (doc_ids[i] >= count_) {
-        return Status::InvalidArgument("FvecsRandomAccessReader::ReadDocIds: doc_id out of bounds");
+        return Status::InvalidArgument("VecsRandomAccessReader::ReadDocIds: doc_id out of bounds");
       }
       order.emplace_back(doc_ids[i], i);
     }
@@ -359,8 +453,23 @@ class FvecsRandomAccessReader {
   std::string path_;
   uint32_t dim_{0};
   uint32_t count_{0};
+  uint64_t value_bytes_{0};
   uint64_t record_bytes_{0};
 };
+
+Result<std::string> ResolveVecsPath(const std::string& path_or_dir,
+                                    const std::string& role_suffix) {
+  auto fvecs = ResolveFvecsPath(path_or_dir, role_suffix + ".fvecs");
+  if (fvecs.ok()) {
+    return fvecs.value();
+  }
+  auto bvecs = ResolveFvecsPath(path_or_dir, role_suffix + ".bvecs");
+  if (bvecs.ok()) {
+    return bvecs.value();
+  }
+  return Status::NotFound("No " + role_suffix + ".fvecs or " + role_suffix +
+                          ".bvecs file found under " + path_or_dir);
+}
 
 void ReleaseMatrix(MatrixRM* matrix) {
   if (matrix == nullptr) {
@@ -421,7 +530,7 @@ class MeanCovAccumulator {
   Eigen::MatrixXd cross_;
 };
 
-Result<MeanCovStats> ComputeMeanCovForRange(const FvecsRandomAccessReader& reader,
+Result<MeanCovStats> ComputeMeanCovForRange(const VecsRandomAccessReader& reader,
                                             uint32_t begin,
                                             uint32_t rows) {
   if (begin > reader.count() || rows > reader.count() - begin) {
@@ -452,7 +561,7 @@ Result<MeanCovStats> ComputeMeanCovForRange(const FvecsRandomAccessReader& reade
   return stats;
 }
 
-Result<MeanCovStats> ComputeMeanCovForDocIds(const FvecsRandomAccessReader& reader,
+Result<MeanCovStats> ComputeMeanCovForDocIds(const VecsRandomAccessReader& reader,
                                              const std::vector<DocId>& doc_ids) {
   if (doc_ids.empty()) {
     return Status::InvalidArgument("ComputeMeanCovForDocIds: empty doc_ids");
@@ -492,7 +601,7 @@ Result<MeanCovStats> ComputeMeanCovForDocIds(const FvecsRandomAccessReader& read
   return stats;
 }
 
-Result<MatrixRM> TransformRangeToWhitened(const FvecsRandomAccessReader& reader,
+Result<MatrixRM> TransformRangeToWhitened(const VecsRandomAccessReader& reader,
                                           uint32_t begin,
                                           uint32_t rows,
                                           const std::shared_ptr<WhiteningModel>& whitening,
@@ -535,7 +644,7 @@ Result<MatrixRM> TransformRangeToWhitened(const FvecsRandomAccessReader& reader,
   return out;
 }
 
-Result<MatrixRM> TransformDocIdsToWhitened(const FvecsRandomAccessReader& reader,
+Result<MatrixRM> TransformDocIdsToWhitened(const VecsRandomAccessReader& reader,
                                            const std::vector<DocId>& doc_ids,
                                            const std::shared_ptr<WhiteningModel>& whitening,
                                            VersionId whiten_version,
@@ -602,10 +711,10 @@ class WhitenedVectorCache final : public VectorAccessor {
     dim_ = dim;
     blocks_.clear();
     free_blocks_.clear();
-    locations_.clear();
+    locations_.Clear();
   }
 
-  void Reserve(size_t rows) { locations_.reserve(rows); }
+  void Reserve(size_t rows) { locations_.Reserve(rows); }
 
   Status AppendBatch(const std::vector<DocId>& doc_ids, const MatrixRM& vectors) {
     std::vector<DocId> ids_copy = doc_ids;
@@ -629,7 +738,7 @@ class WhitenedVectorCache final : public VectorAccessor {
     std::unordered_set<DocId> batch_ids;
     batch_ids.reserve(doc_ids.size() * 2 + 1);
     for (DocId doc_id : doc_ids) {
-      if (!batch_ids.insert(doc_id).second || locations_.find(doc_id) != locations_.end()) {
+      if (!batch_ids.insert(doc_id).second || locations_.Get(doc_id, nullptr)) {
         return Status::AlreadyExists("WhitenedVectorCache::AppendBatch: duplicate doc_id");
       }
     }
@@ -645,7 +754,7 @@ class WhitenedVectorCache final : public VectorAccessor {
       free_blocks_.pop_back();
     }
     for (uint32_t i = 0; i < row_count; ++i) {
-      locations_[block.ids[static_cast<size_t>(i)]] = Location{block_id, i};
+      locations_.Set(block.ids[static_cast<size_t>(i)], Location{block_id, i});
     }
     if (block_id == blocks_.size()) {
       blocks_.push_back(std::move(block));
@@ -668,10 +777,7 @@ class WhitenedVectorCache final : public VectorAccessor {
       norms_bytes += ann::eval_memory::VectorBytes(block.norms);
     }
     const uint64_t free_bytes = ann::eval_memory::StdVectorBytes(free_blocks_);
-    const uint64_t location_bytes =
-        static_cast<uint64_t>(locations_.bucket_count()) * static_cast<uint64_t>(sizeof(void*)) +
-        static_cast<uint64_t>(locations_.size()) *
-            static_cast<uint64_t>(sizeof(DocId) + sizeof(Location) + 2 * sizeof(void*));
+    const uint64_t location_bytes = locations_.MemoryBytes();
     std::vector<ann::eval_memory::MemoryComponent> components;
     components.push_back({prefix + ".blocks", block_container});
     components.push_back({prefix + ".ids", ids_bytes});
@@ -687,11 +793,10 @@ class WhitenedVectorCache final : public VectorAccessor {
 
   Status RemoveDocIds(const std::vector<DocId>& doc_ids) {
     for (DocId doc_id : doc_ids) {
-      auto it = locations_.find(doc_id);
-      if (it == locations_.end()) {
+      Location loc;
+      if (!locations_.Get(doc_id, &loc)) {
         return Status::NotFound("WhitenedVectorCache::RemoveDocIds: missing doc_id");
       }
-      const Location loc = it->second;
       if (loc.block >= blocks_.size() || loc.row >= blocks_[loc.block].ids.size()) {
         return Status::Internal("WhitenedVectorCache::RemoveDocIds: corrupt location");
       }
@@ -709,17 +814,16 @@ class WhitenedVectorCache final : public VectorAccessor {
         block.norms.resize(0);
         free_blocks_.push_back(loc.block);
       }
-      locations_.erase(it);
+      locations_.Erase(doc_id);
     }
     return Status::OK();
   }
 
   Result<Eigen::VectorXf> GetVector(DocId doc_id) const override {
-    auto it = locations_.find(doc_id);
-    if (it == locations_.end()) {
+    Location loc;
+    if (!locations_.Get(doc_id, &loc)) {
       return Status::NotFound("WhitenedVectorCache::GetVector: missing doc_id");
     }
-    const Location loc = it->second;
     if (loc.block >= blocks_.size()) {
       return Status::Internal("WhitenedVectorCache::GetVector: corrupt block index");
     }
@@ -731,11 +835,10 @@ class WhitenedVectorCache final : public VectorAccessor {
   }
 
   Result<float> GetNorm(DocId doc_id) const override {
-    auto it = locations_.find(doc_id);
-    if (it == locations_.end()) {
+    Location loc;
+    if (!locations_.Get(doc_id, &loc)) {
       return Status::NotFound("WhitenedVectorCache::GetNorm: missing doc_id");
     }
-    const Location loc = it->second;
     if (loc.block >= blocks_.size()) {
       return Status::Internal("WhitenedVectorCache::GetNorm: corrupt block index");
     }
@@ -753,11 +856,10 @@ class WhitenedVectorCache final : public VectorAccessor {
     }
     MatrixRM rows(static_cast<Eigen::Index>(doc_ids.size()), dim_);
     for (size_t i = 0; i < doc_ids.size(); ++i) {
-      auto it = locations_.find(doc_ids[i]);
-      if (it == locations_.end()) {
+      Location loc;
+      if (!locations_.Get(doc_ids[i], &loc)) {
         return Status::NotFound("WhitenedVectorCache::Materialize: missing doc_id");
       }
-      const Location loc = it->second;
       const Block& block = blocks_[loc.block];
       if (loc.row >= block.ids.size() || block.ids[loc.row] != doc_ids[i] || block.data.rows() == 0) {
         return Status::Internal("WhitenedVectorCache::Materialize: corrupt location");
@@ -770,9 +872,90 @@ class WhitenedVectorCache final : public VectorAccessor {
 
  private:
   static constexpr DocId kDeletedDoc = std::numeric_limits<DocId>::max();
+  static constexpr uint32_t kInvalidBlock = std::numeric_limits<uint32_t>::max();
   struct Location {
-    uint32_t block{0};
+    uint32_t block{kInvalidBlock};
     uint32_t row{0};
+  };
+  class PagedLocationMap {
+   public:
+    bool Get(DocId doc_id, Location* out) const {
+      const auto it = pages_.find(doc_id >> kPageBits);
+      if (it == pages_.end()) {
+        return false;
+      }
+      const Location& location = it->second->values[doc_id & kPageMask];
+      if (location.block == kInvalidBlock) {
+        return false;
+      }
+      if (out != nullptr) {
+        *out = location;
+      }
+      return true;
+    }
+
+    void Set(DocId doc_id, Location location) {
+      auto [it, inserted] = pages_.try_emplace(doc_id >> kPageBits);
+      if (inserted) {
+        it->second = std::make_unique<Page>();
+      }
+      Page& page = *it->second;
+      Location& current = page.values[doc_id & kPageMask];
+      if (current.block == kInvalidBlock) {
+        ++page.live;
+        ++size_;
+      }
+      current = location;
+    }
+
+    void Erase(DocId doc_id) {
+      const auto it = pages_.find(doc_id >> kPageBits);
+      if (it == pages_.end()) {
+        return;
+      }
+      Page& page = *it->second;
+      Location& location = page.values[doc_id & kPageMask];
+      if (location.block == kInvalidBlock) {
+        return;
+      }
+      location = Location{};
+      --page.live;
+      --size_;
+      if (page.live == 0) {
+        pages_.erase(it);
+      }
+    }
+
+    void Clear() {
+      pages_.clear();
+      size_ = 0;
+    }
+
+    void Reserve(size_t docs) { pages_.reserve((docs + kPageSize - 1) / kPageSize); }
+
+    size_t size() const { return size_; }
+
+    uint64_t MemoryBytes() const {
+      return static_cast<uint64_t>(sizeof(*this)) +
+             static_cast<uint64_t>(pages_.bucket_count()) *
+                 static_cast<uint64_t>(sizeof(void*)) +
+             static_cast<uint64_t>(pages_.size()) *
+                 static_cast<uint64_t>(sizeof(Page) + sizeof(uint32_t) +
+                                       sizeof(std::unique_ptr<Page>) + sizeof(void*));
+    }
+
+   private:
+    static constexpr uint32_t kPageBits = 8;
+    static constexpr uint32_t kPageSize = 1u << kPageBits;
+    static constexpr uint32_t kPageMask = kPageSize - 1;
+
+    struct Page {
+      std::array<Location, kPageSize> values{};
+      uint32_t live{0};
+    };
+
+    std::unordered_map<uint32_t, std::unique_ptr<Page>> pages_;
+    size_t size_{0};
   };
   struct Block {
     std::vector<DocId> ids;
@@ -784,7 +967,7 @@ class WhitenedVectorCache final : public VectorAccessor {
   uint32_t dim_{0};
   std::vector<Block> blocks_;
   std::vector<uint32_t> free_blocks_;
-  std::unordered_map<DocId, Location> locations_;
+  PagedLocationMap locations_;
 };
 
 uint32_t ResolveMainRows(const Config& config, uint32_t total_rows) {
@@ -2157,11 +2340,16 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return Status::InvalidArgument("EvaluateState: no searchable docs");
   }
 
+  Timer exact_gt_timer;
   auto gt_res = ExactSearchDocIdsBlockwise(
       queries_whitened, base_whitened, searchable_doc_ids, config.topk);
   if (!gt_res.ok()) {
     return gt_res.status();
   }
+  std::cout << "[EXACT_GT] searchable_docs=" << searchable_doc_ids.size()
+            << ", queries=" << queries_whitened.rows()
+            << ", topk=" << config.topk
+            << ", elapsed_ms=" << exact_gt_timer.ElapsedMillis() << std::endl;
   std::vector<std::vector<DocId>> ground_truth = std::move(gt_res.value());
 
   std::vector<SearchRoute> routes;
@@ -2777,11 +2965,16 @@ Result<EvalMetrics> EvaluateStateStreaming(const Config& config,
     return Status::InvalidArgument("EvaluateState: no searchable docs");
   }
 
+  Timer exact_gt_timer;
   auto gt_res = ExactSearchDocIdsBlockwiseAccessor(
       queries_whitened, base_vectors, searchable_doc_ids, config.topk);
   if (!gt_res.ok()) {
     return gt_res.status();
   }
+  std::cout << "[EXACT_GT] searchable_docs=" << searchable_doc_ids.size()
+            << ", queries=" << queries_whitened.rows()
+            << ", topk=" << config.topk
+            << ", elapsed_ms=" << exact_gt_timer.ElapsedMillis() << std::endl;
   std::vector<std::vector<DocId>> ground_truth = std::move(gt_res.value());
 
   std::vector<SearchRoute> routes;
@@ -3344,7 +3537,7 @@ int main(int argc, char** argv) {
 
   std::optional<std::string> base_dataset_path;
   if (dataset_spec) {
-    auto resolved = ResolveFvecsPath(*dataset_spec, "_base.fvecs");
+    auto resolved = ResolveVecsPath(*dataset_spec, "_base");
     if (!resolved.ok()) {
       std::cerr << resolved.status().ToString() << std::endl;
       return 1;
@@ -3362,7 +3555,7 @@ int main(int argc, char** argv) {
 
   std::optional<std::string> query_dataset_path;
   if (query_spec) {
-    auto resolved_query = ResolveFvecsPath(*query_spec, "_query.fvecs");
+    auto resolved_query = ResolveVecsPath(*query_spec, "_query");
     if (!resolved_query.ok()) {
       std::cerr << resolved_query.status().ToString() << std::endl;
       return 1;
@@ -3374,7 +3567,7 @@ int main(int argc, char** argv) {
     fs::path spec_path(*dataset_spec);
     std::error_code ec;
     if (fs::is_directory(spec_path, ec)) {
-      auto resolved_query = ResolveFvecsPath(*dataset_spec, "_query.fvecs");
+      auto resolved_query = ResolveVecsPath(*dataset_spec, "_query");
       if (resolved_query.ok()) {
         query_dataset_path = resolved_query.value();
         std::cout << "[INFO] Using query dataset: " << *query_dataset_path << std::endl;
@@ -3385,7 +3578,7 @@ int main(int argc, char** argv) {
     } else if (base_dataset_path) {
       auto parent = fs::path(*base_dataset_path).parent_path();
       if (!parent.empty()) {
-        auto resolved_query = ResolveFvecsPath(parent.string(), "_query.fvecs");
+        auto resolved_query = ResolveVecsPath(parent.string(), "_query");
         if (resolved_query.ok()) {
           query_dataset_path = resolved_query.value();
           std::cout << "[INFO] Using query dataset: " << *query_dataset_path << std::endl;
@@ -3395,9 +3588,10 @@ int main(int argc, char** argv) {
   }
 
   uint32_t nx = 0;
-  FvecsRandomAccessReader base_reader;
+  VecsRandomAccessReader base_reader;
   if (!base_dataset_path) {
-    std::cerr << "run_eval_large_streaming requires a base fvecs dataset path." << std::endl;
+    std::cerr << "run_eval_large_streaming requires a base .fvecs or .bvecs dataset path."
+              << std::endl;
     return 1;
   }
   auto reader_open = base_reader.Open(*base_dataset_path);
@@ -3418,12 +3612,18 @@ int main(int argc, char** argv) {
   uint32_t nq = 0;
   MatrixRM Q;
   if (query_dataset_path) {
-    auto load_res = LoadFvecs(*query_dataset_path);
+    VecsRandomAccessReader query_reader;
+    auto query_open = query_reader.Open(*query_dataset_path);
+    if (!query_open.ok()) {
+      std::cerr << query_open.status().ToString() << std::endl;
+      return 1;
+    }
+    auto load_res = query_reader.ReadRange(0, query_reader.count());
     if (!load_res.ok()) {
       std::cerr << load_res.status().ToString() << std::endl;
       return 1;
     }
-    Q = load_res.value();
+    Q = std::move(load_res.value());
     nq = static_cast<uint32_t>(Q.rows());
     if (nq == 0) {
       std::cerr << "Query dataset contains no vectors." << std::endl;
@@ -3557,10 +3757,10 @@ int main(int argc, char** argv) {
   vector_cache.Reserve(static_cast<size_t>(main_max_rows) + static_cast<size_t>(delta_train_rows) * 2 + 1024);
   uint32_t main_rows_current = main_rows_initial;
   uint32_t next_insert_idx = stream_start_idx;
-  std::deque<DocId> main_window_doc_ids;
+  DocRangeQueue main_window_doc_ids;
   std::optional<DeltaShard> active_delta;
   std::optional<DeltaShard> frozen_delta;
-  std::deque<DocId> sliding_window_doc_ids;
+  DocRangeQueue sliding_window_doc_ids;
   ann::eval_memory::MemoryTraceRecorder memory_trace;
 
   auto collect_memory_components = [&]() {
@@ -3568,12 +3768,10 @@ int main(int argc, char** argv) {
     components.push_back({"base.raw_resident", 0});
     components.push_back({"query.raw", ann::eval_memory::MatrixBytes(Q)});
     components.push_back({"query.whitened", ann::eval_memory::MatrixBytes(Q_whitened)});
-    components.push_back({"main.window_doc_ids",
-                          static_cast<uint64_t>(main_window_doc_ids.size()) *
-                              static_cast<uint64_t>(sizeof(DocId))});
-    components.push_back({"delta.sliding_window_doc_ids",
-                          static_cast<uint64_t>(sliding_window_doc_ids.size()) *
-                              static_cast<uint64_t>(sizeof(DocId))});
+    components.push_back(
+        {"main.window_doc_ids", main_window_doc_ids.EstimatedMemoryBytes()});
+    components.push_back(
+        {"delta.sliding_window_doc_ids", sliding_window_doc_ids.EstimatedMemoryBytes()});
     std::vector<ann::eval_memory::MemoryComponent> cache_components =
         vector_cache.EstimateMemoryComponents("base.whitened_cache");
     components.insert(components.end(), cache_components.begin(), cache_components.end());
@@ -3685,9 +3883,7 @@ int main(int argc, char** argv) {
   }
   record_memory("after_initial_main_index", main_rows_initial);
   const double init_total_wall_ms = init_total_timer.ElapsedMillis();
-  for (uint32_t i = 0; i < main_rows_initial; ++i) {
-    main_window_doc_ids.push_back(i);
-  }
+  main_window_doc_ids.AppendRange(0, main_rows_initial);
   uint64_t evicted_main_rows_total = 0;
   uint32_t next_delta_shard_id = 2;
   bool pending_active_train = false;
@@ -3837,9 +4033,7 @@ int main(int argc, char** argv) {
     pending_active_train = false;
     pending_active_train_begin = 0;
     sliding_window_doc_ids.clear();
-    for (uint32_t i = train_begin; i < train_begin + train_rows; ++i) {
-      sliding_window_doc_ids.push_back(i);
-    }
+    sliding_window_doc_ids.AppendRange(train_begin, train_begin + train_rows);
     record_memory("activate_delta", train_begin + train_rows);
     std::cout << "[MERGE] activate_delta shard=" << active_delta->shard_id
               << ", warmup_rows=" << train_rows << std::endl;
@@ -3998,9 +4192,7 @@ int main(int argc, char** argv) {
   }
 
   if (active_delta.has_value() && delta_train_rows > 0) {
-    for (uint32_t i = main_rows_initial; i < stream_start_idx; ++i) {
-      sliding_window_doc_ids.push_back(i);
-    }
+    sliding_window_doc_ids.AppendRange(main_rows_initial, stream_start_idx);
   }
 
   OnlinePQRollup online_pq_rollup;
@@ -4222,7 +4414,7 @@ int main(int argc, char** argv) {
     const uint32_t seen_rows = trigger.seen_rows;
     const uint32_t old_main_rows = main_rows_current;
 
-    std::vector<DocId> main_ids(main_window_doc_ids.begin(), main_window_doc_ids.end());
+    std::vector<DocId> main_ids = main_window_doc_ids.Materialize();
     if (main_ids.empty()) {
       return Status::InvalidArgument("RunGlobalRebuild: empty main window");
     }
@@ -4347,7 +4539,7 @@ int main(int argc, char** argv) {
 
     std::optional<DeltaShard> rebuilt_active_delta;
     std::optional<DeltaShard> rebuilt_frozen_delta;
-    std::deque<DocId> rebuilt_sliding_window_doc_ids;
+    DocRangeQueue rebuilt_sliding_window_doc_ids;
     bool rebuilt_pending_active_train = pending_active_train && active_doc_ids.empty();
     uint32_t rebuilt_pending_active_train_begin = pending_active_train_begin;
     double delta_seed_ms = 0.0;
@@ -4377,7 +4569,7 @@ int main(int argc, char** argv) {
       }
       rebuilt_active_delta->rows = active_rows;
       for (DocId doc_id : active_doc_ids) {
-        rebuilt_sliding_window_doc_ids.push_back(doc_id);
+        rebuilt_sliding_window_doc_ids.Append(doc_id);
       }
       Timer cache_timer;
       Status cache_status =
@@ -4859,10 +5051,7 @@ int main(int argc, char** argv) {
           if (need_delete > static_cast<uint32_t>(sliding_window_doc_ids.size())) {
             need_delete = static_cast<uint32_t>(sliding_window_doc_ids.size());
           }
-          delete_doc_ids.reserve(need_delete);
-          for (uint32_t i = 0; i < need_delete; ++i) {
-            delete_doc_ids.push_back(sliding_window_doc_ids[static_cast<size_t>(i)]);
-          }
+          delete_doc_ids = sliding_window_doc_ids.MaterializeFront(need_delete);
         }
 
         std::vector<DocId> insert_doc_ids;
@@ -4948,12 +5137,8 @@ int main(int argc, char** argv) {
               return 1;
             }
           }
-          for (uint32_t i = 0; i < deleted_rows; ++i) {
-            sliding_window_doc_ids.pop_front();
-          }
-          for (uint32_t i = begin; i < end; ++i) {
-            sliding_window_doc_ids.push_back(i);
-          }
+          sliding_window_doc_ids.PopFront(deleted_rows);
+          sliding_window_doc_ids.AppendRange(begin, end);
           active_delta->rows = active_delta->rows + chunk - deleted_rows;
         } else {
           active_delta->rows += chunk;
@@ -5147,11 +5332,8 @@ int main(int argc, char** argv) {
           return 1;
         }
 
-        std::vector<DocId> evict_doc_ids;
-        evict_doc_ids.reserve(evicted_rows);
-        for (uint32_t i = 0; i < evicted_rows; ++i) {
-          evict_doc_ids.push_back(main_window_doc_ids[static_cast<size_t>(i)]);
-        }
+        std::vector<DocId> evict_doc_ids =
+            main_window_doc_ids.MaterializeFront(evicted_rows);
 
         Timer pre_replace_timer;
         if (!evict_doc_ids.empty()) {
@@ -5165,9 +5347,7 @@ int main(int argc, char** argv) {
             std::cerr << cache_remove.ToString() << std::endl;
             return 1;
           }
-          for (uint32_t i = 0; i < evicted_rows; ++i) {
-            main_window_doc_ids.pop_front();
-          }
+          main_window_doc_ids.PopFront(evicted_rows);
           evicted_main_rows_total += evicted_rows;
           main_rows_current -= evicted_rows;
         }
@@ -5185,7 +5365,7 @@ int main(int argc, char** argv) {
         }
 
         for (DocId doc_id : frozen_doc_ids) {
-          main_window_doc_ids.push_back(doc_id);
+          main_window_doc_ids.Append(doc_id);
         }
 
         const double merge_commit_ms = merge_commit_timer.ElapsedMillis();
@@ -5307,6 +5487,41 @@ int main(int argc, char** argv) {
                << R"(,"merge_patch_prepare_us":)"
                << merge_event.profiling.patch_prepare_us
                << R"(,"merge_commit_us":)" << merge_event.profiling.commit_us
+               << R"(,"prepare_total_us":)" << merge_event.profiling.prepare_total_us
+               << R"(,"prepare_fetch_us":)" << merge_event.profiling.prepare_fetch_us
+               << R"(,"prepare_distance_us":)" << merge_event.profiling.prepare_distance_us
+               << R"(,"prepare_balance_us":)" << merge_event.profiling.prepare_balance_us
+               << R"(,"compact_emit_us":)" << merge_event.profiling.compact_emit_us
+               << R"(,"compact_patch_records":)"
+               << merge_event.profiling.compact_patch_records
+               << R"(,"compact_patch_estimated_bytes":)"
+               << merge_event.profiling.compact_patch_estimated_bytes
+               << R"(,"commit_total_us":)" << merge_event.profiling.commit_total_us
+               << R"(,"commit_validation_us":)"
+               << merge_event.profiling.commit_validation_us
+               << R"(,"commit_reuse_classify_us":)"
+               << merge_event.profiling.commit_reuse_classify_us
+               << R"(,"commit_materialize_us":)"
+               << merge_event.profiling.commit_materialize_us
+               << R"(,"commit_materialized_rows":)"
+               << merge_event.profiling.commit_materialized_rows
+               << R"(,"commit_materialized_bytes":)"
+               << merge_event.profiling.commit_materialized_bytes
+               << R"(,"commit_materialize_batches":)"
+               << merge_event.profiling.commit_materialize_batches
+               << R"(,"commit_max_materialize_rows":)"
+               << merge_event.profiling.commit_max_materialize_rows
+               << R"(,"commit_pq_encode_us":)"
+               << merge_event.profiling.commit_pq_encode_us
+               << R"(,"pq_codes_reused":)" << merge_event.profiling.pq_codes_reused
+               << R"(,"pq_codes_reencoded":)"
+               << merge_event.profiling.pq_codes_reencoded
+               << R"(,"commit_apply_us":)" << merge_event.profiling.commit_apply_us
+               << R"(,"pq_list_flatten_us":)"
+               << merge_event.profiling.pq_list_flatten_us
+               << R"(,"docmap_rebuild_us":)" << merge_event.profiling.docmap_rebuild_us
+               << R"(,"commit_lock_hold_us":)"
+               << merge_event.profiling.commit_lock_hold_us
                << R"(,"patched_partitions":)" << merge_event.patched_partitions
                << R"(,"append_partitions":)" << merge_event.append_partitions
                << R"(,"recluster_partitions":)" << merge_event.recluster_partitions
@@ -5360,6 +5575,9 @@ int main(int argc, char** argv) {
                   << ", pooled_records=" << merge_profile.pooled_records
                   << ", repartitioned_records=" << merge_profile.repartitioned_records
                   << ", patch_records=" << merge_profile.patch_records
+                  << ", compact_patch_records=" << merge_profile.compact_patch_records
+                  << ", compact_patch_estimated_bytes="
+                  << merge_profile.compact_patch_estimated_bytes
                   << ", assignment_distance_evaluations="
                   << merge_profile.assignment_distance_evaluations
                   << ", assignment_workspace_bytes="
@@ -5383,8 +5601,33 @@ int main(int argc, char** argv) {
                   << ", fetch_main_records_us=" << merge_profile.fetch_main_records_us
                   << ", repartition_us=" << merge_profile.repartition_us
                   << ", patch_prepare_us=" << merge_profile.patch_prepare_us
+                  << ", prepare_total_us=" << merge_profile.prepare_total_us
+                  << ", prepare_fetch_us=" << merge_profile.prepare_fetch_us
+                  << ", prepare_distance_us=" << merge_profile.prepare_distance_us
+                  << ", prepare_balance_us=" << merge_profile.prepare_balance_us
+                  << ", compact_emit_us=" << merge_profile.compact_emit_us
                   << ", commit_us=" << merge_profile.commit_us
                   << ", pq_code_assignment_us=" << merge_profile.pq_code_assignment_us
+                  << ", commit_total_us=" << merge_profile.commit_total_us
+                  << ", commit_validation_us=" << merge_profile.commit_validation_us
+                  << ", commit_reuse_classify_us="
+                  << merge_profile.commit_reuse_classify_us
+                  << ", commit_materialize_us=" << merge_profile.commit_materialize_us
+                  << ", commit_materialized_rows="
+                  << merge_profile.commit_materialized_rows
+                  << ", commit_materialized_bytes="
+                  << merge_profile.commit_materialized_bytes
+                  << ", commit_materialize_batches="
+                  << merge_profile.commit_materialize_batches
+                  << ", commit_max_materialize_rows="
+                  << merge_profile.commit_max_materialize_rows
+                  << ", commit_pq_encode_us=" << merge_profile.commit_pq_encode_us
+                  << ", pq_codes_reused=" << merge_profile.pq_codes_reused
+                  << ", pq_codes_reencoded=" << merge_profile.pq_codes_reencoded
+                  << ", commit_apply_us=" << merge_profile.commit_apply_us
+                  << ", pq_list_flatten_us=" << merge_profile.pq_list_flatten_us
+                  << ", docmap_rebuild_us=" << merge_profile.docmap_rebuild_us
+                  << ", commit_lock_hold_us=" << merge_profile.commit_lock_hold_us
                   << std::endl;
 
         frozen_delta.reset();
@@ -5881,6 +6124,10 @@ int main(int argc, char** argv) {
       ofs << "        \"repartitioned_records\": "
           << ev.profiling.repartitioned_records << ",\n";
       ofs << "        \"patch_records\": " << ev.profiling.patch_records << ",\n";
+      ofs << "        \"compact_patch_records\": "
+          << ev.profiling.compact_patch_records << ",\n";
+      ofs << "        \"compact_patch_estimated_bytes\": "
+          << ev.profiling.compact_patch_estimated_bytes << ",\n";
       ofs << "        \"assignment_distance_evaluations\": "
           << ev.profiling.assignment_distance_evaluations << ",\n";
       ofs << "        \"assignment_workspace_bytes\": "
@@ -5908,7 +6155,41 @@ int main(int argc, char** argv) {
       ofs << "        \"patch_prepare_us\": " << ev.profiling.patch_prepare_us << ",\n";
       ofs << "        \"commit_us\": " << ev.profiling.commit_us << ",\n";
       ofs << "        \"pq_code_assignment_us\": "
-          << ev.profiling.pq_code_assignment_us << "\n";
+          << ev.profiling.pq_code_assignment_us << ",\n";
+      ofs << "        \"prepare_total_us\": " << ev.profiling.prepare_total_us << ",\n";
+      ofs << "        \"prepare_fetch_us\": " << ev.profiling.prepare_fetch_us << ",\n";
+      ofs << "        \"prepare_distance_us\": " << ev.profiling.prepare_distance_us
+          << ",\n";
+      ofs << "        \"prepare_balance_us\": " << ev.profiling.prepare_balance_us
+          << ",\n";
+      ofs << "        \"compact_emit_us\": " << ev.profiling.compact_emit_us << ",\n";
+      ofs << "        \"commit_total_us\": " << ev.profiling.commit_total_us << ",\n";
+      ofs << "        \"commit_validation_us\": " << ev.profiling.commit_validation_us
+          << ",\n";
+      ofs << "        \"commit_reuse_classify_us\": "
+          << ev.profiling.commit_reuse_classify_us << ",\n";
+      ofs << "        \"commit_materialize_us\": "
+          << ev.profiling.commit_materialize_us << ",\n";
+      ofs << "        \"commit_materialized_rows\": "
+          << ev.profiling.commit_materialized_rows << ",\n";
+      ofs << "        \"commit_materialized_bytes\": "
+          << ev.profiling.commit_materialized_bytes << ",\n";
+      ofs << "        \"commit_materialize_batches\": "
+          << ev.profiling.commit_materialize_batches << ",\n";
+      ofs << "        \"commit_max_materialize_rows\": "
+          << ev.profiling.commit_max_materialize_rows << ",\n";
+      ofs << "        \"commit_pq_encode_us\": " << ev.profiling.commit_pq_encode_us
+          << ",\n";
+      ofs << "        \"pq_codes_reused\": " << ev.profiling.pq_codes_reused << ",\n";
+      ofs << "        \"pq_codes_reencoded\": " << ev.profiling.pq_codes_reencoded
+          << ",\n";
+      ofs << "        \"commit_apply_us\": " << ev.profiling.commit_apply_us << ",\n";
+      ofs << "        \"pq_list_flatten_us\": " << ev.profiling.pq_list_flatten_us
+          << ",\n";
+      ofs << "        \"docmap_rebuild_us\": " << ev.profiling.docmap_rebuild_us
+          << ",\n";
+      ofs << "        \"commit_lock_hold_us\": " << ev.profiling.commit_lock_hold_us
+          << "\n";
       ofs << "      }\n";
       ofs << "    }";
       if (i + 1 < merge_events.size()) {
@@ -6293,6 +6574,10 @@ int main(int argc, char** argv) {
     ofs << "        \"repartitioned_records\": "
         << ev.profiling.repartitioned_records << ",\n";
     ofs << "        \"patch_records\": " << ev.profiling.patch_records << ",\n";
+    ofs << "        \"compact_patch_records\": "
+        << ev.profiling.compact_patch_records << ",\n";
+    ofs << "        \"compact_patch_estimated_bytes\": "
+        << ev.profiling.compact_patch_estimated_bytes << ",\n";
     ofs << "        \"assignment_distance_evaluations\": "
         << ev.profiling.assignment_distance_evaluations << ",\n";
     ofs << "        \"assignment_workspace_bytes\": "
@@ -6320,7 +6605,39 @@ int main(int argc, char** argv) {
     ofs << "        \"patch_prepare_us\": " << ev.profiling.patch_prepare_us << ",\n";
     ofs << "        \"commit_us\": " << ev.profiling.commit_us << ",\n";
     ofs << "        \"pq_code_assignment_us\": "
-        << ev.profiling.pq_code_assignment_us << "\n";
+        << ev.profiling.pq_code_assignment_us << ",\n";
+    ofs << "        \"prepare_total_us\": " << ev.profiling.prepare_total_us << ",\n";
+    ofs << "        \"prepare_fetch_us\": " << ev.profiling.prepare_fetch_us << ",\n";
+    ofs << "        \"prepare_distance_us\": " << ev.profiling.prepare_distance_us
+        << ",\n";
+    ofs << "        \"prepare_balance_us\": " << ev.profiling.prepare_balance_us << ",\n";
+    ofs << "        \"compact_emit_us\": " << ev.profiling.compact_emit_us << ",\n";
+    ofs << "        \"commit_total_us\": " << ev.profiling.commit_total_us << ",\n";
+    ofs << "        \"commit_validation_us\": " << ev.profiling.commit_validation_us
+        << ",\n";
+    ofs << "        \"commit_reuse_classify_us\": "
+        << ev.profiling.commit_reuse_classify_us << ",\n";
+    ofs << "        \"commit_materialize_us\": "
+        << ev.profiling.commit_materialize_us << ",\n";
+    ofs << "        \"commit_materialized_rows\": "
+        << ev.profiling.commit_materialized_rows << ",\n";
+    ofs << "        \"commit_materialized_bytes\": "
+        << ev.profiling.commit_materialized_bytes << ",\n";
+    ofs << "        \"commit_materialize_batches\": "
+        << ev.profiling.commit_materialize_batches << ",\n";
+    ofs << "        \"commit_max_materialize_rows\": "
+        << ev.profiling.commit_max_materialize_rows << ",\n";
+    ofs << "        \"commit_pq_encode_us\": " << ev.profiling.commit_pq_encode_us
+        << ",\n";
+    ofs << "        \"pq_codes_reused\": " << ev.profiling.pq_codes_reused << ",\n";
+    ofs << "        \"pq_codes_reencoded\": " << ev.profiling.pq_codes_reencoded
+        << ",\n";
+    ofs << "        \"commit_apply_us\": " << ev.profiling.commit_apply_us << ",\n";
+    ofs << "        \"pq_list_flatten_us\": " << ev.profiling.pq_list_flatten_us
+        << ",\n";
+    ofs << "        \"docmap_rebuild_us\": " << ev.profiling.docmap_rebuild_us << ",\n";
+    ofs << "        \"commit_lock_hold_us\": " << ev.profiling.commit_lock_hold_us
+        << "\n";
     ofs << "      }\n";
     ofs << "    }";
     if (i + 1 < merge_events.size()) {

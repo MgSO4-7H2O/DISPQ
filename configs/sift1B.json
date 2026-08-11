@@ -1,7 +1,7 @@
 {
     "ivf_nlist": 4096,
     "topk": 10,
-    "nprobe": 16,
+    "nprobe": 8,
     "use_cosine": false,
     "use_whitening": true,
     "enable_dual_route": true,
@@ -14,32 +14,32 @@
     "pq_residual": true,
   
     "max_queries": 10000,
-    "snapshot_interval": 1000000,
+    "snapshot_interval": 50000000,
   
     "enable_miss_diag": false,
     "enable_rerank_source_diag": false,
     "enable_latency_debug": false,
   
     "exact_rerank_enable": true,
-    "exact_rerank_candidates_per_route": 10,
+    "exact_rerank_candidates_per_route": 100,
     "main_exact_rerank_candidates": 30,
-    "active_exact_rerank_candidates": 15,
-    "frozen_exact_rerank_candidates": 5,
+    "active_exact_rerank_candidates": 10,
+    "frozen_exact_rerank_candidates": 10,
   
     "enable_streaming": true,
   
-    "main_index_rows": 2000000,
-    "max_main": 3000000,
+    "main_index_rows": 50000000,
+    "max_main": 51000000,
   
     "delta_train_window": 1,
-    "delta_ivf_nlist": 1024,
+    "delta_ivf_nlist": 4096,
   
     "merge_score_alpha": 1.0,
     "merge_score_beta": 1e-07,
     "merge_score_threshold": 10.0,
   
     "merge_trigger_mode": "state",
-    "merge_trigger_rows": 500000,
+    "merge_trigger_rows": 5000000,
     "merge_trigger_qe_ratio": 1.12,
     "merge_trigger_drift": 0.0,
     "merge_trigger_delta_main_ratio": 0.2,
@@ -53,12 +53,12 @@
   
     "enable_global_rebuild": false,
     "global_rebuild_max_count": 100,
-    "global_rebuild_main_imbalance_ratio": 20.0,
+    "global_rebuild_main_imbalance_ratio": 40.0,
     "global_rebuild_force_main_rows": 0,
-    "global_rebuild_cooldown_rows": 500000,
+    "global_rebuild_cooldown_rows": 5000000,
   
     "streaming_mode": "batch",
-    "stream_batch_size": 100000,
+    "stream_batch_size": 2000000,
     "streaming_use_stream_batch_size": true,
   
     "online_pq_enable": true,
