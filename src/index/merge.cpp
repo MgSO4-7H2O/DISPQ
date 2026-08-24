@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -20,6 +21,137 @@ namespace ann {
 namespace {
 
 using ProfilingClock = std::chrono::steady_clock;
+
+struct VectorAccessorMaterializationStats {
+  uint64_t calls{0};
+  uint64_t rows{0};
+  uint64_t bytes{0};
+  uint32_t max_rows{0};
+};
+
+void AccumulateVectorAccessorMaterialization(
+    const VectorAccessorMaterializationStats& source,
+    MergeProfiling* destination) {
+  if (destination == nullptr) {
+    return;
+  }
+  destination->vector_accessor_materialize_calls += source.calls;
+  destination->vector_accessor_materialized_rows += source.rows;
+  destination->vector_accessor_materialized_bytes += source.bytes;
+  destination->vector_accessor_max_materialize_rows = std::max(
+      destination->vector_accessor_max_materialize_rows, source.max_rows);
+}
+
+bool SamePQEncodingContext(const PQEncodingContext& lhs,
+                           const PQEncodingContext& rhs) {
+  return lhs.index_version == rhs.index_version &&
+         lhs.mutation_generation == rhs.mutation_generation &&
+         lhs.use_pq == rhs.use_pq && lhs.pq_residual == rhs.pq_residual &&
+         lhs.M == rhs.M && lhs.nbits == rhs.nbits && lhs.Ks == rhs.Ks &&
+         lhs.dsub == rhs.dsub;
+}
+
+struct PQFinalizationResult {
+  std::optional<PreparedPQPayload> prepared_pq;
+  uint64_t dense_vector_bytes{0};
+  uint64_t retained_vector_bytes{0};
+  uint64_t final_pq_code_bytes{0};
+};
+
+Result<PQFinalizationResult> FinalizePartitionPQCodes(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const std::vector<uint32_t>& partition_ids,
+    std::vector<AlignedVector<VectorRecord>>* replacement_records) {
+  if (replacement_records == nullptr ||
+      partition_ids.size() != replacement_records->size()) {
+    return Status::InvalidArgument(
+        "FinalizePartitionPQCodes: partition/record shape mismatch");
+  }
+
+  PQFinalizationResult result;
+  for (const auto& records : *replacement_records) {
+    for (const auto& rec : records) {
+      result.dense_vector_bytes +=
+          static_cast<uint64_t>(rec.x.size()) * sizeof(float);
+    }
+  }
+  auto prepared_res = main_ivf->PreparePartitionPQCodes(
+      main_versions, partition_ids, *replacement_records);
+  if (!prepared_res.ok()) {
+    return prepared_res.status();
+  }
+  result.prepared_pq = std::move(prepared_res.value());
+  if (result.prepared_pq.has_value()) {
+    for (const auto& partition : result.prepared_pq->partition_codes) {
+      result.final_pq_code_bytes +=
+          static_cast<uint64_t>(partition.final_codes.size());
+    }
+    // Each final code is now owned by the prepared payload. Swapping with an
+    // empty vector releases Eigen's per-record backing allocation immediately.
+    for (auto& records : *replacement_records) {
+      for (auto& rec : records) {
+        Eigen::VectorXf empty;
+        rec.x.swap(empty);
+      }
+    }
+  }
+  for (const auto& records : *replacement_records) {
+    for (const auto& rec : records) {
+      result.retained_vector_bytes +=
+          static_cast<uint64_t>(rec.x.size()) * sizeof(float);
+    }
+  }
+  return result;
+}
+
+Status AppendPreparedPQPayload(std::optional<PreparedPQPayload> batch,
+                               size_t partition_reserve_hint,
+                               PartitionPatch* patch) {
+  if (!batch.has_value()) {
+    if (patch->prepared_pq.has_value()) {
+      return Status::InvalidArgument(
+          "PreparePartitionPatch: mixed PQ and dense preparation state");
+    }
+    return Status::OK();
+  }
+  if (!patch->prepared_pq.has_value()) {
+    PreparedPQPayload combined;
+    combined.context = batch->context;
+    combined.partition_codes.reserve(partition_reserve_hint);
+    patch->prepared_pq = std::move(combined);
+  } else if (!SamePQEncodingContext(patch->prepared_pq->context,
+                                    batch->context)) {
+    return Status::InvalidArgument(
+        "PreparePartitionPatch: IVF changed between PQ preparation batches");
+  }
+  patch->prepared_pq->partition_codes.insert(
+      patch->prepared_pq->partition_codes.end(),
+      std::make_move_iterator(batch->partition_codes.begin()),
+      std::make_move_iterator(batch->partition_codes.end()));
+  patch->prepared_pq->codes_reused += batch->codes_reused;
+  patch->prepared_pq->codes_reencoded += batch->codes_reencoded;
+  patch->prepared_pq->encode_us += batch->encode_us;
+  patch->prepared_pq->copy_or_reuse_us += batch->copy_or_reuse_us;
+  return Status::OK();
+}
+
+void AccumulatePQFinalizationProfiling(const PQFinalizationResult& result,
+                                       MergeProfiling* profiling) {
+  if (profiling == nullptr) {
+    return;
+  }
+  profiling->patch_dense_vector_bytes += result.dense_vector_bytes;
+  profiling->patch_retained_vector_bytes += result.retained_vector_bytes;
+  profiling->patch_elided_vector_bytes +=
+      result.dense_vector_bytes - result.retained_vector_bytes;
+  profiling->patch_final_pq_code_bytes += result.final_pq_code_bytes;
+  if (result.prepared_pq.has_value()) {
+    profiling->prepare_pq_codes_reused += result.prepared_pq->codes_reused;
+    profiling->prepare_pq_codes_reencoded += result.prepared_pq->codes_reencoded;
+    profiling->prepare_pq_encode_us += result.prepared_pq->encode_us;
+  }
+}
 
 double ElapsedProfilingMicros(ProfilingClock::time_point start) {
   return std::chrono::duration<double, std::micro>(ProfilingClock::now() - start).count();
@@ -244,7 +376,6 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     top_r_us += ElapsedProfilingMicros(top_r_start);
 
     for (size_t local_index = 0; local_index < chunk_count; ++local_index) {
-      const auto& rec = frozen_delta.records[chunk_begin + local_index];
       const AssignmentTopCandidate* top_candidates =
           chunk_top_candidates.data() + local_index * static_cast<size_t>(top_r);
 
@@ -312,8 +443,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
 
       const auto materialize_start = ProfilingClock::now();
       DeltaAssignment item;
-      item.record = rec;
-      item.record.ivf_id = chosen_partition;
+      item.frozen_index = static_cast<uint32_t>(chunk_begin + local_index);
       item.main_partition = chosen_partition;
       item.residual_dist = chosen_dist;
       assigned[static_cast<size_t>(chosen_partition)].push_back(std::move(item));
@@ -347,40 +477,71 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     profiling->merge_assignment_top_r_us = top_r_us;
     profiling->merge_assignment_balance_us = balance_us;
     profiling->merge_assignment_materialize_us = materialize_us;
+    profiling->assignment_descriptor_records =
+        static_cast<uint64_t>(frozen_delta.records.size());
+    profiling->assignment_full_vector_copy_bytes = 0;
   }
   return assigned;
 }
 
-Status AppendVectorRecordFromStore(DocId doc_id,
-                                   const VersionSet& versions,
-                                   uint32_t ivf_id,
-                                   const MatrixRM& vector_store,
-                                   AlignedVector<VectorRecord>* out) {
-  if (out == nullptr) {
-    return Status::InvalidArgument("AppendVectorRecordFromStore: null output");
+Result<AlignedVector<VectorRecord>> MaterializeVectorRecordsFromAccessor(
+    const std::vector<DocId>& doc_ids,
+    const VersionSet& versions,
+    uint32_t ivf_id,
+    const VectorAccessor& vector_accessor,
+    VectorAccessorMaterializationStats* profiling) {
+  const uint32_t dim = vector_accessor.dim();
+  AlignedVector<VectorRecord> records;
+  records.reserve(doc_ids.size());
+  std::vector<DocId> chunk_doc_ids;
+  chunk_doc_ids.reserve(std::min(kVectorAccessorMaterializeChunkRows, doc_ids.size()));
+  MatrixRM rows;
+  for (size_t begin = 0; begin < doc_ids.size();
+       begin += kVectorAccessorMaterializeChunkRows) {
+    const size_t end =
+        std::min(begin + kVectorAccessorMaterializeChunkRows, doc_ids.size());
+    chunk_doc_ids.assign(
+        doc_ids.begin() + static_cast<std::ptrdiff_t>(begin),
+        doc_ids.begin() + static_cast<std::ptrdiff_t>(end));
+    Status materialize = vector_accessor.Materialize(chunk_doc_ids, &rows);
+    if (!materialize.ok()) {
+      return materialize;
+    }
+    if (rows.rows() != static_cast<Eigen::Index>(chunk_doc_ids.size()) ||
+        rows.cols() != static_cast<Eigen::Index>(dim)) {
+      return Status::InvalidArgument(
+          "MaterializeVectorRecordsFromAccessor: materialized shape mismatch");
+    }
+    if (profiling != nullptr) {
+      ++profiling->calls;
+      profiling->rows += static_cast<uint64_t>(rows.rows());
+      profiling->bytes += static_cast<uint64_t>(rows.size()) * sizeof(float);
+      profiling->max_rows = std::max<uint32_t>(
+          profiling->max_rows, static_cast<uint32_t>(rows.rows()));
+    }
+    for (size_t i = 0; i < chunk_doc_ids.size(); ++i) {
+      VectorRecord rec;
+      rec.doc_id = chunk_doc_ids[i];
+      rec.dim = dim;
+      rec.versions = versions;
+      rec.ivf_id = ivf_id;
+      rec.x = rows.row(static_cast<Eigen::Index>(i)).transpose();
+      records.push_back(std::move(rec));
+    }
   }
-  if (static_cast<Eigen::Index>(doc_id) >= vector_store.rows()) {
-    return Status::InvalidArgument("AppendVectorRecordFromStore: doc_id out of vector store range");
-  }
-  VectorRecord rec;
-  rec.doc_id = doc_id;
-  rec.dim = static_cast<uint32_t>(vector_store.cols());
-  rec.versions = versions;
-  rec.ivf_id = ivf_id;
-  rec.x = vector_store.row(static_cast<Eigen::Index>(doc_id)).transpose();
-  out->push_back(std::move(rec));
-  return Status::OK();
+  return records;
 }
 
 Result<AlignedVector<VectorRecord>> FetchPartitionRecordsForMerge(
     const std::shared_ptr<IVFIndex>& ivf,
     const VersionSet& versions,
     uint32_t partition_id,
-    const MatrixRM* vector_store) {
+    const VectorAccessor* vector_accessor,
+    VectorAccessorMaterializationStats* profiling) {
   if (!ivf) {
     return Status::InvalidArgument("FetchPartitionRecordsForMerge: ivf is null");
   }
-  if (vector_store == nullptr) {
+  if (vector_accessor == nullptr) {
     return ivf->GetPartitionRecords(versions, partition_id);
   }
 
@@ -388,16 +549,8 @@ Result<AlignedVector<VectorRecord>> FetchPartitionRecordsForMerge(
   if (!doc_ids_res.ok()) {
     return doc_ids_res.status();
   }
-  AlignedVector<VectorRecord> records;
-  records.reserve(doc_ids_res.value().size());
-  for (DocId doc_id : doc_ids_res.value()) {
-    Status append = AppendVectorRecordFromStore(
-        doc_id, versions, partition_id, *vector_store, &records);
-    if (!append.ok()) {
-      return append;
-    }
-  }
-  return records;
+  return MaterializeVectorRecordsFromAccessor(
+      doc_ids_res.value(), versions, partition_id, *vector_accessor, profiling);
 }
 
 std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
@@ -430,6 +583,8 @@ std::vector<uint32_t> TopRNeighborPartitions(uint32_t seed_partition,
 Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
     const std::vector<uint32_t>& neighborhood_partitions,
     std::vector<AlignedVector<VectorRecord>> neighborhood_main_records,
+    const FrozenDelta& frozen_delta,
+    FrozenDelta* consumable_frozen_delta,
     const PartitionAssignments& assignments,
     Eigen::Ref<const MatrixRM> main_centroids,
     const MergeOptions& options,
@@ -473,7 +628,13 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
   for (uint32_t part : neighborhood_partitions) {
     const auto& delta_bucket = assignments[static_cast<size_t>(part)];
     for (const auto& item : delta_bucket) {
-      pooled_records.push_back(item.record);
+      const size_t frozen_index = static_cast<size_t>(item.frozen_index);
+      if (consumable_frozen_delta != nullptr) {
+        pooled_records.push_back(
+            std::move(consumable_frozen_delta->records[frozen_index]));
+      } else {
+        pooled_records.push_back(frozen_delta.records[frozen_index]);
+      }
     }
   }
   if (profiling != nullptr) {
@@ -613,16 +774,21 @@ Result<std::vector<AlignedVector<VectorRecord>>> RepartitionNeighborhood(
 Result<PartitionPatch> PreparePartitionPatchImpl(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
+    FrozenDelta* consumable_frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
-    const MatrixRM* base_vectors,
+    const VectorAccessor* vector_accessor,
     const MergeOptions& options,
     MergeProfiling* profiling);
 
 Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
                                                  const FrozenDelta& frozen_delta,
-                                                 const MatrixRM* base_vectors,
+                                                 FrozenDelta* consumable_frozen_delta,
+                                                 const VectorAccessor* vector_accessor,
+                                                 const VectorAccessorMaterializationStats*
+                                                     initial_materialization,
                                                  const MergeOptions& options);
 
 Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
@@ -639,25 +805,39 @@ Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
   return out;
 }
 
-Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
-                                 const VersionSet& delta_versions,
-                                 const MatrixRM& base_vectors) {
+Result<FrozenDelta> FreezeDeltaFromAccessor(
+    const std::shared_ptr<IVFIndex>& delta_ivf,
+    const VersionSet& delta_versions,
+    const VectorAccessor& vector_accessor,
+    VectorAccessorMaterializationStats* profiling) {
   if (!delta_ivf) {
-    return Status::InvalidArgument("freeze_delta: delta_ivf is null");
+    return Status::InvalidArgument("freeze_delta(accessor): delta_ivf is null");
   }
   auto doc_ids_res = delta_ivf->SnapshotDocIds(delta_versions);
   if (!doc_ids_res.ok()) {
     return doc_ids_res.status();
   }
   FrozenDelta out;
-  out.records.reserve(doc_ids_res.value().size());
-  for (DocId doc_id : doc_ids_res.value()) {
-    Status append = AppendVectorRecordFromStore(doc_id, delta_versions, 0, base_vectors, &out.records);
-    if (!append.ok()) {
-      return append;
-    }
+  auto records_res = MaterializeVectorRecordsFromAccessor(
+      doc_ids_res.value(), delta_versions, 0, vector_accessor, profiling);
+  if (!records_res.ok()) {
+    return records_res.status();
   }
+  out.records = std::move(records_res.value());
   return out;
+}
+
+Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
+                                 const VersionSet& delta_versions,
+                                 const MatrixRM& base_vectors) {
+  MatrixVectorAccessor vector_accessor(base_vectors);
+  return FreezeDeltaFromAccessor(delta_ivf, delta_versions, vector_accessor, nullptr);
+}
+
+Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
+                                 const VersionSet& delta_versions,
+                                 const VectorAccessor& vector_accessor) {
+  return FreezeDeltaFromAccessor(delta_ivf, delta_versions, vector_accessor, nullptr);
 }
 
 Result<PartitionAssignments> assign_delta_to_main_centroids(
@@ -667,7 +847,9 @@ Result<PartitionAssignments> assign_delta_to_main_centroids(
     return Status::InvalidArgument("assign_delta_to_main_centroids: empty main_centroids");
   }
   PartitionAssignments assigned(static_cast<size_t>(main_centroids.rows()));
-  for (const auto& rec : frozen_delta.records) {
+  for (size_t frozen_index = 0; frozen_index < frozen_delta.records.size();
+       ++frozen_index) {
+    const auto& rec = frozen_delta.records[frozen_index];
     if (rec.x.size() != main_centroids.cols()) {
       return Status::InvalidArgument(
           "assign_delta_to_main_centroids: record dim mismatch with main centroids");
@@ -675,8 +857,7 @@ Result<PartitionAssignments> assign_delta_to_main_centroids(
     float residual_dist = 0.0f;
     const uint32_t partition = NearestCentroid(rec.x, main_centroids, &residual_dist);
     DeltaAssignment item;
-    item.record = rec;
-    item.record.ivf_id = partition;
+    item.frozen_index = static_cast<uint32_t>(frozen_index);
     item.main_partition = partition;
     item.residual_dist = residual_dist;
     assigned[static_cast<size_t>(partition)].push_back(std::move(item));
@@ -735,9 +916,11 @@ Result<PartitionScoreResult> score_partitions(const std::vector<PartitionStats>&
   return out;
 }
 
-Result<AlignedVector<VectorRecord>> merge_partition_append(
+Result<AlignedVector<VectorRecord>> MergePartitionAppendImpl(
     uint32_t partition_id,
     const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
+    FrozenDelta* consumable_frozen_delta,
     const AlignedVector<DeltaAssignment>& delta_partition_records) {
   AlignedVector<VectorRecord> merged;
   merged.reserve(main_partition_records.size() + delta_partition_records.size());
@@ -747,20 +930,31 @@ Result<AlignedVector<VectorRecord>> merge_partition_append(
     merged.push_back(std::move(out));
   }
   for (const auto& item : delta_partition_records) {
-    VectorRecord out = item.record;
+    const size_t frozen_index = static_cast<size_t>(item.frozen_index);
+    VectorRecord out;
+    if (consumable_frozen_delta != nullptr) {
+      out = std::move(consumable_frozen_delta->records[frozen_index]);
+    } else {
+      out = frozen_delta.records[frozen_index];
+    }
     out.ivf_id = partition_id;
     merged.push_back(std::move(out));
   }
   return merged;
 }
 
-Result<AlignedVector<VectorRecord>> merge_partition_recluster(
+Result<AlignedVector<VectorRecord>> MergePartitionReclusterImpl(
     uint32_t partition_id,
     const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
+    FrozenDelta* consumable_frozen_delta,
     const AlignedVector<DeltaAssignment>& delta_partition_records,
     const MergeOptions& options) {
-  auto append_res =
-      merge_partition_append(partition_id, main_partition_records, delta_partition_records);
+  auto append_res = MergePartitionAppendImpl(partition_id,
+                                             main_partition_records,
+                                             frozen_delta,
+                                             consumable_frozen_delta,
+                                             delta_partition_records);
   if (!append_res.ok()) {
     return append_res.status();
   }
@@ -844,33 +1038,94 @@ Result<AlignedVector<VectorRecord>> merge_partition_recluster(
   return reordered;
 }
 
-Result<PartitionPatch> prepare_partition_patch(
-    const std::shared_ptr<IVFIndex>& main_ivf,
-    const VersionSet& main_versions,
-    const PartitionAssignments& assignments,
-    const PartitionScoreResult& score_result,
+Result<AlignedVector<VectorRecord>> merge_partition_append(
+    uint32_t partition_id,
+    const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
+    const AlignedVector<DeltaAssignment>& delta_partition_records) {
+  return MergePartitionAppendImpl(
+      partition_id, main_partition_records, frozen_delta, nullptr, delta_partition_records);
+}
+
+Result<AlignedVector<VectorRecord>> merge_partition_recluster(
+    uint32_t partition_id,
+    const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
+    const AlignedVector<DeltaAssignment>& delta_partition_records,
     const MergeOptions& options) {
-  return PreparePartitionPatchImpl(
-      main_ivf, main_versions, assignments, score_result, nullptr, options, nullptr);
+  return MergePartitionReclusterImpl(partition_id,
+                                     main_partition_records,
+                                     frozen_delta,
+                                     nullptr,
+                                     delta_partition_records,
+                                     options);
 }
 
 Result<PartitionPatch> prepare_partition_patch(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const MergeOptions& options) {
+  return PreparePartitionPatchImpl(
+      main_ivf,
+      main_versions,
+      frozen_delta,
+      nullptr,
+      assignments,
+      score_result,
+      nullptr,
+      options,
+      nullptr);
+}
+
+Result<PartitionPatch> prepare_partition_patch(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM& base_vectors,
     const MergeOptions& options) {
+  MatrixVectorAccessor vector_accessor(base_vectors);
+  return prepare_partition_patch(main_ivf,
+                                 main_versions,
+                                 frozen_delta,
+                                 assignments,
+                                 score_result,
+                                 vector_accessor,
+                                 options);
+}
+
+Result<PartitionPatch> prepare_partition_patch(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const VectorAccessor& vector_accessor,
+    const MergeOptions& options) {
   return PreparePartitionPatchImpl(
-      main_ivf, main_versions, assignments, score_result, &base_vectors, options, nullptr);
+      main_ivf,
+      main_versions,
+      frozen_delta,
+      nullptr,
+      assignments,
+      score_result,
+      &vector_accessor,
+      options,
+      nullptr);
 }
 
 Result<PartitionPatch> PreparePartitionPatchImpl(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
+    FrozenDelta* consumable_frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
-    const MatrixRM* base_vectors,
+    const VectorAccessor* vector_accessor,
     const MergeOptions& options,
     MergeProfiling* profiling) {
   if (!main_ivf) {
@@ -936,13 +1191,19 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
       neighborhood_main_records.reserve(active_neighborhood.size());
       for (uint32_t part : active_neighborhood) {
+        VectorAccessorMaterializationStats materialization_profile;
         const auto fetch_start = profiling != nullptr
                                      ? ProfilingClock::now()
                                      : ProfilingClock::time_point{};
         auto main_records_res =
-            FetchPartitionRecordsForMerge(main_ivf, main_versions, part, base_vectors);
+            FetchPartitionRecordsForMerge(main_ivf,
+                                          main_versions,
+                                          part,
+                                          vector_accessor,
+                                          &materialization_profile);
         if (profiling != nullptr) {
           profiling->fetch_main_records_us += ElapsedProfilingMicros(fetch_start);
+          AccumulateVectorAccessorMaterialization(materialization_profile, profiling);
         }
         if (!main_records_res.ok()) {
           return main_records_res.status();
@@ -956,6 +1217,8 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
 
       auto repartition_res = RepartitionNeighborhood(active_neighborhood,
                                                      std::move(neighborhood_main_records),
+                                                     frozen_delta,
+                                                     consumable_frozen_delta,
                                                      assignments,
                                                      centroids_res.value(),
                                                      options,
@@ -964,6 +1227,17 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
         return repartition_res.status();
       }
       std::vector<AlignedVector<VectorRecord>> repartitioned = std::move(repartition_res.value());
+      auto finalization_res = FinalizePartitionPQCodes(
+          main_ivf, main_versions, active_neighborhood, &repartitioned);
+      if (!finalization_res.ok()) {
+        return finalization_res.status();
+      }
+      AccumulatePQFinalizationProfiling(finalization_res.value(), profiling);
+      Status append_prepared = AppendPreparedPQPayload(
+          std::move(finalization_res.value().prepared_pq), assignments.size(), &patch);
+      if (!append_prepared.ok()) {
+        return append_prepared;
+      }
       for (size_t i = 0; i < active_neighborhood.size(); ++i) {
         patch.partition_ids.push_back(active_neighborhood[i]);
         patch.replacement_records.push_back(std::move(repartitioned[i]));
@@ -1004,6 +1278,7 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
   std::atomic<bool> failed{false};
   std::mutex err_mu;
   Status first_error = Status::OK();
+  std::vector<std::optional<PreparedPQPayload>> prepared_batches(active_partitions.size());
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
@@ -1013,14 +1288,20 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     }
     const uint32_t p = active_partitions[static_cast<size_t>(i)];
     const auto& delta_bucket = assignments[static_cast<size_t>(p)];
+    VectorAccessorMaterializationStats materialization_profile;
     const auto fetch_start = profiling != nullptr
                                  ? ProfilingClock::now()
                                  : ProfilingClock::time_point{};
     auto main_records_res =
-        FetchPartitionRecordsForMerge(main_ivf, main_versions, p, base_vectors);
+        FetchPartitionRecordsForMerge(main_ivf,
+                                      main_versions,
+                                      p,
+                                      vector_accessor,
+                                      &materialization_profile);
     if (profiling != nullptr) {
       std::lock_guard<std::mutex> lock(profiling_mu);
       profiling->fetch_main_records_us += ElapsedProfilingMicros(fetch_start);
+      AccumulateVectorAccessorMaterialization(materialization_profile, profiling);
     }
     if (!main_records_res.ok()) {
       std::lock_guard<std::mutex> lock(err_mu);
@@ -1036,8 +1317,17 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
     }
     Result<AlignedVector<VectorRecord>> merged_res =
         recluster_flags[static_cast<size_t>(p)] != 0
-            ? merge_partition_recluster(p, main_records_res.value(), delta_bucket, options)
-            : merge_partition_append(p, main_records_res.value(), delta_bucket);
+            ? MergePartitionReclusterImpl(p,
+                                          main_records_res.value(),
+                                          frozen_delta,
+                                          consumable_frozen_delta,
+                                          delta_bucket,
+                                          options)
+            : MergePartitionAppendImpl(p,
+                                       main_records_res.value(),
+                                       frozen_delta,
+                                       consumable_frozen_delta,
+                                       delta_bucket);
     if (!merged_res.ok()) {
       std::lock_guard<std::mutex> lock(err_mu);
       if (!failed.exchange(true)) {
@@ -1045,10 +1335,36 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       }
       continue;
     }
-    patch.replacement_records[static_cast<size_t>(i)] = std::move(merged_res.value());
+    std::vector<uint32_t> batch_partition_ids{p};
+    std::vector<AlignedVector<VectorRecord>> batch_records;
+    batch_records.push_back(std::move(merged_res.value()));
+    auto finalization_res = FinalizePartitionPQCodes(
+        main_ivf, main_versions, batch_partition_ids, &batch_records);
+    if (!finalization_res.ok()) {
+      std::lock_guard<std::mutex> lock(err_mu);
+      if (!failed.exchange(true)) {
+        first_error = finalization_res.status();
+      }
+      continue;
+    }
+    if (profiling != nullptr) {
+      std::lock_guard<std::mutex> lock(profiling_mu);
+      AccumulatePQFinalizationProfiling(finalization_res.value(), profiling);
+    }
+    prepared_batches[static_cast<size_t>(i)] =
+        std::move(finalization_res.value().prepared_pq);
+    patch.replacement_records[static_cast<size_t>(i)] =
+        std::move(batch_records.front());
   }
   if (failed.load(std::memory_order_relaxed)) {
     return first_error;
+  }
+  for (auto& prepared_batch : prepared_batches) {
+    Status append_prepared = AppendPreparedPQPayload(
+        std::move(prepared_batch), active_partitions.size(), &patch);
+    if (!append_prepared.ok()) {
+      return append_prepared;
+    }
   }
   if (profiling != nullptr) {
     profiling->patch_records = 0;
@@ -1073,7 +1389,7 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const FrozenDelta& frozen_delta,
                                                  const MergeOptions& options) {
   return MergeFrozenDeltaIntoMainImpl(
-      main_ivf, main_versions, frozen_delta, nullptr, options);
+      main_ivf, main_versions, frozen_delta, nullptr, nullptr, nullptr, options);
 }
 
 Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
@@ -1081,20 +1397,43 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const FrozenDelta& frozen_delta,
                                                  const MatrixRM& base_vectors,
                                                  const MergeOptions& options) {
+  MatrixVectorAccessor vector_accessor(base_vectors);
+  return merge_frozen_delta_into_main(
+      main_ivf, main_versions, frozen_delta, vector_accessor, options);
+}
+
+Result<MergeReport> merge_frozen_delta_into_main(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
+    const VectorAccessor& vector_accessor,
+    const MergeOptions& options) {
   return MergeFrozenDeltaIntoMainImpl(
-      main_ivf, main_versions, frozen_delta, &base_vectors, options);
+      main_ivf,
+      main_versions,
+      frozen_delta,
+      nullptr,
+      &vector_accessor,
+      nullptr,
+      options);
 }
 
 Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
                                                  const FrozenDelta& frozen_delta,
-                                                 const MatrixRM* base_vectors,
+                                                 FrozenDelta* consumable_frozen_delta,
+                                                 const VectorAccessor* vector_accessor,
+                                                 const VectorAccessorMaterializationStats*
+                                                     initial_materialization,
                                                  const MergeOptions& options) {
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
   MergeProfiling profiling;
   profiling.frozen_records = static_cast<uint64_t>(frozen_delta.records.size());
+  if (initial_materialization != nullptr) {
+    AccumulateVectorAccessorMaterialization(*initial_materialization, &profiling);
+  }
   Timer merge_compute_timer;
   auto centroids_res = main_ivf->GetRoutingCentroids(main_versions);
   if (!centroids_res.ok()) {
@@ -1130,16 +1469,24 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   }
   profiling.scoring_us = scoring_timer.ElapsedMicros();
   Timer patch_prepare_timer;
+  // Assignment, diagnostics, stats, and scoring are complete. Prepare is the
+  // first phase allowed to consume a locally owned Frozen payload.
   auto patch_res = PreparePartitionPatchImpl(
       main_ivf,
       main_versions,
+      frozen_delta,
+      consumable_frozen_delta,
       assign_res.value(),
       score_res.value(),
-      base_vectors,
+      vector_accessor,
       options,
       &profiling);
   if (!patch_res.ok()) {
     return patch_res.status();
+  }
+  if (consumable_frozen_delta != nullptr) {
+    profiling.frozen_payload_records_moved =
+        static_cast<uint64_t>(frozen_delta.records.size());
   }
   profiling.patch_prepare_us = patch_prepare_timer.ElapsedMicros();
   const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
@@ -1215,7 +1562,13 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
   if (!frozen_res.ok()) {
     return frozen_res.status();
   }
-  return merge_frozen_delta_into_main(main_ivf, main_versions, frozen_res.value(), options);
+  return MergeFrozenDeltaIntoMainImpl(main_ivf,
+                                      main_versions,
+                                      frozen_res.value(),
+                                      &frozen_res.value(),
+                                      nullptr,
+                                      nullptr,
+                                      options);
 }
 
 Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
@@ -1224,12 +1577,35 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const VersionSet& delta_versions,
                                                  const MatrixRM& base_vectors,
                                                  const MergeOptions& options) {
-  auto frozen_res = freeze_delta(delta_ivf, delta_versions, base_vectors);
+  MatrixVectorAccessor vector_accessor(base_vectors);
+  return merge_frozen_delta_into_main(main_ivf,
+                                      main_versions,
+                                      delta_ivf,
+                                      delta_versions,
+                                      vector_accessor,
+                                      options);
+}
+
+Result<MergeReport> merge_frozen_delta_into_main(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const std::shared_ptr<IVFIndex>& delta_ivf,
+    const VersionSet& delta_versions,
+    const VectorAccessor& vector_accessor,
+    const MergeOptions& options) {
+  VectorAccessorMaterializationStats materialization_profile;
+  auto frozen_res = FreezeDeltaFromAccessor(
+      delta_ivf, delta_versions, vector_accessor, &materialization_profile);
   if (!frozen_res.ok()) {
     return frozen_res.status();
   }
-  return merge_frozen_delta_into_main(
-      main_ivf, main_versions, frozen_res.value(), base_vectors, options);
+  return MergeFrozenDeltaIntoMainImpl(main_ivf,
+                                      main_versions,
+                                      frozen_res.value(),
+                                      &frozen_res.value(),
+                                      &vector_accessor,
+                                      &materialization_profile,
+                                      options);
 }
 
 }  // namespace ann

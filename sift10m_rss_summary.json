@@ -1,0 +1,16 @@
+{
+  "command": [
+    "numactl",
+    "--cpunodebind=0",
+    "--membind=0",
+    "./build_release/run_eval",
+    "configs/sift10m_drift.json",
+    "/home/ydy/data/sift10M/drift_fast"
+  ],
+  "returncode": 0,
+  "elapsed_ms": 3759286,
+  "samples": 37378,
+  "peak_rss_kb": 24547196,
+  "peak_hwm_kb": 24547196,
+  "csv": "sift10m_rss_trace.csv"
+}

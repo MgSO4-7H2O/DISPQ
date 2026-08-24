@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <utility>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -112,8 +114,72 @@ int main() {
   cands[0].doc_id = 0;
   auto rerank_status = RerankL2(sample, &cands, [&](DocId) -> Result<Eigen::VectorXf> {
     return sample;
+  }, [&](DocId) -> Result<float> {
+    return sample.squaredNorm();
   });
   assert(rerank_status.ok());
+  assert(std::fabs(cands[0].rerank_dist) < 1e-6f);
+
+  for (bool residual : {true, false}) {
+    constexpr uint32_t kSoADim = 8;
+    MatrixRM training = MatrixRM::Zero(1, kSoADim);
+    std::vector<DocId> training_ids = {900};
+
+    IVFParams pq_params;
+    pq_params.nlist = 1;
+    pq_params.dim = kSoADim;
+    pq_params.kmeans_iterations = 1;
+    pq_params.pq.enable = true;
+    pq_params.pq.M = 1;
+    pq_params.pq.nbits = 8;
+    pq_params.pq.residual = residual;
+    pq_params.use_fixed_routing_centroids = true;
+    pq_params.fixed_routing_centroids = MatrixRM::Zero(1, kSoADim);
+    pq_params.use_fixed_pq_codebooks = true;
+    MatrixRM codebook = MatrixRM::Zero(256, kSoADim);
+    for (int k = 0; k < 256; ++k) {
+      codebook(k, 0) = static_cast<float>(k);
+    }
+    pq_params.fixed_pq_codebooks = {codebook};
+
+    auto pq_ivf = CreateIVFIndex();
+    auto pq_version = pq_ivf->Build(training, training_ids, pq_params, residual ? 201 : 202);
+    assert(pq_version.ok());
+    VersionSet pq_routes{1, pq_version.value()};
+
+    AlignedVector<VectorRecord> pq_records;
+    for (const auto& doc_value : {std::pair<DocId, float>{100, 30.0f},
+                                  std::pair<DocId, float>{101, 10.0f},
+                                  std::pair<DocId, float>{102, 20.0f}}) {
+      VectorRecord r;
+      r.doc_id = doc_value.first;
+      r.dim = kSoADim;
+      r.versions = pq_routes;
+      r.ivf_id = 0;
+      r.x = Eigen::VectorXf::Zero(kSoADim);
+      r.x(0) = doc_value.second;
+      pq_records.push_back(std::move(r));
+    }
+    assert(pq_ivf->Add(pq_records).ok());
+
+    Eigen::VectorXf pq_query = Eigen::VectorXf::Zero(kSoADim);
+    pq_query(0) = 10.0f;
+    auto pq_search = pq_ivf->Search(pq_query, 3, 1, pq_routes, 0);
+    assert(pq_search.ok());
+    assert(!pq_search.value().topk.empty());
+    assert(pq_search.value().topk[0].doc_id == 101);
+    assert(std::fabs(pq_search.value().topk[0].approx_dist) < 1e-5f);
+
+    auto payload_res = pq_ivf->Serialize();
+    assert(payload_res.ok());
+    auto restored = CreateIVFIndex();
+    assert(restored->Deserialize(payload_res.value()).ok());
+    auto restored_search = restored->Search(pq_query, 3, 1, pq_routes, 0);
+    assert(restored_search.ok());
+    assert(!restored_search.value().topk.empty());
+    assert(restored_search.value().topk[0].doc_id == 101);
+    assert(std::fabs(restored_search.value().topk[0].approx_dist) < 1e-5f);
+  }
 
   {
     const std::string tmp_fvecs = "test_vectors.fvecs";

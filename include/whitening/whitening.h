@@ -18,6 +18,10 @@ class WhiteningModel {
   // NTS: Fits statistics for a new version using batched data (X shape: n x dim, row-major).
   virtual Result<VersionId> Fit(Eigen::Ref<const MatrixRM> X) = 0;
 
+  // NTS: Fits a new version from externally accumulated raw-space moments.
+  virtual Result<VersionId> FitFromMeanCov(Eigen::Ref<const Eigen::VectorXf> mean,
+                                           Eigen::Ref<const MatrixRM> cov) = 0;
+
   // TS: Applies the whitening transform corresponding to version -> out_xw.
   virtual Result<void> Transform(Eigen::Ref<const Eigen::VectorXf> x,
                                  VersionId version,
@@ -26,6 +30,15 @@ class WhiteningModel {
   // TS: Applies whitening transform to a batch matrix (each row a vector).
   virtual Result<MatrixRM> TransformBatch(Eigen::Ref<const MatrixRM> X,
                                           VersionId version) const = 0;
+
+  // TS: Maps vectors from a whitening space back to raw input space.
+  virtual Result<void> InverseTransform(Eigen::Ref<const Eigen::VectorXf> xw,
+                                        VersionId version,
+                                        Eigen::Ref<Eigen::VectorXf> out_x) const = 0;
+
+  // TS: Batch inverse transform, rows are whitened vectors.
+  virtual Result<MatrixRM> InverseTransformBatch(Eigen::Ref<const MatrixRM> Xw,
+                                                 VersionId version) const = 0;
 
   // NTS: Updates running stats using a single sample.
   virtual Status UpdateStats(Eigen::Ref<const Eigen::VectorXf> x) = 0;

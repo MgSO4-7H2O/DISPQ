@@ -45,6 +45,31 @@ class ZCAWhiteningModel : public WhiteningModel {
     return version;
   }
 
+  Result<VersionId> FitFromMeanCov(Eigen::Ref<const Eigen::VectorXf> mean,
+                                   Eigen::Ref<const MatrixRM> cov) override {
+    if (mean.size() == 0 || cov.rows() == 0 || cov.cols() == 0) {
+      return Status::InvalidArgument("FitFromMeanCov: empty moments");
+    }
+    if (cov.rows() != cov.cols() || cov.rows() != mean.size()) {
+      return Status::InvalidArgument("FitFromMeanCov: dimension mismatch");
+    }
+    VersionPayload payload;
+    payload.mean = mean;
+    payload.dim = static_cast<uint32_t>(mean.size());
+    payload.epsilon = kDefaultEpsilon;
+    auto status = ComputePayloadFromCov(cov, &payload);
+    if (!status.ok()) {
+      return status;
+    }
+    std::unique_lock lock(mu_);
+    VersionId version = next_version_++;
+    payload.version = version;
+    versions_[version] = std::move(payload);
+    dim_ = versions_[version].dim;
+    ResetPending();
+    return version;
+  }
+
   Result<void> Transform(Eigen::Ref<const Eigen::VectorXf> x,
                          VersionId version,
                          Eigen::Ref<Eigen::VectorXf> out_xw) const override {
@@ -75,6 +100,38 @@ class ZCAWhiteningModel : public WhiteningModel {
     MatrixRM centered = X.rowwise() - payload.mean.transpose();
     MatrixRM whitened = centered * payload.transform.transpose();
     return whitened;
+  }
+
+  Result<void> InverseTransform(Eigen::Ref<const Eigen::VectorXf> xw,
+                                VersionId version,
+                                Eigen::Ref<Eigen::VectorXf> out_x) const override {
+    std::shared_lock lock(mu_);
+    auto it = versions_.find(version);
+    if (it == versions_.end()) {
+      return Status::NotFound("Whitening version missing");
+    }
+    const VersionPayload& payload = it->second;
+    if (xw.size() != payload.mean.size() || out_x.size() != xw.size()) {
+      return Status::InvalidArgument("Dimension mismatch for InverseTransform");
+    }
+    out_x = payload.transform_inv * xw + payload.mean;
+    return Result<void>();
+  }
+
+  Result<MatrixRM> InverseTransformBatch(Eigen::Ref<const MatrixRM> Xw,
+                                         VersionId version) const override {
+    std::shared_lock lock(mu_);
+    auto it = versions_.find(version);
+    if (it == versions_.end()) {
+      return Status::NotFound("Whitening version missing");
+    }
+    const VersionPayload& payload = it->second;
+    if (Xw.cols() != payload.mean.size()) {
+      return Status::InvalidArgument("Dimension mismatch for batch inverse transform");
+    }
+    MatrixRM raw = Xw * payload.transform_inv.transpose();
+    raw.rowwise() += payload.mean.transpose();
+    return raw;
   }
 
   Status UpdateStats(Eigen::Ref<const Eigen::VectorXf> x) override {

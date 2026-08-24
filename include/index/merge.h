@@ -7,6 +7,7 @@
 
 #include "common/result.h"
 #include "common/types.h"
+#include "common/vector_accessor.h"
 #include "index/ivf.h"
 
 namespace ann {
@@ -16,7 +17,7 @@ struct FrozenDelta {
 };
 
 struct DeltaAssignment {
-  VectorRecord record;
+  uint32_t frozen_index{0};
   uint32_t main_partition{0};
   float residual_dist{0.0f};
 };
@@ -67,14 +68,27 @@ struct DistributionSummary {
 struct MergeProfiling {
   uint32_t effective_nlist{0};
   uint64_t frozen_records{0};
+  uint64_t assignment_descriptor_records{0};
+  uint64_t assignment_full_vector_copy_bytes{0};
+  uint64_t frozen_payload_records_moved{0};
+  uint64_t vector_accessor_materialize_calls{0};
+  uint64_t vector_accessor_materialized_rows{0};
+  uint64_t vector_accessor_materialized_bytes{0};
+  uint32_t vector_accessor_max_materialize_rows{0};
   uint64_t seed_partitions{0};
   uint64_t neighborhoods{0};
   uint64_t main_records_loaded{0};
   uint64_t pooled_records{0};
   uint64_t repartitioned_records{0};
   uint64_t patch_records{0};
+  uint64_t patch_dense_vector_bytes{0};
+  uint64_t patch_retained_vector_bytes{0};
+  uint64_t patch_elided_vector_bytes{0};
+  uint64_t patch_final_pq_code_bytes{0};
   uint64_t pq_codes_reused{0};
   uint64_t pq_codes_reencoded{0};
+  uint64_t prepare_pq_codes_reused{0};
+  uint64_t prepare_pq_codes_reencoded{0};
 
   double merge_delta_to_main_assignment_us{0.0};
   double merge_assignment_distance_us{0.0};
@@ -90,6 +104,7 @@ struct MergeProfiling {
   double repartition_candidate_selection_us{0.0};
   double repartition_sort_us{0.0};
   double patch_prepare_us{0.0};
+  double prepare_pq_encode_us{0.0};
   double commit_us{0.0};
   double pq_code_assignment_us{0.0};
   double pq_code_copy_or_reuse_us{0.0};
@@ -121,6 +136,9 @@ Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
 Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
                                  const VersionSet& delta_versions,
                                  const MatrixRM& base_vectors);
+Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
+                                 const VersionSet& delta_versions,
+                                 const VectorAccessor& vector_accessor);
 
 Result<PartitionAssignments> assign_delta_to_main_centroids(
     const FrozenDelta& frozen_delta,
@@ -138,26 +156,38 @@ Result<PartitionScoreResult> score_partitions(const std::vector<PartitionStats>&
 Result<AlignedVector<VectorRecord>> merge_partition_append(
     uint32_t partition_id,
     const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
     const AlignedVector<DeltaAssignment>& delta_partition_records);
 
 Result<AlignedVector<VectorRecord>> merge_partition_recluster(
     uint32_t partition_id,
     const AlignedVector<VectorRecord>& main_partition_records,
+    const FrozenDelta& frozen_delta,
     const AlignedVector<DeltaAssignment>& delta_partition_records,
     const MergeOptions& options);
 
 Result<PartitionPatch> prepare_partition_patch(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MergeOptions& options);
 Result<PartitionPatch> prepare_partition_patch(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
     const PartitionAssignments& assignments,
     const PartitionScoreResult& score_result,
     const MatrixRM& base_vectors,
+    const MergeOptions& options);
+Result<PartitionPatch> prepare_partition_patch(
+    const std::shared_ptr<IVFIndex>& main_ivf,
+    const VersionSet& main_versions,
+    const FrozenDelta& frozen_delta,
+    const PartitionAssignments& assignments,
+    const PartitionScoreResult& score_result,
+    const VectorAccessor& vector_accessor,
     const MergeOptions& options);
 
 Status commit_partition_patch(const std::shared_ptr<IVFIndex>& main_ivf,
@@ -173,6 +203,11 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const FrozenDelta& frozen_delta,
                                                  const MatrixRM& base_vectors,
                                                  const MergeOptions& options);
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const FrozenDelta& frozen_delta,
+                                                 const VectorAccessor& vector_accessor,
+                                                 const MergeOptions& options);
 
 Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
@@ -184,6 +219,12 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const std::shared_ptr<IVFIndex>& delta_ivf,
                                                  const VersionSet& delta_versions,
                                                  const MatrixRM& base_vectors,
+                                                 const MergeOptions& options);
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const std::shared_ptr<IVFIndex>& delta_ivf,
+                                                 const VersionSet& delta_versions,
+                                                 const VectorAccessor& vector_accessor,
                                                  const MergeOptions& options);
 
 }  // namespace ann

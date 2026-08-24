@@ -21,6 +21,10 @@
 
 #include <Eigen/Dense>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -30,6 +34,7 @@
 #include "common/prebuilt_index.h"
 #include "common/timer.h"
 #include "common/types.h"
+#include "eval_memory.h"
 #include "eval/metrics.h"
 #include "index/ivf.h"
 #include "index/merge.h"
@@ -46,6 +51,16 @@ constexpr uint32_t kSlowQueryDebugCount = 5;
 constexpr uint32_t kAddBlockRows = 65536;
 constexpr uint32_t kWhitenedMinGrowthRows = 65536;
 constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
+
+void TrimAllocatorRetainedMemory(const char* stage) {
+#ifdef __GLIBC__
+  const int released = malloc_trim(0);
+  std::cout << "[MALLOC_TRIM] stage=" << stage
+            << ", released=" << released << std::endl;
+#else
+  (void)stage;
+#endif
+}
 
 void EnsureWhitenedCapacity(MatrixRM* matrix,
                             uint32_t required_rows,
@@ -151,6 +166,35 @@ uint32_t RuntimeMaxThreads() {
 #else
   return 1;
 #endif
+}
+
+constexpr bool OpenMPCompiled() {
+#ifdef _OPENMP
+  return true;
+#else
+  return false;
+#endif
+}
+
+constexpr bool AVX2Compiled() {
+#ifdef __AVX2__
+  return true;
+#else
+  return false;
+#endif
+}
+
+constexpr bool AVX512FCompiled() {
+#ifdef __AVX512F__
+  return true;
+#else
+  return false;
+#endif
+}
+
+float SquaredL2FromNormDot(float a_norm, float b_norm, float dot) {
+  const float dist = a_norm + b_norm - 2.0f * dot;
+  return dist >= 0.0f ? dist : 0.0f;
 }
 
 struct RouteDebugStats {
@@ -772,12 +816,17 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
                        uint32_t end,
                        uint32_t dim,
                        const VersionSet& versions,
-                       IngestProfiling* profiling = nullptr) {
+                       IngestProfiling* profiling = nullptr,
+                       const std::vector<int>* precomputed_assignments = nullptr) {
   if (!ivf) {
     return Status::InvalidArgument("AddRangeToIndex: null ivf");
   }
   if (begin > end || end > static_cast<uint32_t>(x_whitened.rows())) {
     return Status::InvalidArgument("AddRangeToIndex: invalid range");
+  }
+  if (precomputed_assignments != nullptr &&
+      precomputed_assignments->size() != static_cast<size_t>(end - begin)) {
+    return Status::InvalidArgument("AddRangeToIndex: assignment size mismatch");
   }
   if (begin == end) {
     return Status::OK();
@@ -786,6 +835,7 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
   for (uint32_t block_begin = begin; block_begin < end;) {
     const uint32_t block_end =
         block_begin + std::min<uint32_t>(kAddBlockRows, end - block_begin);
+    Timer record_construction_timer;
     AlignedVector<VectorRecord> records;
     records.reserve(static_cast<size_t>(block_end - block_begin));
     for (uint32_t i = block_begin; i < block_end; ++i) {
@@ -797,18 +847,28 @@ Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
       rec.x = x_whitened.row(static_cast<int64_t>(i)).transpose();
       records.push_back(std::move(rec));
     }
-    const Status add_status = ivf->AddBatch(records, block_end == end);
+    const double record_construction_us = record_construction_timer.ElapsedMicros();
+    const int* block_assignments =
+        precomputed_assignments != nullptr
+            ? precomputed_assignments->data() + (block_begin - begin)
+            : nullptr;
+    const Status add_status =
+        ivf->AddBatch(records, block_end == end, block_assignments);
     if (!add_status.ok()) {
       return add_status;
     }
     if (profiling != nullptr) {
+      profiling->record_construction_us += record_construction_us;
       auto block_profile = ivf->GetLastIngestProfiling(versions);
       if (!block_profile.ok()) {
         return block_profile.status();
       }
       profiling->records += block_profile.value().records;
+      profiling->validation_us += block_profile.value().validation_us;
       profiling->assignment_us += block_profile.value().assignment_us;
       profiling->encode_us += block_profile.value().encode_us;
+      profiling->deferred_pq_stats_us +=
+          block_profile.value().deferred_pq_stats_us;
       profiling->commit_us += block_profile.value().commit_us;
     }
     block_begin = block_end;
@@ -1060,13 +1120,15 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
                                bool exact_rerank_enable,
                                const std::vector<uint32_t>& rerank_candidates_per_route,
                                Eigen::Ref<const Eigen::VectorXf> query_whitened,
-                               const MatrixRM& base_whitened) {
+                               const MatrixRM& base_whitened,
+                               const Eigen::VectorXf& base_norms) {
   SearchResult out;
   if (partial_results.empty() || topk == 0) {
     return out;
   }
-  std::unordered_map<DocId, Candidate> best_by_doc;
   uint64_t scanned = 0;
+
+  size_t total_candidates = 0;
   for (size_t ri = 0; ri < partial_results.size(); ++ri) {
     const auto& part = partial_results[ri];
     scanned += part.scanned_candidates;
@@ -1077,19 +1139,47 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
                                      : static_cast<uint32_t>(route_take);
       route_take = std::min(route_take, static_cast<size_t>(route_cap));
     }
-    for (size_t i = 0; i < route_take; ++i) {
-      const auto& cand = part.topk[i];
-      auto it = best_by_doc.find(cand.doc_id);
-      if (it == best_by_doc.end() || cand.approx_dist < it->second.approx_dist) {
-        best_by_doc[cand.doc_id] = cand;
-      }
-    }
+    total_candidates += route_take;
   }
 
   std::vector<Candidate> merged;
-  merged.reserve(best_by_doc.size());
-  for (const auto& kv : best_by_doc) {
-    merged.push_back(kv.second);
+  merged.reserve(total_candidates);
+  for (size_t ri = 0; ri < partial_results.size(); ++ri) {
+    const auto& part = partial_results[ri];
+    size_t route_take = part.topk.size();
+    if (exact_rerank_enable) {
+      const uint32_t route_cap = ri < rerank_candidates_per_route.size()
+                                     ? rerank_candidates_per_route[ri]
+                                     : static_cast<uint32_t>(route_take);
+      route_take = std::min(route_take, static_cast<size_t>(route_cap));
+    }
+    for (size_t i = 0; i < route_take; ++i) {
+      merged.push_back(part.topk[i]);
+    }
+  }
+  if (partial_results.size() > 1) {
+    auto doc_approx_less = [](const Candidate& a, const Candidate& b) {
+      if (a.doc_id != b.doc_id) {
+        return a.doc_id < b.doc_id;
+      }
+      if (a.approx_dist != b.approx_dist) {
+        return a.approx_dist < b.approx_dist;
+      }
+      return a.from_new < b.from_new;
+    };
+    std::sort(merged.begin(), merged.end(), doc_approx_less);
+    size_t write = 0;
+    for (size_t read = 0; read < merged.size();) {
+      if (write != read) {
+        merged[write] = std::move(merged[read]);
+      }
+      const DocId doc_id = merged[write].doc_id;
+      ++write;
+      do {
+        ++read;
+      } while (read < merged.size() && merged[read].doc_id == doc_id);
+    }
+    merged.resize(write);
   }
 
   auto approx_less = [](const Candidate& a, const Candidate& b) {
@@ -1110,18 +1200,21 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
 
   if (exact_rerank_enable) {
     for (const auto& cand : merged) {
-      if (cand.doc_id >= static_cast<DocId>(base_whitened.rows())) {
+      if (cand.doc_id >= static_cast<DocId>(base_whitened.rows()) ||
+          cand.doc_id >= static_cast<DocId>(base_norms.size())) {
         return Status::InvalidArgument("MergeTopK: doc id out of range for exact rerank");
       }
     }
+    const float query_norm = query_whitened.squaredNorm();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (!omp_in_parallel() && merged.size() > 1)
 #endif
     for (int64_t i = 0; i < static_cast<int64_t>(merged.size()); ++i) {
       auto& cand = merged[static_cast<size_t>(i)];
-      const Eigen::VectorXf diff =
-          query_whitened - base_whitened.row(static_cast<Eigen::Index>(cand.doc_id)).transpose();
-      cand.rerank_dist = diff.squaredNorm();
+      const Eigen::Index doc_idx = static_cast<Eigen::Index>(cand.doc_id);
+      const float dot = base_whitened.row(doc_idx).dot(query_whitened);
+      cand.rerank_dist =
+          SquaredL2FromNormDot(query_norm, base_norms(doc_idx), dot);
     }
     if (merged.size() > topk) {
       std::nth_element(merged.begin(),
@@ -1149,6 +1242,7 @@ Result<SearchResult> MergeTopK(const std::vector<SearchResult>& partial_results,
 
 Result<EvalMetrics> EvaluateState(const Config& config,
                                   const MatrixRM& base_whitened,
+                                  const Eigen::VectorXf& base_norms,
                                   uint32_t seen_rows,
                                   uint32_t new_begin,
                                   uint32_t new_end,
@@ -1164,6 +1258,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                   const SearchParams& params) {
   if (seen_rows == 0 || seen_rows > static_cast<uint32_t>(base_whitened.rows())) {
     return Status::InvalidArgument("EvaluateState: invalid seen_rows");
+  }
+  if (seen_rows > static_cast<uint32_t>(base_norms.size())) {
+    return Status::InvalidArgument("EvaluateState: invalid base_norms");
   }
   if (main_rows == 0 || main_rows > seen_rows) {
     return Status::InvalidArgument("EvaluateState: invalid main_rows");
@@ -1368,7 +1465,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                 enable_exact_rerank,
                                 route_rerank_candidates,
                                 q,
-                                base_whitened);
+                                base_whitened,
+                                base_norms);
     if (!merged_res.ok()) {
       std::lock_guard<std::mutex> lock(error_mu);
       if (!failed.exchange(true)) {
@@ -1465,11 +1563,13 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       exact_ranked.reserve(approx_by_doc.size());
       const Eigen::VectorXf qv =
           queries_whitened_runtime.row(static_cast<Eigen::Index>(qi)).transpose();
+      const float qnorm = qv.squaredNorm();
       for (const auto& kv : approx_by_doc) {
         approx_ranked.push_back({kv.second, kv.first});
-        const Eigen::VectorXf diff =
-            qv - base_whitened.row(static_cast<Eigen::Index>(kv.first)).transpose();
-        exact_ranked.push_back({diff.squaredNorm(), kv.first});
+        const Eigen::Index doc_idx = static_cast<Eigen::Index>(kv.first);
+        const float dot = base_whitened.row(doc_idx).dot(qv);
+        exact_ranked.push_back(
+            {SquaredL2FromNormDot(qnorm, base_norms(doc_idx), dot), kv.first});
       }
       std::sort(approx_ranked.begin(), approx_ranked.end(),
                 [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -1776,6 +1876,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   RuntimeOptions runtime_opts = runtime_opts_res.value();
+  std::cout << "[RUNTIME_ENV] omp_get_max_threads=" << RuntimeMaxThreads()
+            << ", openmp_compiled=" << std::boolalpha << OpenMPCompiled()
+            << ", avx2_compiled=" << AVX2Compiled()
+            << ", avx512f_compiled=" << AVX512FCompiled() << std::endl;
   const std::string config_path = runtime_opts.config_path;
   auto config_res = LoadConfigFromJson(config_path);
   if (!config_res.ok()) {
@@ -1851,26 +1955,28 @@ int main(int argc, char** argv) {
   }
 
   uint32_t nx = 0;
-  MatrixRM X;
+  ann::eval_memory::BaseVectorSource base_source;
   if (base_dataset_path) {
-    auto load_res = LoadFvecs(*base_dataset_path);
-    if (!load_res.ok()) {
-      std::cerr << load_res.status().ToString() << std::endl;
+    auto source_res = ann::eval_memory::MakeFvecsBaseSource(*base_dataset_path);
+    if (!source_res.ok()) {
+      std::cerr << source_res.status().ToString() << std::endl;
       return 1;
     }
-    X = load_res.value();
-    nx = static_cast<uint32_t>(X.rows());
+    base_source = std::move(source_res.value());
+    nx = base_source.rows;
     if (nx == 0) {
       std::cerr << "Base dataset contains no vectors." << std::endl;
       return 1;
     }
-    if (config.dim != static_cast<uint32_t>(X.cols())) {
-      std::cout << "[INFO] Overriding config dim " << config.dim << " -> " << X.cols() << std::endl;
-      config.dim = static_cast<uint32_t>(X.cols());
+    if (config.dim != base_source.dim) {
+      std::cout << "[INFO] Overriding config dim " << config.dim << " -> "
+                << base_source.dim << std::endl;
+      config.dim = base_source.dim;
     }
   } else {
     nx = 64;
-    X = GenerateRandom(nx, config.dim, config.seed);
+    base_source = ann::eval_memory::MakeResidentBaseSource(
+        GenerateRandom(nx, config.dim, config.seed));
   }
 
   uint32_t nq = 0;
@@ -1965,9 +2071,49 @@ int main(int argc, char** argv) {
   VersionId whiten_version = 0;
   VersionSet main_versions{};
   MatrixRM X_whitened;
+  Eigen::VectorXf X_whitened_norms;
   MatrixRM Q_whitened;
   uint32_t main_rows_current = main_rows_initial;
   uint32_t next_insert_idx = stream_start_idx;
+  std::optional<DeltaShard> active_delta;
+  std::optional<DeltaShard> frozen_delta;
+  uint32_t whitening_version_count_estimate = 0;
+
+  ann::eval_memory::MemoryTraceRecorder memory_trace;
+  auto collect_memory_components = [&]() {
+    std::vector<ann::eval_memory::MemoryComponent> components;
+    components.push_back({"base.raw_resident", base_source.ResidentBytes()});
+    components.push_back({"base.whitened_matrix", ann::eval_memory::MatrixBytes(X_whitened)});
+    components.push_back({"base.whitened_norms", ann::eval_memory::VectorBytes(X_whitened_norms)});
+    components.push_back({"query.raw", ann::eval_memory::MatrixBytes(Q)});
+    components.push_back({"query.whitened", ann::eval_memory::MatrixBytes(Q_whitened)});
+    const uint64_t whitening_version_bytes =
+        (2ull * static_cast<uint64_t>(config.dim) * static_cast<uint64_t>(config.dim) +
+         static_cast<uint64_t>(config.dim)) *
+        sizeof(float);
+    components.push_back({"whitening.model_versions_estimate",
+                          static_cast<uint64_t>(whitening_version_count_estimate) *
+                              whitening_version_bytes});
+    ann::eval_memory::AddIVFMemoryComponents("main", main_ivf, main_versions, &components);
+    if (active_delta.has_value()) {
+      ann::eval_memory::AddIVFMemoryComponents(
+          "active_delta", active_delta->ivf, active_delta->versions, &components);
+    }
+    if (frozen_delta.has_value()) {
+      ann::eval_memory::AddIVFMemoryComponents(
+          "frozen_delta", frozen_delta->ivf, frozen_delta->versions, &components);
+    }
+    return components;
+  };
+  auto record_memory = [&](const std::string& stage,
+                           uint32_t active_rows,
+                           uint64_t transient_estimate_bytes = 0) {
+    memory_trace.Record(stage,
+                        active_rows,
+                        collect_memory_components(),
+                        transient_estimate_bytes);
+  };
+  record_memory("after_dataset_load", 0);
 
   Timer init_total_timer;
   const uint32_t init_visible_rows = std::min<uint32_t>(nx, stream_start_idx);
@@ -2012,6 +2158,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     whiten_version = artifact.metadata.whiten_version;
+    whitening_version_count_estimate = 1;
     main_versions = VersionSet{whiten_version, artifact.metadata.index_version};
     auto main_sizes_res = main_ivf->GetPartitionSizes(main_versions);
     if (!main_sizes_res.ok()) {
@@ -2029,26 +2176,38 @@ int main(int argc, char** argv) {
     }
   } else {
     Timer init_fit_timer;
-    auto whiten_version_res = whitening->Fit(X.topRows(main_rows_initial));
+    auto whiten_version_res = ann::eval_memory::FitWhiteningFromSourcePrefix(
+        base_source, main_rows_initial, kAddBlockRows, whitening);
     if (!whiten_version_res.ok()) {
       std::cerr << whiten_version_res.status().ToString() << std::endl;
       return 1;
     }
     whiten_version = whiten_version_res.value();
+    whitening_version_count_estimate = 1;
     init_whitening_ms = init_fit_timer.ElapsedMillis();
   }
+  record_memory("after_initial_whitening_fit",
+                0,
+                ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
 
   Timer init_transform_timer;
-  auto xb_res = whitening->TransformBatch(X.topRows(init_visible_rows), whiten_version);
-  if (!xb_res.ok()) {
-    std::cerr << xb_res.status().ToString() << std::endl;
+  Status init_transform_status =
+      ann::eval_memory::TransformSourcePrefixToWhitened(base_source,
+                                                        init_visible_rows,
+                                                        kAddBlockRows,
+                                                        whiten_version,
+                                                        whitening,
+                                                        config.use_cosine,
+                                                        &X_whitened);
+  if (!init_transform_status.ok()) {
+    std::cerr << init_transform_status.ToString() << std::endl;
     return 1;
   }
-  X_whitened = std::move(xb_res.value());
-  if (config.use_cosine) {
-    NormalizeRowsL2(&X_whitened);
-  }
+  X_whitened_norms = X_whitened.rowwise().squaredNorm();
   init_whitening_transform_ms = init_transform_timer.ElapsedMillis();
+  record_memory("after_initial_base_transform",
+                init_visible_rows,
+                2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
 
   auto qb_res = whitening->TransformBatch(Q, whiten_version);
   if (!qb_res.ok()) {
@@ -2076,6 +2235,29 @@ int main(int argc, char** argv) {
     }
     init_main_build_ms = init_build_timer.ElapsedMillis();
     main_versions = VersionSet{whiten_version, main_version_res.value()};
+    auto init_build_profile_res = main_ivf->GetBuildProfiling(main_versions);
+    if (init_build_profile_res.ok()) {
+      const IVFBuildProfiling& build_profile = init_build_profile_res.value();
+      std::cout << "[INITIAL_PQ_BUILD_PROFILE] build_pq_routing_assignment_us="
+                << build_profile.build_pq_routing_assignment_us
+                << ", build_pq_routing_assignment_rows="
+                << build_profile.build_pq_routing_assignment_rows
+                << ", build_pq_subspace_materialize_us="
+                << build_profile.build_pq_subspace_materialize_us
+                << ", build_pq_subspace_materialized_rows="
+                << build_profile.build_pq_subspace_materialized_rows
+                << ", build_pq_subspace_materialized_bytes="
+                << build_profile.build_pq_subspace_materialized_bytes
+                << ", build_pq_max_live_subspaces="
+                << build_profile.build_pq_max_live_subspaces
+                << ", build_pq_kmeans_us=" << build_profile.build_pq_kmeans_us
+                << ", build_pq_training_total_us="
+                << build_profile.build_pq_training_total_us
+                << ", build_pq_full_residual_bytes="
+                << build_profile.build_pq_full_residual_bytes
+                << ", build_pq_training_concurrency="
+                << build_profile.build_pq_training_concurrency << std::endl;
+    }
     Timer init_add_timer;
     Status add_main =
         AddRangeToIndex(main_ivf, X_whitened, 0, main_rows_initial, config.dim, main_versions);
@@ -2085,6 +2267,7 @@ int main(int argc, char** argv) {
     }
     init_main_add_ms = init_add_timer.ElapsedMillis();
   }
+  record_memory("after_initial_main_index", init_visible_rows);
   const double init_rebuild_ms = init_whitening_ms + init_whitening_transform_ms +
                                  init_main_build_ms + init_main_add_ms;
   const double init_total_wall_ms = init_total_timer.ElapsedMillis();
@@ -2097,8 +2280,6 @@ int main(int argc, char** argv) {
             << ", main_add_ms=" << init_main_add_ms
             << ", aligned_ms=" << init_rebuild_ms
             << ", wall_ms=" << init_total_wall_ms << std::endl;
-  std::optional<DeltaShard> active_delta;
-  std::optional<DeltaShard> frozen_delta;
   std::deque<DocId> sliding_window_doc_ids;
   uint32_t next_delta_shard_id = 2;
   bool pending_active_train = false;
@@ -2135,6 +2316,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     active_delta->rows = delta_train_rows;
+    record_memory("after_initial_delta_seed", stream_start_idx);
   }
 
   double total_delta_ingest_assignment_us = 0.0;
@@ -2516,6 +2698,7 @@ int main(int argc, char** argv) {
     }
 
     Timer total_timer;
+    Timer setup_timer;
     const uint32_t seen_rows = trigger.seen_rows;
     const uint32_t old_main_rows = main_rows_current;
     uint32_t rebuild_main_rows = seen_rows;
@@ -2526,25 +2709,63 @@ int main(int argc, char** argv) {
     const uint32_t active_seed_begin = rebuild_main_rows;
     const uint32_t active_seed_rows = seen_rows > active_seed_begin ? seen_rows - active_seed_begin : 0;
 
+    const VersionId old_whiten_version = whiten_version;
+    double setup_ms = setup_timer.ElapsedMillis();
+    double memory_trace_ms = 0.0;
+    double profiling_collect_ms = 0.0;
+
     Timer fit_timer;
-    auto new_whiten_res = whitening->Fit(X.topRows(seen_rows));
+    Result<VersionId> new_whiten_res =
+        config.use_cosine
+            ? ann::eval_memory::FitWhiteningFromSourcePrefix(
+                  base_source, seen_rows, kAddBlockRows, whitening)
+            : ann::eval_memory::FitWhiteningFromWhitenedPrefix(
+                  X_whitened, seen_rows, old_whiten_version, kAddBlockRows, whitening);
     if (!new_whiten_res.ok()) {
       return new_whiten_res.status();
     }
     const VersionId new_whiten_version = new_whiten_res.value();
+    ++whitening_version_count_estimate;
     const double whitening_ms = fit_timer.ElapsedMillis();
+    Timer memory_trace_timer;
+    record_memory("global_rebuild_after_fit",
+                  seen_rows,
+                  config.use_cosine
+                      ? ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim)
+                      : 2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
+    memory_trace_ms += memory_trace_timer.ElapsedMillis();
 
-    Timer transform_timer;
-    auto xb_res = whitening->TransformBatch(X.topRows(seen_rows), new_whiten_version);
-    if (!xb_res.ok()) {
-      return xb_res.status();
+    Timer base_retarget_timer;
+    MatrixRM new_x_whitened;
+    Status transform_status =
+        config.use_cosine
+            ? ann::eval_memory::TransformSourcePrefixToWhitened(base_source,
+                                                                seen_rows,
+                                                                kAddBlockRows,
+                                                                new_whiten_version,
+                                                                whitening,
+                                                                config.use_cosine,
+                                                                &new_x_whitened)
+            : ann::eval_memory::RetargetWhitenedPrefix(X_whitened,
+                                                       seen_rows,
+                                                       kAddBlockRows,
+                                                       old_whiten_version,
+                                                       new_whiten_version,
+                                                       whitening,
+                                                       config.use_cosine,
+                                                       &new_x_whitened);
+    if (!transform_status.ok()) {
+      return transform_status;
     }
-    MatrixRM new_x_whitened = std::move(xb_res.value());
-    if (config.use_cosine) {
-      NormalizeRowsL2(&new_x_whitened);
-    }
-    const double whitening_transform_ms = transform_timer.ElapsedMillis();
+    const double base_retarget_ms = base_retarget_timer.ElapsedMillis();
+    const double whitening_transform_ms = base_retarget_ms;
+    Timer base_memory_trace_timer;
+    record_memory("global_rebuild_after_base_retarget",
+                  seen_rows,
+                  2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
+    memory_trace_ms += base_memory_trace_timer.ElapsedMillis();
 
+    Timer query_transform_timer;
     auto qb_res = whitening->TransformBatch(Q, new_whiten_version);
     if (!qb_res.ok()) {
       return qb_res.status();
@@ -2553,24 +2774,45 @@ int main(int argc, char** argv) {
     if (config.use_cosine) {
       NormalizeRowsL2(&new_q_whitened);
     }
+    const double query_transform_ms = query_transform_timer.ElapsedMillis();
 
+    Timer main_setup_timer;
     auto new_main_ivf = CreateIVFIndex();
     std::vector<DocId> main_ids(static_cast<size_t>(rebuild_main_rows));
     std::iota(main_ids.begin(), main_ids.end(), 0);
+    setup_ms += main_setup_timer.ElapsedMillis();
     Timer build_timer;
+    std::vector<int> routing_assignments;
     auto new_main_version_res = new_main_ivf->Build(new_x_whitened.topRows(rebuild_main_rows),
                                                     main_ids,
                                                     ivf_params,
-                                                    0);
+                                                    0,
+                                                    &routing_assignments);
     if (!new_main_version_res.ok()) {
       return new_main_version_res.status();
     }
     const double main_build_ms = build_timer.ElapsedMillis();
     const VersionSet new_main_versions{new_whiten_version, new_main_version_res.value()};
+    Timer profiling_collect_timer;
+    auto main_build_profile_res = new_main_ivf->GetBuildProfiling(new_main_versions);
+    if (!main_build_profile_res.ok()) {
+      return main_build_profile_res.status();
+    }
+    const IVFBuildProfiling main_build_profile = main_build_profile_res.value();
+    profiling_collect_ms += profiling_collect_timer.ElapsedMillis();
 
     Timer add_main_timer;
-    Status add_main =
-        AddRangeToIndex(new_main_ivf, new_x_whitened, 0, rebuild_main_rows, config.dim, new_main_versions);
+    IngestProfiling main_add_profile;
+    Status add_main = AddRangeToIndex(new_main_ivf,
+                                      new_x_whitened,
+                                      0,
+                                      rebuild_main_rows,
+                                      config.dim,
+                                      new_main_versions,
+                                      &main_add_profile,
+                                      routing_assignments.size() == rebuild_main_rows
+                                          ? &routing_assignments
+                                          : nullptr);
     if (!add_main.ok()) {
       return add_main;
     }
@@ -2581,9 +2823,13 @@ int main(int argc, char** argv) {
     bool rebuilt_pending_active_train = false;
     uint32_t rebuilt_pending_active_train_begin = 0;
     double delta_seed_ms = 0.0;
+    double delta_build_ms = 0.0;
+    double delta_add_ms = 0.0;
+    double delta_finalize_ms = 0.0;
     if (config.enable_streaming && rows_after_main > 0) {
       if (active_seed_rows > 0) {
         Timer delta_timer;
+        Timer delta_build_timer;
         auto delta_train = new_x_whitened.middleRows(active_seed_begin, active_seed_rows);
         IVFParams delta_params = ivf_params;
         delta_params.nlist = std::max(1u, delta_ivf_nlist);
@@ -2593,7 +2839,9 @@ int main(int argc, char** argv) {
         if (!active_res.ok()) {
           return active_res.status();
         }
+        delta_build_ms = delta_build_timer.ElapsedMillis();
         DeltaShard shard = active_res.value();
+        Timer delta_add_timer;
         const Status add_delta_seed = AddRangeToIndex(shard.ivf,
                                                       new_x_whitened,
                                                       active_seed_begin,
@@ -2603,11 +2851,14 @@ int main(int argc, char** argv) {
         if (!add_delta_seed.ok()) {
           return add_delta_seed;
         }
+        delta_add_ms = delta_add_timer.ElapsedMillis();
+        Timer delta_finalize_timer;
         shard.rows = active_seed_rows;
         rebuilt_active_delta = std::move(shard);
         for (uint32_t i = active_seed_begin; i < seen_rows; ++i) {
           rebuilt_sliding_window_doc_ids.push_back(i);
         }
+        delta_finalize_ms = delta_finalize_timer.ElapsedMillis();
         delta_seed_ms = delta_timer.ElapsedMillis();
       } else if (seen_rows < nx && delta_train_rows > 0) {
         rebuilt_pending_active_train = true;
@@ -2615,7 +2866,14 @@ int main(int argc, char** argv) {
       }
     }
 
+    double publication_ms = 0.0;
+    Timer publication_prefix_timer;
     X_whitened = std::move(new_x_whitened);
+    publication_ms += publication_prefix_timer.ElapsedMillis();
+    Timer norms_timer;
+    X_whitened_norms = X_whitened.rowwise().squaredNorm();
+    const double norms_recompute_ms = norms_timer.ElapsedMillis();
+    Timer publication_timer;
     Q_whitened = std::move(new_q_whitened);
     whiten_version = new_whiten_version;
     main_ivf = std::move(new_main_ivf);
@@ -2628,8 +2886,21 @@ int main(int argc, char** argv) {
     pending_active_train_begin = rebuilt_pending_active_train_begin;
     sliding_window_doc_ids = std::move(rebuilt_sliding_window_doc_ids);
     last_online_pq_stats = OnlinePQUpdateStats{};
+    publication_ms += publication_timer.ElapsedMillis();
+    Timer malloc_trim_timer;
+    TrimAllocatorRetainedMemory("global_rebuild_done");
+    const double malloc_trim_ms = malloc_trim_timer.ElapsedMillis();
+    Timer done_memory_trace_timer;
+    record_memory("global_rebuild_done", seen_rows);
+    memory_trace_ms += done_memory_trace_timer.ElapsedMillis();
 
     const double wall_total_ms = total_timer.ElapsedMillis();
+    const double accounted_stage_sum_ms =
+        setup_ms + whitening_ms + memory_trace_ms + base_retarget_ms +
+        query_transform_ms + profiling_collect_ms + main_build_ms + main_add_ms +
+        delta_build_ms + delta_add_ms + delta_finalize_ms + norms_recompute_ms +
+        publication_ms + malloc_trim_ms;
+    const double unaccounted_ms = wall_total_ms - accounted_stage_sum_ms;
     const double total_ms = whitening_ms + whitening_transform_ms + main_build_ms + main_add_ms;
     rebuild_ms_total += total_ms;
     total_global_rebuild_ms += total_ms;
@@ -2665,6 +2936,83 @@ int main(int argc, char** argv) {
     event.wall_total_ms = wall_total_ms;
     event.reason = trigger.reason;
     global_rebuild_events.push_back(event);
+
+    std::cout << "[GLOBAL_REBUILD_BUILD_PROFILE]"
+              << " build_coarse_centroid_init_us="
+              << main_build_profile.build_coarse_centroid_init_us
+              << ", build_coarse_kmeans_us="
+              << main_build_profile.build_coarse_kmeans_us
+              << ", build_coarse_kmeans_assignment_us="
+              << main_build_profile.build_coarse_kmeans_assignment_us
+              << ", build_coarse_kmeans_update_us="
+              << main_build_profile.build_coarse_kmeans_update_us
+              << ", build_coarse_kmeans_rows="
+              << main_build_profile.build_coarse_kmeans_rows
+              << ", build_coarse_kmeans_k="
+              << main_build_profile.build_coarse_kmeans_k
+              << ", build_coarse_kmeans_dim="
+              << main_build_profile.build_coarse_kmeans_dim
+              << ", build_coarse_kmeans_iterations="
+              << main_build_profile.build_coarse_kmeans_iterations
+              << ", build_pq_routing_assignment_us="
+              << main_build_profile.build_pq_routing_assignment_us
+              << ", build_pq_routing_assignment_rows="
+              << main_build_profile.build_pq_routing_assignment_rows
+              << ", build_pq_subspace_materialize_us="
+              << main_build_profile.build_pq_subspace_materialize_us
+              << ", build_pq_subspace_materialized_rows="
+              << main_build_profile.build_pq_subspace_materialized_rows
+              << ", build_pq_subspace_materialized_bytes="
+              << main_build_profile.build_pq_subspace_materialized_bytes
+              << ", build_pq_centroid_init_us="
+              << main_build_profile.build_pq_centroid_init_us
+              << ", build_pq_kmeans_assignment_us="
+              << main_build_profile.build_pq_kmeans_assignment_us
+              << ", build_pq_kmeans_update_us="
+              << main_build_profile.build_pq_kmeans_update_us
+              << ", build_pq_kmeans_us="
+              << main_build_profile.build_pq_kmeans_us
+              << ", build_pq_training_total_us="
+              << main_build_profile.build_pq_training_total_us
+              << ", build_pq_codebook_soa_us="
+              << main_build_profile.build_pq_codebook_soa_us
+              << ", build_pq_precomputed_table_us="
+              << main_build_profile.build_pq_precomputed_table_us
+              << ", build_publication_us="
+              << main_build_profile.build_publication_us
+              << ", build_pq_max_live_subspaces="
+              << main_build_profile.build_pq_max_live_subspaces
+              << ", build_pq_full_residual_bytes="
+              << main_build_profile.build_pq_full_residual_bytes
+              << ", build_pq_training_concurrency="
+              << main_build_profile.build_pq_training_concurrency << std::endl;
+    std::cout << "[GLOBAL_REBUILD_ADD_PROFILE]"
+              << " records=" << main_add_profile.records
+              << ", record_construction_us=" << main_add_profile.record_construction_us
+              << ", validation_us=" << main_add_profile.validation_us
+              << ", assignment_us=" << main_add_profile.assignment_us
+              << ", encode_us=" << main_add_profile.encode_us
+              << ", deferred_pq_stats_us=" << main_add_profile.deferred_pq_stats_us
+              << ", commit_us=" << main_add_profile.commit_us << std::endl;
+    std::cout << "[GLOBAL_REBUILD_PROFILE_SUMMARY]"
+              << " setup_ms=" << setup_ms
+              << ", whitening_fit_ms=" << whitening_ms
+              << ", base_retarget_ms=" << base_retarget_ms
+              << ", query_transform_ms=" << query_transform_ms
+              << ", main_build_ms=" << main_build_ms
+              << ", main_add_ms=" << main_add_ms
+              << ", delta_build_ms=" << delta_build_ms
+              << ", delta_add_ms=" << delta_add_ms
+              << ", delta_finalize_ms=" << delta_finalize_ms
+              << ", delta_seed_ms=" << delta_seed_ms
+              << ", norms_recompute_ms=" << norms_recompute_ms
+              << ", publication_ms=" << publication_ms
+              << ", malloc_trim_ms=" << malloc_trim_ms
+              << ", memory_trace_ms=" << memory_trace_ms
+              << ", profiling_collect_ms=" << profiling_collect_ms
+              << ", accounted_stage_sum_ms=" << accounted_stage_sum_ms
+              << ", wall_total_ms=" << wall_total_ms
+              << ", unaccounted_ms=" << unaccounted_ms << std::endl;
 
     std::cout << "[GLOBAL REBUILD] done: base_rows=" << seen_rows
               << ", reason=" << trigger.reason
@@ -2717,6 +3065,7 @@ int main(int argc, char** argv) {
       std::filesystem::path("result") / dataset_name / metric_name / config_name;
   std::error_code ec;
   std::filesystem::create_directories(results_dir, ec);
+  const std::filesystem::path memory_trace_path = results_dir / "memory_trace.json";
   const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
@@ -2742,6 +3091,7 @@ int main(int argc, char** argv) {
                            uint32_t new_end) -> Result<EvalMetrics> {
     auto res = EvaluateState(config,
                              X_whitened,
+                             X_whitened_norms,
                              active_rows,
                              new_begin,
                              new_end,
@@ -2880,6 +3230,7 @@ int main(int argc, char** argv) {
       }
     }
     snap.minibatches = std::move(minibatches);
+    record_memory("snapshot", active_rows);
     std::cout << "[SNAPSHOT] base_rows=" << snap.base_rows
               << ", snapshot_rows=" << snap.snapshot_rows
               << ", recall@" << config.topk << "=" << snap.recall
@@ -2969,18 +3320,31 @@ int main(int argc, char** argv) {
       const uint32_t end = begin + chunk;
 
       Timer whitening_timer;
-      auto chunk_whiten_res = whitening->TransformBatch(X.middleRows(begin, chunk), whiten_version);
+      auto chunk_whiten_res =
+          ann::eval_memory::TransformSourceRangeToWhitened(base_source,
+                                                           begin,
+                                                           chunk,
+                                                           whiten_version,
+                                                           whitening,
+                                                           config.use_cosine);
       if (!chunk_whiten_res.ok()) {
         std::cerr << chunk_whiten_res.status().ToString() << std::endl;
         return 1;
       }
       MatrixRM chunk_whitened = std::move(chunk_whiten_res.value());
-      if (config.use_cosine) {
-        NormalizeRowsL2(&chunk_whitened);
-      }
       EnsureWhitenedCapacity(&X_whitened, end, nx, config.dim);
       X_whitened.middleRows(begin, chunk) = chunk_whitened;
+      if (X_whitened_norms.size() < static_cast<Eigen::Index>(end)) {
+        X_whitened_norms.conservativeResize(static_cast<Eigen::Index>(end));
+      }
+      X_whitened_norms.segment(static_cast<Eigen::Index>(begin),
+                               static_cast<Eigen::Index>(chunk)) =
+          X_whitened.middleRows(static_cast<Eigen::Index>(begin),
+                                static_cast<Eigen::Index>(chunk)).rowwise().squaredNorm();
       const double step_whitening_ms = whitening_timer.ElapsedMillis();
+      record_memory("stream_after_chunk_transform",
+                    end,
+                    2ull * ann::eval_memory::MatrixActiveBytes(chunk, config.dim));
 
       last_online_pq_stats = OnlinePQUpdateStats{};
       if (active_delta.has_value()) {
@@ -3064,7 +3428,8 @@ int main(int argc, char** argv) {
           }
           active_delta->rows = active_delta->rows + chunk - deleted_rows;
         } else {
-          active_delta->rows += chunk;
+        active_delta->rows += chunk;
+        record_memory("stream_after_delta_insert", end);
         }
       }
       const double step_insert_ms = last_online_pq_stats.insert_ms;
@@ -3213,11 +3578,12 @@ int main(int argc, char** argv) {
       bool snapshot_state_changed = false;
       if (should_commit_merge) {
         Timer merge_commit_timer;
+        MatrixVectorAccessor vector_accessor(X_whitened, X_whitened_norms);
         auto merge_res = merge_frozen_delta_into_main(main_ivf,
                                                       main_versions,
                                                       frozen_delta->ivf,
                                                       frozen_delta->versions,
-                                                      X_whitened,
+                                                      vector_accessor,
                                                       merge_options);
         if (!merge_res.ok()) {
           std::cerr << merge_res.status().ToString() << std::endl;
@@ -3303,14 +3669,38 @@ int main(int argc, char** argv) {
         const auto& profile = merge_res.value().profiling;
         std::cout << "[MERGE_PROFILE] effective_nlist=" << profile.effective_nlist
                   << ", frozen_records=" << profile.frozen_records
+                  << ", assignment_descriptor_records="
+                  << profile.assignment_descriptor_records
+                  << ", assignment_full_vector_copy_bytes="
+                  << profile.assignment_full_vector_copy_bytes
+                  << ", frozen_payload_records_moved="
+                  << profile.frozen_payload_records_moved
+                  << ", vector_accessor_materialize_calls="
+                  << profile.vector_accessor_materialize_calls
+                  << ", vector_accessor_materialized_rows="
+                  << profile.vector_accessor_materialized_rows
+                  << ", vector_accessor_materialized_bytes="
+                  << profile.vector_accessor_materialized_bytes
+                  << ", vector_accessor_max_materialize_rows="
+                  << profile.vector_accessor_max_materialize_rows
                   << ", seed_partitions=" << profile.seed_partitions
                   << ", neighborhoods=" << profile.neighborhoods
                   << ", main_records_loaded=" << profile.main_records_loaded
                   << ", pooled_records=" << profile.pooled_records
                   << ", repartitioned_records=" << profile.repartitioned_records
                   << ", patch_records=" << profile.patch_records
+                  << ", patch_dense_vector_bytes=" << profile.patch_dense_vector_bytes
+                  << ", patch_retained_vector_bytes="
+                  << profile.patch_retained_vector_bytes
+                  << ", patch_elided_vector_bytes=" << profile.patch_elided_vector_bytes
+                  << ", patch_final_pq_code_bytes="
+                  << profile.patch_final_pq_code_bytes
                   << ", pq_codes_reused=" << profile.pq_codes_reused
                   << ", pq_codes_reencoded=" << profile.pq_codes_reencoded
+                  << ", prepare_pq_codes_reused="
+                  << profile.prepare_pq_codes_reused
+                  << ", prepare_pq_codes_reencoded="
+                  << profile.prepare_pq_codes_reencoded
                   << ", merge_delta_to_main_assignment_us="
                   << profile.merge_delta_to_main_assignment_us
                   << ", merge_assignment_distance_us="
@@ -3331,6 +3721,7 @@ int main(int argc, char** argv) {
                   << profile.repartition_candidate_selection_us
                   << ", repartition_sort_us=" << profile.repartition_sort_us
                   << ", patch_prepare_us=" << profile.patch_prepare_us
+                  << ", prepare_pq_encode_us=" << profile.prepare_pq_encode_us
                   << ", commit_us=" << profile.commit_us
                   << ", pq_code_assignment_us=" << profile.pq_code_assignment_us
                   << ", pq_code_copy_or_reuse_us=" << profile.pq_code_copy_or_reuse_us
@@ -3338,6 +3729,8 @@ int main(int argc, char** argv) {
                   << std::endl;
         frozen_delta.reset();
         frozen_trigger_decision.reset();
+        TrimAllocatorRetainedMemory("stream_after_merge_commit");
+        record_memory("stream_after_merge_commit", next_insert_idx);
         snapshot_state_changed = true;
       }
 
@@ -3593,6 +3986,19 @@ int main(int argc, char** argv) {
 
   const bool debug_output_enabled =
       config.enable_miss_diag || config.enable_rerank_source_diag || config.enable_latency_debug;
+  auto write_memory_trace = [&]() -> Status {
+    record_memory("final", std::min<uint32_t>(next_insert_idx, nx));
+    const std::vector<ann::eval_memory::MemoryComponent> memory_metadata = {
+        {"base_rows", base_source.rows},
+        {"base_dim", base_source.dim},
+        {"base_raw_full_dataset_bytes",
+         ann::eval_memory::MatrixActiveBytes(base_source.rows, base_source.dim)},
+        {"query_rows", static_cast<uint64_t>(Q.rows())},
+        {"query_dim", static_cast<uint64_t>(Q.cols())},
+        {"memory_block_rows", kAddBlockRows},
+        {"raw_base_is_resident", base_source.UsesResidentMatrix() ? 1ull : 0ull}};
+    return memory_trace.WriteJson(memory_trace_path.string(), memory_metadata);
+  };
   if (!debug_output_enabled) {
     ofs << "{\n";
     ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
@@ -3754,7 +4160,13 @@ int main(int argc, char** argv) {
     ofs << "  ]\n";
     ofs << "}\n";
 
+    Status memory_write_status = write_memory_trace();
+    if (!memory_write_status.ok()) {
+      std::cerr << memory_write_status.ToString() << std::endl;
+      return 1;
+    }
     std::cout << "Saved metrics to " << result_path << std::endl;
+    std::cout << "Saved memory trace to " << memory_trace_path << std::endl;
     return 0;
   }
 
@@ -4352,6 +4764,12 @@ int main(int argc, char** argv) {
   ofs << "  ]\n";
   ofs << "}\n";
 
+  Status memory_write_status = write_memory_trace();
+  if (!memory_write_status.ok()) {
+    std::cerr << memory_write_status.ToString() << std::endl;
+    return 1;
+  }
   std::cout << "Saved metrics to " << result_path << std::endl;
+  std::cout << "Saved memory trace to " << memory_trace_path << std::endl;
   return 0;
 }
