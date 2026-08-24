@@ -2,10 +2,10 @@
 
 set -uo pipefail
 
-PROJECT_ROOT="/home/jky/DISPQ_large"
+PROJECT_ROOT="/home/ydy/DISPQ_large"
 BINARY="${PROJECT_ROOT}/build_release/run_eval_large_streaming"
 CONFIG="${PROJECT_ROOT}/configs/sift10m.json"
-DATASET="/home/jky/data/sift10M/origin"
+DATASET="/home/ydy/data/sift10M/origin"
 NODE=0
 
 # Fast process RSS sampling.

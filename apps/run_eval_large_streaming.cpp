@@ -25,6 +25,11 @@
 #include <malloc.h>
 #endif
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -698,6 +703,13 @@ Result<MatrixRM> TransformDocIdsToWhitened(const VecsRandomAccessReader& reader,
 
 class WhitenedVectorCache final : public VectorAccessor {
  public:
+  struct ReclaimStats {
+    uint64_t reclaimed_vector_bytes{0};
+    uint64_t reclaim_calls{0};
+    uint64_t dead_prefix_rows{0};
+    uint64_t reclaim_failures{0};
+  };
+
   WhitenedVectorCache() = default;
   WhitenedVectorCache(const WhitenedVectorCache&) = delete;
   WhitenedVectorCache& operator=(const WhitenedVectorCache&) = delete;
@@ -707,11 +719,25 @@ class WhitenedVectorCache final : public VectorAccessor {
   uint32_t dim() const override { return dim_; }
   size_t size() const { return locations_.size(); }
 
+  ReclaimStats GetReclaimStats() const {
+    ReclaimStats stats;
+    stats.reclaimed_vector_bytes = reclaimed_vector_bytes_;
+    stats.reclaim_calls = reclaim_calls_;
+    stats.reclaim_failures = reclaim_failures_;
+    for (const Block& block : blocks_) {
+      stats.dead_prefix_rows += static_cast<uint64_t>(block.dead_prefix_rows);
+    }
+    return stats;
+  }
+
   void Clear(uint32_t dim) {
     dim_ = dim;
     blocks_.clear();
     free_blocks_.clear();
     locations_.Clear();
+    reclaimed_vector_bytes_ = 0;
+    reclaim_calls_ = 0;
+    reclaim_failures_ = 0;
   }
 
   void Reserve(size_t rows) { locations_.Reserve(rows); }
@@ -792,17 +818,33 @@ class WhitenedVectorCache final : public VectorAccessor {
   }
 
   Status RemoveDocIds(const std::vector<DocId>& doc_ids) {
+    std::vector<uint32_t> touched_prefix_blocks;
+    touched_prefix_blocks.reserve(std::min(doc_ids.size(), blocks_.size()));
+    auto reclaim_touched_prefixes = [&]() {
+      for (uint32_t block_id : touched_prefix_blocks) {
+        Block& block = blocks_[block_id];
+        if (block.live != 0) {
+          AdvanceAndReclaimDeadPrefix(&block);
+        }
+      }
+    };
     for (DocId doc_id : doc_ids) {
       Location loc;
       if (!locations_.Get(doc_id, &loc)) {
+        reclaim_touched_prefixes();
         return Status::NotFound("WhitenedVectorCache::RemoveDocIds: missing doc_id");
       }
       if (loc.block >= blocks_.size() || loc.row >= blocks_[loc.block].ids.size()) {
+        reclaim_touched_prefixes();
         return Status::Internal("WhitenedVectorCache::RemoveDocIds: corrupt location");
       }
       Block& block = blocks_[loc.block];
       if (block.ids[loc.row] != doc_id) {
+        reclaim_touched_prefixes();
         return Status::Internal("WhitenedVectorCache::RemoveDocIds: doc_id/location mismatch");
+      }
+      if (loc.row == block.dead_prefix_rows) {
+        touched_prefix_blocks.push_back(loc.block);
       }
       block.ids[loc.row] = kDeletedDoc;
       if (block.live > 0) {
@@ -812,10 +854,12 @@ class WhitenedVectorCache final : public VectorAccessor {
         block.ids.clear();
         block.data.resize(0, 0);
         block.norms.resize(0);
+        block.dead_prefix_rows = 0;
         free_blocks_.push_back(loc.block);
       }
       locations_.Erase(doc_id);
     }
+    reclaim_touched_prefixes();
     return Status::OK();
   }
 
@@ -962,12 +1006,55 @@ class WhitenedVectorCache final : public VectorAccessor {
     MatrixRM data;
     Eigen::VectorXf norms;
     uint32_t live{0};
+    size_t dead_prefix_rows{0};
   };
+
+  void AdvanceAndReclaimDeadPrefix(Block* block) {
+    const size_t old_dead_prefix_rows = block->dead_prefix_rows;
+    while (block->dead_prefix_rows < block->ids.size() &&
+           block->ids[block->dead_prefix_rows] == kDeletedDoc) {
+      ++block->dead_prefix_rows;
+    }
+    if (block->dead_prefix_rows == old_dead_prefix_rows) {
+      return;
+    }
+
+#ifdef __linux__
+    static const long page_size_value = sysconf(_SC_PAGESIZE);
+    if (page_size_value <= 0) {
+      ++reclaim_failures_;
+      return;
+    }
+    const uintptr_t page_size = static_cast<uintptr_t>(page_size_value);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(block->data.data());
+    const uintptr_t row_bytes = static_cast<uintptr_t>(block->data.cols()) * sizeof(float);
+    // Exclude allocator metadata, the leading partial page, and the page containing live bytes.
+    const uintptr_t first_full_page = ((base + page_size - 1) / page_size) * page_size;
+    const uintptr_t old_dead_end = base + old_dead_prefix_rows * row_bytes;
+    const uintptr_t new_dead_end = base + block->dead_prefix_rows * row_bytes;
+    const uintptr_t reclaim_begin =
+        std::max(first_full_page, old_dead_end - old_dead_end % page_size);
+    const uintptr_t reclaim_end =
+        std::max(first_full_page, new_dead_end - new_dead_end % page_size);
+    if (reclaim_end > reclaim_begin) {
+      ++reclaim_calls_;
+      const size_t reclaim_bytes = static_cast<size_t>(reclaim_end - reclaim_begin);
+      if (madvise(reinterpret_cast<void*>(reclaim_begin), reclaim_bytes, MADV_DONTNEED) == 0) {
+        reclaimed_vector_bytes_ += static_cast<uint64_t>(reclaim_bytes);
+      } else {
+        ++reclaim_failures_;
+      }
+    }
+#endif
+  }
 
   uint32_t dim_{0};
   std::vector<Block> blocks_;
   std::vector<uint32_t> free_blocks_;
   PagedLocationMap locations_;
+  uint64_t reclaimed_vector_bytes_{0};
+  uint64_t reclaim_calls_{0};
+  uint64_t reclaim_failures_{0};
 };
 
 uint32_t ResolveMainRows(const Config& config, uint32_t total_rows) {
@@ -3791,6 +3878,12 @@ int main(int argc, char** argv) {
                            uint64_t active_rows,
                            uint64_t transient_bytes = 0) {
     memory_trace.Record(stage, active_rows, collect_memory_components(), transient_bytes);
+    const WhitenedVectorCache::ReclaimStats reclaim_stats = vector_cache.GetReclaimStats();
+    std::cout << "[CACHE_RECLAIM_PROFILE] stage=" << stage
+              << " cache_reclaimed_vector_bytes=" << reclaim_stats.reclaimed_vector_bytes
+              << " cache_reclaim_calls=" << reclaim_stats.reclaim_calls
+              << " cache_dead_prefix_rows=" << reclaim_stats.dead_prefix_rows
+              << " cache_reclaim_failures=" << reclaim_stats.reclaim_failures << std::endl;
   };
   record_memory("after_dataset_open", 0);
 
@@ -3869,6 +3962,29 @@ int main(int argc, char** argv) {
   }
   init_main_build_ms = init_main_build_timer.ElapsedMillis();
   main_versions = VersionSet{whiten_version, main_version_res.value()};
+  auto init_build_profile_res = main_ivf->GetBuildProfiling(main_versions);
+  if (init_build_profile_res.ok()) {
+    const IVFBuildProfiling& build_profile = init_build_profile_res.value();
+    std::cout << "[INITIAL_PQ_BUILD_PROFILE] build_pq_routing_assignment_us="
+              << build_profile.build_pq_routing_assignment_us
+              << ", build_pq_routing_assignment_rows="
+              << build_profile.build_pq_routing_assignment_rows
+              << ", build_pq_subspace_materialize_us="
+              << build_profile.build_pq_subspace_materialize_us
+              << ", build_pq_subspace_materialized_rows="
+              << build_profile.build_pq_subspace_materialized_rows
+              << ", build_pq_subspace_materialized_bytes="
+              << build_profile.build_pq_subspace_materialized_bytes
+              << ", build_pq_max_live_subspaces="
+              << build_profile.build_pq_max_live_subspaces
+              << ", build_pq_kmeans_us=" << build_profile.build_pq_kmeans_us
+              << ", build_pq_training_total_us="
+              << build_profile.build_pq_training_total_us
+              << ", build_pq_full_residual_bytes="
+              << build_profile.build_pq_full_residual_bytes
+              << ", build_pq_training_concurrency="
+              << build_profile.build_pq_training_concurrency << std::endl;
+  }
   Timer init_main_add_timer;
   Status add_main = AddMatrixRowsToIndex(main_ivf, main_train, main_ids, config.dim, main_versions);
   if (!add_main.ok()) {

@@ -32,6 +32,8 @@ constexpr double kDefaultNQEEps = 1e-6;
 constexpr size_t kPrecomputedTableMaxBytes = (static_cast<size_t>(2) << 30);  // 2GB
 constexpr size_t kKMeansPartialMaxBytes = static_cast<size_t>(256) << 20;
 constexpr size_t kCommitMaterializeChunkRows = 65536;
+// V1 keeps one subspace live so its materialization and RunKMeans own the OpenMP team.
+constexpr uint32_t kPQTrainingConcurrency = 1;
 constexpr uint32_t kInvalidListId = std::numeric_limits<uint32_t>::max();
 
 struct DocLocation {
@@ -175,6 +177,7 @@ struct IndexData {
   std::vector<AlignedVector<ListEntry>> lists;
   PagedDocLocationMap doc_locations;
   uint64_t ntotal{0};
+  IVFBuildProfiling build_profiling;
   double last_patch_pq_reencode_ms{0.0};
 };
 
@@ -321,6 +324,60 @@ int NearestCentroid(Eigen::Ref<const Eigen::VectorXf> vec, const IndexData& data
     }
   }
   return best_idx;
+}
+
+void ComputeRoutingAssignmentsForPQ(Eigen::Ref<const MatrixRM> Xw,
+                                    const IndexData& data,
+                                    std::vector<int>* assignments) {
+  assignments->resize(static_cast<size_t>(Xw.rows()));
+  auto assign_row = [&](int64_t i) {
+    Eigen::Map<const Eigen::VectorXf> vec(Xw.row(i).data(), Xw.cols());
+    (*assignments)[static_cast<size_t>(i)] = NearestCentroid(vec, data);
+  };
+#ifdef _OPENMP
+  if (!omp_in_parallel() && Xw.rows() > 1) {
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < Xw.rows(); ++i) {
+      assign_row(i);
+    }
+  } else
+#endif
+  {
+    for (int64_t i = 0; i < Xw.rows(); ++i) {
+      assign_row(i);
+    }
+  }
+}
+
+MatrixRM MaterializePQResidualSubspace(Eigen::Ref<const MatrixRM> Xw,
+                                       const std::vector<int>& routing_assignments,
+                                       const IndexData& data,
+                                       uint32_t m) {
+  const Eigen::Index offset = static_cast<Eigen::Index>(PQSubOffset(data, m));
+  const Eigen::Index subdim = static_cast<Eigen::Index>(PQSubDim(data, m));
+  MatrixRM sub(Xw.rows(), subdim);
+  auto materialize_row = [&](int64_t i) {
+    sub.row(i) = Xw.row(i).segment(offset, subdim);
+    if (data.pq_residual) {
+      sub.row(i) -= data.routing_centroids
+                        .row(routing_assignments[static_cast<size_t>(i)])
+                        .segment(offset, subdim);
+    }
+  };
+#ifdef _OPENMP
+  if (!omp_in_parallel() && Xw.rows() > 1) {
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < Xw.rows(); ++i) {
+      materialize_row(i);
+    }
+  } else
+#endif
+  {
+    for (int64_t i = 0; i < Xw.rows(); ++i) {
+      materialize_row(i);
+    }
+  }
+  return sub;
 }
 
 uint32_t NearestCodeword(Eigen::Ref<const Eigen::VectorXf> sub,
@@ -1146,30 +1203,36 @@ class KMeansIVFIndex : public IVFIndex {
           data->pq_codebooks[static_cast<size_t>(m)] = book;
         }
       } else {
-        const int64_t num_vecs = Xw.rows();
-        MatrixRM residuals(num_vecs, dim);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int64_t i = 0; i < num_vecs; ++i) {
-          const Eigen::VectorXf vec = Xw.row(i).transpose();
-          const int centroid = NearestCentroid(vec, *data);
-          residuals.row(i) = Xw.row(i);
-          if (data->pq_residual) {
-            residuals.row(i) -= data->routing_centroids.row(centroid);
-          }
-        }
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
+        Timer pq_training_timer;
+        std::vector<int> routing_assignments;
+        Timer routing_assignment_timer;
+        ComputeRoutingAssignmentsForPQ(Xw, *data, &routing_assignments);
+        data->build_profiling.build_pq_routing_assignment_us =
+            routing_assignment_timer.ElapsedMicros();
+        data->build_profiling.build_pq_routing_assignment_rows =
+            static_cast<uint64_t>(Xw.rows());
+        data->build_profiling.build_pq_training_concurrency = kPQTrainingConcurrency;
+        data->build_profiling.build_pq_max_live_subspaces = 1;
+
         for (uint32_t m = 0; m < data->M; ++m) {
-          const Eigen::Index offset = static_cast<Eigen::Index>(PQSubOffset(*data, m));
-          const Eigen::Index subdim = static_cast<Eigen::Index>(PQSubDim(*data, m));
-          MatrixRM sub = residuals.block(0, offset, residuals.rows(), subdim);
+          Timer materialize_timer;
+          MatrixRM sub =
+              MaterializePQResidualSubspace(Xw, routing_assignments, *data, m);
+          data->build_profiling.build_pq_subspace_materialize_us +=
+              materialize_timer.ElapsedMicros();
+          data->build_profiling.build_pq_subspace_materialized_rows +=
+              static_cast<uint64_t>(sub.rows());
+          data->build_profiling.build_pq_subspace_materialized_bytes +=
+              static_cast<uint64_t>(sub.size()) * sizeof(float);
+
+          Timer kmeans_timer;
           MatrixRM codebook = InitializeCentroids(sub, data->Ks);
           RunKMeans(sub, &codebook, p.kmeans_iterations, KMeansMode::kPQ);
+          data->build_profiling.build_pq_kmeans_us += kmeans_timer.ElapsedMicros();
           data->pq_codebooks[static_cast<size_t>(m)] = std::move(codebook);
         }
+        data->build_profiling.build_pq_training_total_us =
+            pq_training_timer.ElapsedMicros();
       }
 
       RebuildPQSoACache(data.get());
@@ -2131,6 +2194,16 @@ class KMeansIVFIndex : public IVFIndex {
       return Status::NotFound("EstimateMemoryUsage: index version not built");
     }
     return EstimateIndexDataMemoryUsage(*it->second);
+  }
+
+  Result<IVFBuildProfiling> GetBuildProfiling(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("GetBuildProfiling: index version not built");
+    }
+    return it->second->build_profiling;
   }
 
   Status CommitPartitionPatch(const VersionSet& route_versions,

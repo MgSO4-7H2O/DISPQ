@@ -112,6 +112,19 @@ struct IVFMemoryUsage {
   uint64_t container_overhead_bytes{0};
 };
 
+struct IVFBuildProfiling {
+  double build_pq_routing_assignment_us{0.0};
+  uint64_t build_pq_routing_assignment_rows{0};
+  double build_pq_subspace_materialize_us{0.0};
+  uint64_t build_pq_subspace_materialized_rows{0};
+  uint64_t build_pq_subspace_materialized_bytes{0};
+  uint32_t build_pq_max_live_subspaces{0};
+  double build_pq_kmeans_us{0.0};
+  double build_pq_training_total_us{0.0};
+  uint64_t build_pq_full_residual_bytes{0};
+  uint32_t build_pq_training_concurrency{0};
+};
+
 struct PartitionPatch {
   std::vector<uint32_t> partition_ids;
   std::vector<AlignedVector<VectorRecord>> replacement_records;
@@ -217,6 +230,8 @@ class IVFIndex {
   virtual Result<std::vector<uint32_t>> GetPartitionSizes(
       const VersionSet& route_versions) const = 0;
   virtual Result<IVFMemoryUsage> EstimateMemoryUsage(
+      const VersionSet& route_versions) const = 0;
+  virtual Result<IVFBuildProfiling> GetBuildProfiling(
       const VersionSet& route_versions) const = 0;
   virtual Status CommitPartitionPatch(const VersionSet& route_versions,
                                       const PartitionPatch& patch) = 0;

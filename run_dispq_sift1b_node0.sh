@@ -2,10 +2,10 @@
 
 set -uo pipefail
 
-PROJECT_ROOT="/home/jky/DISPQ_large"
+PROJECT_ROOT="/home/ydy/DISPQ_large"
 BINARY="${PROJECT_ROOT}/build_release/run_eval_large_streaming"
 CONFIG="${PROJECT_ROOT}/configs/sift1B.json"
-DATASET="/home/jky/data/sift1B/origin"
+DATASET="/home/ydy/data/sift1B/origin"
 NODE=0
 MONITOR_INTERVAL_SECONDS="${MONITOR_INTERVAL_SECONDS:-30}"
 

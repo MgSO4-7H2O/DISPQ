@@ -11,3 +11,4 @@
 /build-release
 .codegraph
 /logs
+*.sh
