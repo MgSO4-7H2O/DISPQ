@@ -24,6 +24,10 @@ struct Config {
   bool pq_residual{true};
   uint32_t max_queries{0};
   uint32_t snapshot_interval{0};
+  // Computes exact ground truth for every evaluated streaming snapshot. Disable
+  // this only for build/merge/query throughput profiling; recall fields are
+  // then unavailable rather than zero-recall measurements.
+  bool enable_dynamic_ground_truth{true};
   bool enable_miss_diag{true};
   bool enable_rerank_source_diag{false};
   // When true, emit extra latency diagnostics for route-level breakdown and slow queries.

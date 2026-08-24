@@ -69,6 +69,8 @@ std::string Config::ToString() const {
       << "pq_residual=" << std::boolalpha << pq_residual << ", "
       << "max_queries=" << max_queries << ", "
       << "snapshot_interval=" << snapshot_interval << ", "
+      << "enable_dynamic_ground_truth=" << std::boolalpha << enable_dynamic_ground_truth
+      << ", "
       << "enable_miss_diag=" << std::boolalpha << enable_miss_diag << ", "
       << "enable_rerank_source_diag=" << std::boolalpha << enable_rerank_source_diag << ", "
       << "enable_latency_debug=" << std::boolalpha << enable_latency_debug << ", "
@@ -148,6 +150,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractBool(text, "pq_residual", &cfg.pq_residual);
   ExtractUint(text, "max_queries", &cfg.max_queries);
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
+  ExtractBool(text, "enable_dynamic_ground_truth", &cfg.enable_dynamic_ground_truth);
   ExtractBool(text, "enable_miss_diag", &cfg.enable_miss_diag);
   ExtractBool(text, "enable_rerank_source_diag", &cfg.enable_rerank_source_diag);
   ExtractBool(text, "enable_latency_debug", &cfg.enable_latency_debug);

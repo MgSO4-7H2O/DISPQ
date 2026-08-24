@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -610,6 +614,54 @@ int NearestCentroid(Eigen::Ref<const Eigen::VectorXf> vec, const IndexData& data
   return best_idx;
 }
 
+#if defined(__AVX512F__)
+void UpdateNearestCentroidsFromDotsAvx512(const float* dots,
+                                          Eigen::Index dots_stride,
+                                          Eigen::Index point_count,
+                                          Eigen::Index centroid_count,
+                                          const float* centroid_norms,
+                                          Eigen::Index centroid_begin,
+                                          float* best_scores,
+                                          int* best_clusters) {
+  constexpr Eigen::Index kSimdWidth = 16;
+  const __m512 two = _mm512_set1_ps(2.0f);
+  for (Eigen::Index point = 0; point < point_count; ++point) {
+    float best_score = best_scores[point];
+    int best_cluster = best_clusters[point];
+    const float* dot_row = dots + point * dots_stride;
+    Eigen::Index centroid = 0;
+    for (; centroid + kSimdWidth <= centroid_count; centroid += kSimdWidth) {
+      const __m512 dot = _mm512_loadu_ps(dot_row + centroid);
+      const __m512 norm = _mm512_loadu_ps(
+          centroid_norms + centroid_begin + centroid);
+      // Keep the scalar path's non-fused norm - 2 * dot arithmetic.
+      const __m512 scores = _mm512_sub_ps(norm, _mm512_mul_ps(two, dot));
+      const float block_best = _mm512_reduce_min_ps(scores);
+      if (block_best < best_score) {
+        const __mmask16 equal_mask = _mm512_cmp_ps_mask(
+            scores, _mm512_set1_ps(block_best), _CMP_EQ_OQ);
+        if (equal_mask != 0) {
+          best_score = block_best;
+          best_cluster = static_cast<int>(centroid_begin + centroid +
+                                          static_cast<Eigen::Index>(
+                                              __builtin_ctz(static_cast<unsigned int>(equal_mask))));
+        }
+      }
+    }
+    for (; centroid < centroid_count; ++centroid) {
+      const float score = centroid_norms[centroid_begin + centroid] -
+                          2.0f * dot_row[centroid];
+      if (score < best_score) {
+        best_score = score;
+        best_cluster = static_cast<int>(centroid_begin + centroid);
+      }
+    }
+    best_scores[point] = best_score;
+    best_clusters[point] = best_cluster;
+  }
+}
+#endif
+
 void AssignNearestCentroidsBlocked(Eigen::Ref<const MatrixRM> X,
                                    Eigen::Ref<const MatrixRM> centroids,
                                    std::vector<int>* assignments) {
@@ -642,6 +694,12 @@ void AssignNearestCentroidsBlocked(Eigen::Ref<const MatrixRM> X,
           centroids
               .middleRows(static_cast<Eigen::Index>(centroid_begin), centroid_count)
               .transpose();
+#if defined(__AVX512F__)
+      UpdateNearestCentroidsFromDotsAvx512(
+          dots.data(), dots.outerStride(), point_count, centroid_count,
+          centroid_norms.data(), static_cast<Eigen::Index>(centroid_begin),
+          best_scores.data(), best_clusters.data());
+#else
       for (Eigen::Index point = 0; point < point_count; ++point) {
         for (Eigen::Index centroid = 0; centroid < centroid_count; ++centroid) {
           const Eigen::Index centroid_idx =
@@ -655,6 +713,7 @@ void AssignNearestCentroidsBlocked(Eigen::Ref<const MatrixRM> X,
           }
         }
       }
+#endif
     }
     for (Eigen::Index point = 0; point < point_count; ++point) {
       (*assignments)[static_cast<size_t>(point_begin + point)] =
@@ -837,6 +896,14 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X,
   const bool use_parallel = !omp_in_parallel();
   const int num_threads = use_parallel ? std::max(1, omp_get_max_threads()) : 1;
 #endif
+  MatrixRM new_centroids(k, dim);
+  std::vector<int64_t> counts(static_cast<size_t>(k));
+#ifdef _OPENMP
+  std::vector<MatrixRM> partial_sums(
+      static_cast<size_t>(num_threads), MatrixRM(k, dim));
+  std::vector<std::vector<int64_t>> partial_counts(
+      static_cast<size_t>(num_threads), std::vector<int64_t>(static_cast<size_t>(k)));
+#endif
   for (uint32_t iter = 0; iter < kmeans_iters; ++iter) {
     Timer assignment_timer;
 #if defined(__AVX512F__)
@@ -867,12 +934,15 @@ void RunKMeans(Eigen::Ref<const MatrixRM> X,
 
     // Update step.
     Timer update_timer;
-    MatrixRM new_centroids = MatrixRM::Zero(k, dim);
-    std::vector<int64_t> counts(static_cast<size_t>(k), 0);
+    new_centroids.setZero();
+    std::fill(counts.begin(), counts.end(), 0);
 #ifdef _OPENMP
-    std::vector<MatrixRM> partial_sums(static_cast<size_t>(num_threads), MatrixRM::Zero(k, dim));
-    std::vector<std::vector<int64_t>> partial_counts(
-        static_cast<size_t>(num_threads), std::vector<int64_t>(static_cast<size_t>(k), 0));
+    for (MatrixRM& partial_sum : partial_sums) {
+      partial_sum.setZero();
+    }
+    for (auto& partial_count : partial_counts) {
+      std::fill(partial_count.begin(), partial_count.end(), 0);
+    }
 
 #pragma omp parallel if (use_parallel)
     {

@@ -455,6 +455,7 @@ struct DeltaShard {
 };
 
 struct EvalMetrics {
+  bool recall_available{false};
   double recall{0.0};
   double recall_new{0.0};
   double recall_old{0.0};
@@ -707,6 +708,7 @@ struct MergeEventRecord {
   double merge_compute_ms{0.0};
   double merge_ms{0.0};
   double codebook_rebuild_ms{0.0};
+  MergeProfiling profiling;
 };
 
 struct MergeTriggerDecision {
@@ -1269,63 +1271,66 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return Status::InvalidArgument("EvaluateState: main index is null");
   }
 
-  auto main_doc_ids_res = main_ivf->SnapshotDocIds(main_versions);
-  if (!main_doc_ids_res.ok()) {
-    return main_doc_ids_res.status();
-  }
+  std::vector<std::vector<DocId>> ground_truth;
+  if (config.enable_dynamic_ground_truth) {
+    auto main_doc_ids_res = main_ivf->SnapshotDocIds(main_versions);
+    if (!main_doc_ids_res.ok()) {
+      return main_doc_ids_res.status();
+    }
 
-  std::vector<DocId> searchable_doc_ids;
-  searchable_doc_ids.reserve(main_doc_ids_res.value().size() +
-                             (frozen_delta.has_value() ? frozen_delta->rows : 0u) +
-                             (active_delta.has_value() ? active_delta->rows : 0u));
-  std::unordered_set<DocId> searchable_seen;
-  searchable_seen.reserve(searchable_doc_ids.capacity() * 2 + 1);
-  auto append_unique = [&](const std::vector<DocId>& doc_ids) -> Status {
-    for (DocId doc_id : doc_ids) {
-      if (doc_id >= seen_rows) {
-        return Status::InvalidArgument("EvaluateState: route doc_id exceeds seen_rows");
+    std::vector<DocId> searchable_doc_ids;
+    searchable_doc_ids.reserve(main_doc_ids_res.value().size() +
+                               (frozen_delta.has_value() ? frozen_delta->rows : 0u) +
+                               (active_delta.has_value() ? active_delta->rows : 0u));
+    std::unordered_set<DocId> searchable_seen;
+    searchable_seen.reserve(searchable_doc_ids.capacity() * 2 + 1);
+    auto append_unique = [&](const std::vector<DocId>& doc_ids) -> Status {
+      for (DocId doc_id : doc_ids) {
+        if (doc_id >= seen_rows) {
+          return Status::InvalidArgument("EvaluateState: route doc_id exceeds seen_rows");
+        }
+        if (searchable_seen.insert(doc_id).second) {
+          searchable_doc_ids.push_back(doc_id);
+        }
       }
-      if (searchable_seen.insert(doc_id).second) {
-        searchable_doc_ids.push_back(doc_id);
+      return Status::OK();
+    };
+
+    Status append_main = append_unique(main_doc_ids_res.value());
+    if (!append_main.ok()) {
+      return append_main;
+    }
+    if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
+      auto frozen_doc_ids_res = frozen_delta->ivf->SnapshotDocIds(frozen_delta->versions);
+      if (!frozen_doc_ids_res.ok()) {
+        return frozen_doc_ids_res.status();
+      }
+      Status append_frozen = append_unique(frozen_doc_ids_res.value());
+      if (!append_frozen.ok()) {
+        return append_frozen;
       }
     }
-    return Status::OK();
-  };
+    if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
+      auto active_doc_ids_res = active_delta->ivf->SnapshotDocIds(active_delta->versions);
+      if (!active_doc_ids_res.ok()) {
+        return active_doc_ids_res.status();
+      }
+      Status append_active = append_unique(active_doc_ids_res.value());
+      if (!append_active.ok()) {
+        return append_active;
+      }
+    }
+    if (searchable_doc_ids.empty()) {
+      return Status::InvalidArgument("EvaluateState: no searchable docs");
+    }
 
-  Status append_main = append_unique(main_doc_ids_res.value());
-  if (!append_main.ok()) {
-    return append_main;
-  }
-  if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
-    auto frozen_doc_ids_res = frozen_delta->ivf->SnapshotDocIds(frozen_delta->versions);
-    if (!frozen_doc_ids_res.ok()) {
-      return frozen_doc_ids_res.status();
+    auto gt_res = ExactSearchDocIdsBlockwise(
+        queries_whitened, base_whitened, searchable_doc_ids, config.topk);
+    if (!gt_res.ok()) {
+      return gt_res.status();
     }
-    Status append_frozen = append_unique(frozen_doc_ids_res.value());
-    if (!append_frozen.ok()) {
-      return append_frozen;
-    }
+    ground_truth = std::move(gt_res.value());
   }
-  if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
-    auto active_doc_ids_res = active_delta->ivf->SnapshotDocIds(active_delta->versions);
-    if (!active_doc_ids_res.ok()) {
-      return active_doc_ids_res.status();
-    }
-    Status append_active = append_unique(active_doc_ids_res.value());
-    if (!append_active.ok()) {
-      return append_active;
-    }
-  }
-  if (searchable_doc_ids.empty()) {
-    return Status::InvalidArgument("EvaluateState: no searchable docs");
-  }
-
-  auto gt_res = ExactSearchDocIdsBlockwise(
-      queries_whitened, base_whitened, searchable_doc_ids, config.topk);
-  if (!gt_res.ok()) {
-    return gt_res.status();
-  }
-  std::vector<std::vector<DocId>> ground_truth = std::move(gt_res.value());
 
   std::vector<SearchRoute> routes;
   routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main", main_rows});
@@ -1521,7 +1526,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   double pq_rank_loss_sum = 0.0;
   uint64_t pq_rank_loss_count = 0;
   std::vector<std::string> worst_queries;
-  if (config.enable_miss_diag) {
+  if (config.enable_dynamic_ground_truth && config.enable_miss_diag) {
     struct QueryMissDiag {
       double recall{0.0};
       uint32_t misses{0};
@@ -1694,12 +1699,17 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   const double wall_elapsed_no_merge_ms = whitening_wall_ms + slowest_route_wall_ms;
   const double wall_elapsed_with_merge_ms = wall_elapsed_no_merge_ms + merge_wall_ms;
 
-  auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
-  if (!recall_res.ok()) {
-    return recall_res.status();
+  RecallAgeMetrics age_metrics;
+  double recall = 0.0;
+  if (config.enable_dynamic_ground_truth) {
+    auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
+    if (!recall_res.ok()) {
+      return recall_res.status();
+    }
+    recall = recall_res.value();
+    age_metrics =
+        ComputeRecallByRecentInsert(ground_truth, predictions, new_begin, new_end, seen_rows);
   }
-  const RecallAgeMetrics age_metrics =
-      ComputeRecallByRecentInsert(ground_truth, predictions, new_begin, new_end, seen_rows);
   auto whiten_summary = SummarizeLatencies(whitening_ms);
   if (!whiten_summary.ok()) {
     return whiten_summary.status();
@@ -1743,7 +1753,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       nq > 0 ? (wall_elapsed_no_merge_ms / static_cast<double>(nq)) : 0.0;
 
   EvalMetrics metrics;
-  metrics.recall = recall_res.value();
+  metrics.recall_available = config.enable_dynamic_ground_truth;
+  metrics.recall = recall;
   metrics.recall_new = age_metrics.recall_new;
   metrics.recall_old = age_metrics.recall_old;
   metrics.gt_new_ratio = age_metrics.gt_new_ratio;
@@ -2123,6 +2134,7 @@ int main(int argc, char** argv) {
   double init_main_add_ms = 0.0;
   double init_load_ms = 0.0;
   bool used_prebuilt_index = false;
+  std::optional<IVFBuildProfiling> initial_build_profile;
 
   if (runtime_opts.prebuilt_index_dir) {
     Timer load_timer;
@@ -2237,7 +2249,8 @@ int main(int argc, char** argv) {
     main_versions = VersionSet{whiten_version, main_version_res.value()};
     auto init_build_profile_res = main_ivf->GetBuildProfiling(main_versions);
     if (init_build_profile_res.ok()) {
-      const IVFBuildProfiling& build_profile = init_build_profile_res.value();
+      initial_build_profile = init_build_profile_res.value();
+      const IVFBuildProfiling& build_profile = *initial_build_profile;
       std::cout << "[INITIAL_PQ_BUILD_PROFILE] build_pq_routing_assignment_us="
                 << build_profile.build_pq_routing_assignment_us
                 << ", build_pq_routing_assignment_rows="
@@ -3112,7 +3125,8 @@ int main(int argc, char** argv) {
     m.rebuild_ms = rebuild_ms_total;
     const uint64_t eval_id = ++eval_seq;
     std::cout << "[EVAL] #" << eval_id << " stage=" << stage << ", base_rows=" << active_rows
-              << ", recall@" << config.topk << "=" << m.recall
+              << ", recall@" << config.topk << "="
+              << (m.recall_available ? std::to_string(m.recall) : "unavailable")
               << ", latency_ms=" << m.avg_query_ms << ", qps=" << m.query_qps << std::endl;
     return m;
   };
@@ -3233,7 +3247,8 @@ int main(int argc, char** argv) {
     record_memory("snapshot", active_rows);
     std::cout << "[SNAPSHOT] base_rows=" << snap.base_rows
               << ", snapshot_rows=" << snap.snapshot_rows
-              << ", recall@" << config.topk << "=" << snap.recall
+              << ", recall@" << config.topk << "="
+              << (config.enable_dynamic_ground_truth ? std::to_string(snap.recall) : "unavailable")
               << ", latency_ms=" << snap.latency_ms
               << ", qps=" << snap.query_qps
               << ", throughput=" << snap.update_throughput_vecps
@@ -3651,6 +3666,7 @@ int main(int argc, char** argv) {
         merge_event.merge_compute_ms = merge_res.value().merge_compute_ms;
         merge_event.merge_ms = merge_commit_ms;
         merge_event.codebook_rebuild_ms = merge_res.value().codebook_rebuild_ms;
+        merge_event.profiling = merge_res.value().profiling;
         merge_events.push_back(merge_event);
         std::cout << "[MERGE] commit done: frozen_rows=" << merge_res.value().frozen_records
                   << ", patched_partitions=" << merge_res.value().patch_partitions
@@ -3839,9 +3855,13 @@ int main(int argc, char** argv) {
           ? online_pq_rollup.sum_codebook_drift / static_cast<double>(online_pq_rollup.batches)
           : 0.0;
 
-  std::cout << "[ONLINE EVAL] "
-            << "Recall@" << config.topk << " = " << final_metrics.recall
-            << " (nprobe=" << params.nprobe
+  std::cout << "[ONLINE EVAL] ";
+  if (final_metrics.recall_available) {
+    std::cout << "Recall@" << config.topk << " = " << final_metrics.recall;
+  } else {
+    std::cout << "Recall disabled (enable_dynamic_ground_truth=false)";
+  }
+  std::cout << " (nprobe=" << params.nprobe
             << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
             << ", rerank_candidates_per_route=" << config.exact_rerank_candidates_per_route
             << ")" << std::endl;
@@ -4005,6 +4025,8 @@ int main(int argc, char** argv) {
     ofs << "  \"timestamp\": " << ts << ",\n";
     ofs << "  \"params\": {\n";
     ofs << "    \"topk\": " << config.topk << ",\n";
+    ofs << "    \"enable_dynamic_ground_truth\": "
+        << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
     ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
@@ -4021,6 +4043,8 @@ int main(int argc, char** argv) {
     ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
     ofs << "  },\n";
     ofs << "  \"metrics\": {\n";
+    ofs << "    \"recall_available\": "
+        << (final_metrics.recall_available ? "true" : "false") << ",\n";
     ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
     ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
     ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
@@ -4052,6 +4076,29 @@ int main(int argc, char** argv) {
         << (used_prebuilt_index ? "true" : "false") << ",\n";
     ofs << "    \"initial_index_load_ms\": " << init_load_ms << ",\n";
     ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
+    ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
+    ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
+    ofs << "    \"initial_build_profile_available\": "
+        << (initial_build_profile.has_value() ? "true" : "false") << ",\n";
+    ofs << "    \"initial_build_coarse_kmeans_us\": "
+        << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_us : 0.0) << ",\n";
+    ofs << "    \"initial_build_coarse_assignment_us\": "
+        << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_assignment_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_coarse_update_us\": "
+        << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_update_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_pq_training_us\": "
+        << (initial_build_profile ? initial_build_profile->build_pq_training_total_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_pq_assignment_us\": "
+        << (initial_build_profile ? initial_build_profile->build_pq_kmeans_assignment_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_pq_update_us\": "
+        << (initial_build_profile ? initial_build_profile->build_pq_kmeans_update_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_publication_us\": "
+        << (initial_build_profile ? initial_build_profile->build_publication_us : 0.0) << ",\n";
     ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
     ofs << "    \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
     ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
@@ -4108,6 +4155,23 @@ int main(int argc, char** argv) {
       ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
       ofs << "      \"frozen_rows\": " << ev.frozen_rows << ",\n";
       ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
+      ofs << "      \"assignment_distance_us\": "
+          << ev.profiling.merge_assignment_distance_us << ",\n";
+      ofs << "      \"assignment_top_r_us\": "
+          << ev.profiling.merge_assignment_top_r_us << ",\n";
+      ofs << "      \"assignment_balance_us\": "
+          << ev.profiling.merge_assignment_balance_us << ",\n";
+      ofs << "      \"fetch_main_records_us\": "
+          << ev.profiling.fetch_main_records_us << ",\n";
+      ofs << "      \"repartition_distance_us\": "
+          << ev.profiling.repartition_distance_us << ",\n";
+      ofs << "      \"repartition_sort_us\": " << ev.profiling.repartition_sort_us << ",\n";
+      ofs << "      \"prepare_pq_encode_us\": "
+          << ev.profiling.prepare_pq_encode_us << ",\n";
+      ofs << "      \"commit_us\": " << ev.profiling.commit_us << ",\n";
+      ofs << "      \"pq_code_copy_or_reuse_us\": "
+          << ev.profiling.pq_code_copy_or_reuse_us << ",\n";
+      ofs << "      \"pq_list_flatten_us\": " << ev.profiling.pq_list_flatten_us << ",\n";
       ofs << "      \"merge_ms\": " << ev.merge_ms << ",\n";
       ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << "\n";
       ofs << "    }";
@@ -4122,6 +4186,8 @@ int main(int argc, char** argv) {
       const auto& snap = snapshots[i];
       ofs << "    {\n";
       ofs << "      \"snapshot_size\": " << snap.base_rows << ",\n";
+      ofs << "      \"recall_available\": "
+          << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
       ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
       ofs << "      \"recall_new\": " << snap.recall_new << ",\n";
       ofs << "      \"recall_old\": " << snap.recall_old << ",\n";
@@ -4223,6 +4289,8 @@ int main(int argc, char** argv) {
   ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
   ofs << "    \"streaming_use_stream_batch_size\": "
       << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
+  ofs << "    \"enable_dynamic_ground_truth\": "
+      << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
   ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
   ofs << "    \"enable_rerank_source_diag\": "
       << (config.enable_rerank_source_diag ? "true" : "false") << ",\n";
@@ -4264,6 +4332,8 @@ int main(int argc, char** argv) {
       << (config.online_pq_reencode_batch ? "true" : "false") << "\n";
   ofs << "  },\n";
   ofs << "  \"metrics\": {\n";
+  ofs << "    \"recall_available\": "
+      << (final_metrics.recall_available ? "true" : "false") << ",\n";
   ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
   ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
   ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
@@ -4284,6 +4354,27 @@ int main(int argc, char** argv) {
   ofs << "    \"initial_whitening_transform_ms\": " << init_whitening_transform_ms << ",\n";
   ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
   ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
+  ofs << "    \"initial_build_profile_available\": "
+      << (initial_build_profile.has_value() ? "true" : "false") << ",\n";
+  ofs << "    \"initial_build_coarse_kmeans_us\": "
+      << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_us : 0.0) << ",\n";
+  ofs << "    \"initial_build_coarse_assignment_us\": "
+      << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_assignment_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_coarse_update_us\": "
+      << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_update_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_pq_training_us\": "
+      << (initial_build_profile ? initial_build_profile->build_pq_training_total_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_pq_assignment_us\": "
+      << (initial_build_profile ? initial_build_profile->build_pq_kmeans_assignment_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_pq_update_us\": "
+      << (initial_build_profile ? initial_build_profile->build_pq_kmeans_update_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_publication_us\": "
+      << (initial_build_profile ? initial_build_profile->build_publication_us : 0.0) << ",\n";
   ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
   ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
   ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
@@ -4470,6 +4561,25 @@ int main(int argc, char** argv) {
         << ev.trigger_active_avg_non_empty_list << ",\n";
     ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
     ofs << "      \"codebook_rebuild_ms\": " << ev.codebook_rebuild_ms << ",\n";
+    ofs << "      \"assignment_distance_us\": "
+        << ev.profiling.merge_assignment_distance_us << ",\n";
+    ofs << "      \"assignment_top_r_us\": "
+        << ev.profiling.merge_assignment_top_r_us << ",\n";
+    ofs << "      \"assignment_balance_us\": "
+        << ev.profiling.merge_assignment_balance_us << ",\n";
+    ofs << "      \"fetch_main_records_us\": "
+        << ev.profiling.fetch_main_records_us << ",\n";
+    ofs << "      \"repartition_distance_us\": "
+        << ev.profiling.repartition_distance_us << ",\n";
+    ofs << "      \"repartition_sort_us\": " << ev.profiling.repartition_sort_us << ",\n";
+    ofs << "      \"prepare_pq_encode_us\": "
+        << ev.profiling.prepare_pq_encode_us << ",\n";
+    ofs << "      \"commit_us\": " << ev.profiling.commit_us << ",\n";
+    ofs << "      \"pq_code_assignment_us\": "
+        << ev.profiling.pq_code_assignment_us << ",\n";
+    ofs << "      \"pq_code_copy_or_reuse_us\": "
+        << ev.profiling.pq_code_copy_or_reuse_us << ",\n";
+    ofs << "      \"pq_list_flatten_us\": " << ev.profiling.pq_list_flatten_us << ",\n";
     ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
     ofs << "    }";
     if (i + 1 < merge_events.size()) {
