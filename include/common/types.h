@@ -31,6 +31,10 @@ struct Candidate {
 struct SearchResult {
   std::vector<Candidate> topk;
   uint64_t scanned_candidates{0};
+  // Time spent constructing query-dependent PQ distance tables and scanning
+  // PQ codes. These are per SearchSingleQuery call.
+  double pq_lut_build_us{0.0};
+  double pq_adc_scan_us{0.0};
   std::vector<DocId> scanned_doc_ids;
   std::vector<float> scanned_approx_dists;
 };

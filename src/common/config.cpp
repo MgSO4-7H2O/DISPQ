@@ -67,6 +67,8 @@ std::string Config::ToString() const {
       << "pq_m=" << pq_m << ", "
       << "pq_nbits=" << pq_nbits << ", "
       << "pq_residual=" << std::boolalpha << pq_residual << ", "
+      << "pq_codebook_dimension_major=" << std::boolalpha << pq_codebook_dimension_major << ", "
+      << "pq_codes_subquantizer_major=" << std::boolalpha << pq_codes_subquantizer_major << ", "
       << "max_queries=" << max_queries << ", "
       << "snapshot_interval=" << snapshot_interval << ", "
       << "enable_dynamic_ground_truth=" << std::boolalpha << enable_dynamic_ground_truth
@@ -148,6 +150,8 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "pq_m", &cfg.pq_m);
   ExtractUint(text, "pq_nbits", &cfg.pq_nbits);
   ExtractBool(text, "pq_residual", &cfg.pq_residual);
+  ExtractBool(text, "pq_codebook_dimension_major", &cfg.pq_codebook_dimension_major);
+  ExtractBool(text, "pq_codes_subquantizer_major", &cfg.pq_codes_subquantizer_major);
   ExtractUint(text, "max_queries", &cfg.max_queries);
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
   ExtractBool(text, "enable_dynamic_ground_truth", &cfg.enable_dynamic_ground_truth);

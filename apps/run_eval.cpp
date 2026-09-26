@@ -468,6 +468,8 @@ struct EvalMetrics {
   double whitening_p99{0.0};
   double avg_whiten_ms{0.0};
   double avg_search_ms{0.0};
+  double avg_pq_lut_build_us{0.0};
+  double avg_pq_adc_scan_us{0.0};
   double search_p50{0.0};
   double search_p99{0.0};
   double total_p50{0.0};
@@ -1375,6 +1377,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       nq, std::vector<SearchResult>(route_count));
   std::vector<double> route_search_ms(static_cast<size_t>(nq) * route_count, 0.0);
   std::vector<double> route_scanned_candidates(static_cast<size_t>(nq) * route_count, 0.0);
+  std::vector<double> pq_lut_build_us(nq, 0.0);
+  std::vector<double> pq_adc_scan_us(nq, 0.0);
   std::vector<double> merge_topk_ms(nq, 0.0);
   std::vector<double> max_route_search_ms(nq, 0.0);
   std::vector<double> route_wall_ms(route_count, 0.0);
@@ -1434,6 +1438,8 @@ Result<EvalMetrics> EvaluateState(const Config& config,
         nq > 0 ? (route_wall_ms[static_cast<size_t>(ri)] / static_cast<double>(nq)) : 0.0;
     for (uint32_t qi = 0; qi < nq; ++qi) {
       const size_t idx = static_cast<size_t>(qi) * route_count + static_cast<size_t>(ri);
+      pq_lut_build_us[static_cast<size_t>(qi)] += route_batch[static_cast<size_t>(qi)].pq_lut_build_us;
+      pq_adc_scan_us[static_cast<size_t>(qi)] += route_batch[static_cast<size_t>(qi)].pq_adc_scan_us;
       route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] =
           std::move(route_batch[static_cast<size_t>(qi)]);
       route_scanned_candidates[idx] = static_cast<double>(
@@ -1766,6 +1772,14 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   metrics.whitening_p99 = whiten_summary.value().p99_ms;
   metrics.avg_whiten_ms = avg_whiten;
   metrics.avg_search_ms = avg_search;
+  metrics.avg_pq_lut_build_us = nq > 0
+      ? std::accumulate(pq_lut_build_us.begin(), pq_lut_build_us.end(), 0.0) /
+            static_cast<double>(nq)
+      : 0.0;
+  metrics.avg_pq_adc_scan_us = nq > 0
+      ? std::accumulate(pq_adc_scan_us.begin(), pq_adc_scan_us.end(), 0.0) /
+            static_cast<double>(nq)
+      : 0.0;
   metrics.search_p50 = search_summary.value().p50_ms;
   metrics.search_p99 = search_summary.value().p99_ms;
   metrics.total_p50 = total_summary.value().p50_ms;
@@ -2075,6 +2089,8 @@ int main(int argc, char** argv) {
   ivf_params.pq.M = config.pq_m;
   ivf_params.pq.nbits = config.pq_nbits;
   ivf_params.pq.residual = config.pq_residual;
+  ivf_params.pq_codebook_dimension_major = config.pq_codebook_dimension_major;
+  ivf_params.pq_codes_subquantizer_major = config.pq_codes_subquantizer_major;
   ivf_params.defer_pq_stats_to_add = true;
 
   auto whitening = CreateWhiteningModel();
@@ -2135,6 +2151,8 @@ int main(int argc, char** argv) {
   double init_load_ms = 0.0;
   bool used_prebuilt_index = false;
   std::optional<IVFBuildProfiling> initial_build_profile;
+  IngestProfiling initial_main_ingest_profile;
+  IngestProfiling initial_delta_seed_ingest_profile;
 
   if (runtime_opts.prebuilt_index_dir) {
     Timer load_timer;
@@ -2272,13 +2290,23 @@ int main(int argc, char** argv) {
                 << build_profile.build_pq_training_concurrency << std::endl;
     }
     Timer init_add_timer;
-    Status add_main =
-        AddRangeToIndex(main_ivf, X_whitened, 0, main_rows_initial, config.dim, main_versions);
+    Status add_main = AddRangeToIndex(main_ivf,
+                                      X_whitened,
+                                      0,
+                                      main_rows_initial,
+                                      config.dim,
+                                      main_versions,
+                                      &initial_main_ingest_profile);
     if (!add_main.ok()) {
       std::cerr << add_main.ToString() << std::endl;
       return 1;
     }
     init_main_add_ms = init_add_timer.ElapsedMillis();
+    std::cout << "[INITIAL_MAIN_ADD_PROFILE] records="
+              << initial_main_ingest_profile.records
+              << ", pq_encode_us=" << initial_main_ingest_profile.encode_us
+              << ", assignment_us=" << initial_main_ingest_profile.assignment_us
+              << std::endl;
   }
   record_memory("after_initial_main_index", init_visible_rows);
   const double init_rebuild_ms = init_whitening_ms + init_whitening_transform_ms +
@@ -2323,7 +2351,8 @@ int main(int argc, char** argv) {
                                                   main_rows_initial,
                                                   stream_start_idx,
                                                   config.dim,
-                                                  active_delta->versions);
+                                                  active_delta->versions,
+                                                  &initial_delta_seed_ingest_profile);
     if (!add_delta_seed.ok()) {
       std::cerr << add_delta_seed.ToString() << std::endl;
       return 1;
@@ -4030,6 +4059,10 @@ int main(int argc, char** argv) {
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
     ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
+    ofs << "    \"pq_codebook_dimension_major\": "
+        << (config.pq_codebook_dimension_major ? "true" : "false") << ",\n";
+    ofs << "    \"pq_codes_subquantizer_major\": "
+        << (config.pq_codes_subquantizer_major ? "true" : "false") << ",\n";
     ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
     ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
         << ",\n";
@@ -4056,6 +4089,8 @@ int main(int argc, char** argv) {
     ofs << "    \"latency_ms\": " << final_metrics.avg_query_ms << ",\n";
     ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
     ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
+    ofs << "    \"avg_pq_lut_build_us\": " << final_metrics.avg_pq_lut_build_us << ",\n";
+    ofs << "    \"avg_pq_adc_scan_us\": " << final_metrics.avg_pq_adc_scan_us << ",\n";
     ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
     ofs << "    \"update_whitening_ms\": " << total_update_whitening_ms << ",\n";
     ofs << "    \"update_insert_ms\": " << total_update_insert_ms << ",\n";
@@ -4078,6 +4113,10 @@ int main(int argc, char** argv) {
     ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
     ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
     ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
+    ofs << "    \"initial_main_pq_encode_us\": "
+        << initial_main_ingest_profile.encode_us << ",\n";
+    ofs << "    \"initial_delta_seed_pq_encode_us\": "
+        << initial_delta_seed_ingest_profile.encode_us << ",\n";
     ofs << "    \"initial_build_profile_available\": "
         << (initial_build_profile.has_value() ? "true" : "false") << ",\n";
     ofs << "    \"initial_build_coarse_kmeans_us\": "
@@ -4090,6 +4129,12 @@ int main(int argc, char** argv) {
         << ",\n";
     ofs << "    \"initial_build_pq_training_us\": "
         << (initial_build_profile ? initial_build_profile->build_pq_training_total_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_pq_codebook_soa_us\": "
+        << (initial_build_profile ? initial_build_profile->build_pq_codebook_soa_us : 0.0)
+        << ",\n";
+    ofs << "    \"initial_build_pq_precomputed_table_us\": "
+        << (initial_build_profile ? initial_build_profile->build_pq_precomputed_table_us : 0.0)
         << ",\n";
     ofs << "    \"initial_build_pq_assignment_us\": "
         << (initial_build_profile ? initial_build_profile->build_pq_kmeans_assignment_us : 0.0)
@@ -4244,6 +4289,10 @@ int main(int argc, char** argv) {
   ofs << "    \"nprobe\": " << params.nprobe << ",\n";
   ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
   ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
+  ofs << "    \"pq_codebook_dimension_major\": "
+      << (config.pq_codebook_dimension_major ? "true" : "false") << ",\n";
+  ofs << "    \"pq_codes_subquantizer_major\": "
+      << (config.pq_codes_subquantizer_major ? "true" : "false") << ",\n";
   ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
   ofs << "    \"main_query_only\": " << (config.main_query_only ? "true" : "false") << ",\n";
   ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
@@ -4337,6 +4386,8 @@ int main(int argc, char** argv) {
   ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
   ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
   ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
+  ofs << "    \"avg_pq_lut_build_us\": " << final_metrics.avg_pq_lut_build_us << ",\n";
+  ofs << "    \"avg_pq_adc_scan_us\": " << final_metrics.avg_pq_adc_scan_us << ",\n";
   ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
   ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
   ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
@@ -4354,6 +4405,10 @@ int main(int argc, char** argv) {
   ofs << "    \"initial_whitening_transform_ms\": " << init_whitening_transform_ms << ",\n";
   ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
   ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
+  ofs << "    \"initial_main_pq_encode_us\": "
+      << initial_main_ingest_profile.encode_us << ",\n";
+  ofs << "    \"initial_delta_seed_pq_encode_us\": "
+      << initial_delta_seed_ingest_profile.encode_us << ",\n";
   ofs << "    \"initial_build_profile_available\": "
       << (initial_build_profile.has_value() ? "true" : "false") << ",\n";
   ofs << "    \"initial_build_coarse_kmeans_us\": "
@@ -4366,6 +4421,12 @@ int main(int argc, char** argv) {
       << ",\n";
   ofs << "    \"initial_build_pq_training_us\": "
       << (initial_build_profile ? initial_build_profile->build_pq_training_total_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_pq_codebook_soa_us\": "
+      << (initial_build_profile ? initial_build_profile->build_pq_codebook_soa_us : 0.0)
+      << ",\n";
+  ofs << "    \"initial_build_pq_precomputed_table_us\": "
+      << (initial_build_profile ? initial_build_profile->build_pq_precomputed_table_us : 0.0)
       << ",\n";
   ofs << "    \"initial_build_pq_assignment_us\": "
       << (initial_build_profile ? initial_build_profile->build_pq_kmeans_assignment_us : 0.0)

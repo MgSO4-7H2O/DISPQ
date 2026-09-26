@@ -22,6 +22,8 @@ struct Config {
   uint32_t pq_m{0};
   uint32_t pq_nbits{8};
   bool pq_residual{true};
+  bool pq_codebook_dimension_major{true};
+  bool pq_codes_subquantizer_major{true};
   uint32_t max_queries{0};
   uint32_t snapshot_interval{0};
   // Computes exact ground truth for every evaluated streaming snapshot. Disable

@@ -24,6 +24,11 @@ struct IVFParams {
   uint32_t dim{0};
   uint32_t kmeans_iterations{20};
   PQParams pq;
+  // Store/use transposed PQ codebooks (dimension-major, dsub x Ks) for
+  // codeword assignment and LUT construction.
+  bool pq_codebook_dimension_major{true};
+  // Store/use PQ codes in subquantizer-major order for ADC scans.
+  bool pq_codes_subquantizer_major{true};
   bool use_fixed_routing_centroids{false};
   MatrixRM fixed_routing_centroids;
   bool use_fixed_pq_codebooks{false};

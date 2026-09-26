@@ -12,3 +12,11 @@
 .codegraph
 /logs
 *.sh
+!/experiments/sift1m_layout_ablation/
+/experiments/sift1m_layout_ablation/*
+!/experiments/sift1m_layout_ablation/README.md
+!/experiments/sift1m_layout_ablation/run.sh
+!/experiments/sift1m_layout_ablation/summarize.py
+!/experiments/sift1m_layout_ablation/configs/
+/experiments/sift1m_layout_ablation/configs/*
+!/experiments/sift1m_layout_ablation/configs/*.json

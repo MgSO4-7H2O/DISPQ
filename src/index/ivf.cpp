@@ -322,6 +322,8 @@ struct IndexData {
   VersionId version{0};
   bool use_pq{false};
   bool pq_residual{true};
+  bool pq_codebook_dimension_major{true};
+  bool pq_codes_subquantizer_major{true};
   uint32_t M{0};
   uint32_t nbits{8};
   uint32_t Ks{0};
@@ -366,7 +368,7 @@ void RebuildPQSoACache(IndexData* data) {
     return;
   }
   data->pq_codebooks_soa.clear();
-  if (!data->use_pq || data->dsub == 0 || data->Ks == 0 ||
+  if (!data->pq_codebook_dimension_major || !data->use_pq || data->dsub == 0 || data->Ks == 0 ||
       data->pq_codebooks.size() != data->M) {
     return;
   }
@@ -1137,7 +1139,8 @@ void ClearListPQCodesSoA(IndexData* data, uint32_t list_id) {
 }
 
 void ReserveListPQCodesSoA(IndexData* data, uint32_t list_id, size_t rows_needed) {
-  if (data == nullptr || !data->use_pq || data->M == 0 || list_id >= data->lists.size()) {
+  if (data == nullptr || !data->use_pq || !data->pq_codes_subquantizer_major ||
+      data->M == 0 || list_id >= data->lists.size()) {
     return;
   }
   if (data->pq_codes_soa_by_list.size() != data->lists.size()) {
@@ -1180,20 +1183,25 @@ void RebuildListPQCodes(IndexData* data, uint32_t list_id) {
   if (data->doc_ids_by_list.size() != data->lists.size()) {
     data->doc_ids_by_list.resize(data->lists.size());
   }
-  if (data->pq_codes_soa_by_list.size() != data->lists.size()) {
+  if (data->pq_codes_subquantizer_major &&
+      data->pq_codes_soa_by_list.size() != data->lists.size()) {
     data->pq_codes_soa_by_list.resize(data->lists.size());
   }
   const auto& list = data->lists[static_cast<size_t>(list_id)];
   auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
   auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
-  auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+  ListPQCodesSoA* soa = data->pq_codes_subquantizer_major
+                            ? &data->pq_codes_soa_by_list[static_cast<size_t>(list_id)]
+                            : nullptr;
   doc_ids.clear();
   doc_ids.reserve(list.size());
   flat.clear();
   flat.reserve(list.size() * data->M);
-  soa.rows = list.size();
-  soa.stride = list.size();
-  soa.codes.assign(static_cast<size_t>(data->M) * soa.stride, 0);
+  if (soa != nullptr) {
+    soa->rows = list.size();
+    soa->stride = list.size();
+    soa->codes.assign(static_cast<size_t>(data->M) * soa->stride, 0);
+  }
   for (size_t row = 0; row < list.size(); ++row) {
     const auto& entry = list[row];
     if (entry.pq_code.size() != data->M) {
@@ -1204,9 +1212,11 @@ void RebuildListPQCodes(IndexData* data, uint32_t list_id) {
     }
     doc_ids.push_back(entry.doc_id);
     flat.insert(flat.end(), entry.pq_code.begin(), entry.pq_code.end());
-    for (uint32_t m = 0; m < data->M; ++m) {
-      soa.codes[static_cast<size_t>(m) * soa.stride + row] =
-          entry.pq_code[static_cast<size_t>(m)];
+    if (soa != nullptr) {
+      for (uint32_t m = 0; m < data->M; ++m) {
+        soa->codes[static_cast<size_t>(m) * soa->stride + row] =
+            entry.pq_code[static_cast<size_t>(m)];
+      }
     }
   }
 }
@@ -1229,7 +1239,8 @@ void AppendListPQCaches(IndexData* data,
   if (data->doc_ids_by_list.size() != data->lists.size()) {
     data->doc_ids_by_list.resize(data->lists.size());
   }
-  if (data->pq_codes_soa_by_list.size() != data->lists.size()) {
+  if (data->pq_codes_subquantizer_major &&
+      data->pq_codes_soa_by_list.size() != data->lists.size()) {
     data->pq_codes_soa_by_list.resize(data->lists.size());
   }
   if (data->lists[static_cast<size_t>(list_id)].size() != rows_before + 1) {
@@ -1238,6 +1249,16 @@ void AppendListPQCaches(IndexData* data,
   }
 
   auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
+  if (!data->pq_codes_subquantizer_major) {
+    auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
+    if (doc_ids.size() != rows_before || flat.size() != rows_before * data->M) {
+      RebuildListPQCodes(data, list_id);
+      return;
+    }
+    doc_ids.push_back(entry.doc_id);
+    flat.insert(flat.end(), code.begin(), code.end());
+    return;
+  }
   auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
   const bool appendable = doc_ids.size() == rows_before &&
                           soa.rows == rows_before && soa.stride >= rows_before &&
@@ -1271,12 +1292,13 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   if (!HasCompactDocIdsForList(*data, list_id)) {
     RebuildListPQCodes(data, list_id);
   }
-  if (!HasSoAPQCodesForList(*data, list_id)) {
+  if (data->pq_codes_subquantizer_major && !HasSoAPQCodesForList(*data, list_id)) {
     RebuildListPQCodes(data, list_id);
   }
   if (list_id >= data->doc_ids_by_list.size() ||
       list_id >= data->pq_codes_by_list.size() ||
-      list_id >= data->pq_codes_soa_by_list.size()) {
+      (data->pq_codes_subquantizer_major &&
+       list_id >= data->pq_codes_soa_by_list.size())) {
     return;
   }
   auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
@@ -1295,13 +1317,15 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
       return;
     }
   }
-  auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
-  if (!HasSoAPQCodesForList(*data, list_id) || pos >= soa.rows) {
-    RebuildListPQCodes(data, list_id);
-  }
-  if (!HasSoAPQCodesForList(*data, list_id) ||
-      pos >= data->pq_codes_soa_by_list[static_cast<size_t>(list_id)].rows) {
-    return;
+  if (data->pq_codes_subquantizer_major) {
+    auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+    if (!HasSoAPQCodesForList(*data, list_id) || pos >= soa.rows) {
+      RebuildListPQCodes(data, list_id);
+    }
+    if (!HasSoAPQCodesForList(*data, list_id) ||
+        pos >= data->pq_codes_soa_by_list[static_cast<size_t>(list_id)].rows) {
+      return;
+    }
   }
   const size_t last = rows - 1;
   auto& updated_doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
@@ -1314,14 +1338,16 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   updated_doc_ids.resize(last);
   flat.resize(last * data->M);
 
-  auto& updated_soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
-  for (uint32_t m = 0; m < data->M; ++m) {
-    const size_t offset = static_cast<size_t>(m) * updated_soa.stride;
-    if (pos != last) {
-      updated_soa.codes[offset + pos] = updated_soa.codes[offset + last];
+  if (data->pq_codes_subquantizer_major) {
+    auto& updated_soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+    for (uint32_t m = 0; m < data->M; ++m) {
+      const size_t offset = static_cast<size_t>(m) * updated_soa.stride;
+      if (pos != last) {
+        updated_soa.codes[offset + pos] = updated_soa.codes[offset + last];
+      }
     }
+    updated_soa.rows = last;
   }
-  updated_soa.rows = last;
 }
 
 SearchResult SearchSingleQuery(const IndexData& data,
@@ -1340,9 +1366,11 @@ SearchResult SearchSingleQuery(const IndexData& data,
       use_pq && data.use_precomputed_table &&
       data.pq_precomputed_table.size() == PrecomputedTableElementCount(data);
   const bool use_fast_scan = use_pq && data.M >= 4;
-  const bool use_codebook_soa = use_pq && HasPQCodebookSoA(data);
+  const bool use_codebook_soa = use_pq && data.pq_codebook_dimension_major &&
+                                HasPQCodebookSoA(data);
   const bool use_vectorized_code_soa_scan =
-      use_pq && internal::HasVectorizedPQCodeSoAScan();
+      use_pq && data.pq_codes_subquantizer_major &&
+      internal::HasVectorizedPQCodeSoAScan();
   const bool has_routing_norms =
       data.routing_centroid_norms.size() == data.routing_centroids.rows();
   const float qw_norm = qw.squaredNorm();
@@ -1366,6 +1394,8 @@ SearchResult SearchSingleQuery(const IndexData& data,
   const float qnorm = use_pq ? 0.0f : qw_norm;
   std::vector<float> distance_table;
   std::vector<float> query_term3_table;
+  double pq_lut_build_us = 0.0;
+  Timer query_lut_timer;
   if (use_pq) {
     distance_table.resize(static_cast<size_t>(data.M) * data.Ks);
     if (use_precomputed_table) {
@@ -1391,11 +1421,16 @@ SearchResult SearchSingleQuery(const IndexData& data,
       }
     }
   }
+  if (use_pq) {
+    pq_lut_build_us += query_lut_timer.ElapsedMicros();
+  }
   std::vector<float> soa_scan_dists;
+  double pq_adc_scan_us = 0.0;
   for (uint32_t pi = 0; pi < probes; ++pi) {
     const uint32_t list_id = centroid_dists[static_cast<size_t>(pi)].second;
     const float coarse_dist = centroid_dists[static_cast<size_t>(pi)].first;
     if (use_pq) {
+      Timer lut_timer;
       if (use_precomputed_table) {
         const size_t table_offset =
             static_cast<size_t>(list_id) * static_cast<size_t>(data.M) * static_cast<size_t>(data.Ks);
@@ -1428,6 +1463,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
           }
         }
       }
+      pq_lut_build_us += lut_timer.ElapsedMicros();
     }
     const auto& list = data.lists[static_cast<size_t>(list_id)];
     const bool use_compact_pq_scan = use_pq && HasCompactPQListForSearch(data, list_id);
@@ -1441,6 +1477,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
         use_vectorized_code_soa_scan && HasSoAPQCodesForList(data, list_id);
     const ListPQCodesSoA* soa_codes =
         use_soa_codes ? &data.pq_codes_soa_by_list[static_cast<size_t>(list_id)] : nullptr;
+    Timer scan_timer;
     if (soa_codes != nullptr && list_size > 0) {
       soa_scan_dists.resize(list_size);
       internal::ScanPQCodesSoA(distance_table.data(),
@@ -1512,10 +1549,15 @@ SearchResult SearchSingleQuery(const IndexData& data,
         std::push_heap(heap.begin(), heap.end(), heap_cmp);
       }
     }
+    if (use_pq) {
+      pq_adc_scan_us += scan_timer.ElapsedMicros();
+    }
   }
 
   SearchResult result;
   result.scanned_candidates = scanned;
+  result.pq_lut_build_us = pq_lut_build_us;
+  result.pq_adc_scan_us = pq_adc_scan_us;
   if (!heap.empty()) {
     std::sort(heap.begin(), heap.end(),
               [](const Candidate& a, const Candidate& b) { return a.approx_dist < b.approx_dist; });
@@ -1608,6 +1650,8 @@ class KMeansIVFIndex : public IVFIndex {
     data->routing_centroid_norms = data->routing_centroids.rowwise().squaredNorm();
     data->use_pq = p.pq.enable;
     data->pq_residual = p.pq.residual;
+    data->pq_codebook_dimension_major = p.pq_codebook_dimension_major;
+    data->pq_codes_subquantizer_major = p.pq_codes_subquantizer_major;
     if (data->use_pq) {
       data->M = p.pq.M;
       data->nbits = p.pq.nbits;
@@ -1629,7 +1673,9 @@ class KMeansIVFIndex : public IVFIndex {
     if (data->use_pq) {
       data->doc_ids_by_list.resize(nlist);
       data->pq_codes_by_list.resize(nlist);
-      data->pq_codes_soa_by_list.resize(nlist);
+      if (data->pq_codes_subquantizer_major) {
+        data->pq_codes_soa_by_list.resize(nlist);
+      }
     }
     data->doc_to_list.Clear();
     data->ntotal = 0;
@@ -3246,7 +3292,9 @@ class KMeansIVFIndex : public IVFIndex {
         data->pq_codes_by_list.clear();
         data->pq_codes_by_list.resize(data->lists.size());
         data->pq_codes_soa_by_list.clear();
-        data->pq_codes_soa_by_list.resize(data->lists.size());
+        if (data->pq_codes_subquantizer_major) {
+          data->pq_codes_soa_by_list.resize(data->lists.size());
+        }
         for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
           RebuildListPQCodes(data, list_id);
         }
@@ -3399,7 +3447,8 @@ class KMeansIVFIndex : public IVFIndex {
     if (data->use_pq && data->pq_codes_by_list.size() != data->lists.size()) {
       data->pq_codes_by_list.resize(data->lists.size());
     }
-    if (data->use_pq && data->pq_codes_soa_by_list.size() != data->lists.size()) {
+    if (data->use_pq && data->pq_codes_subquantizer_major &&
+        data->pq_codes_soa_by_list.size() != data->lists.size()) {
       data->pq_codes_soa_by_list.resize(data->lists.size());
     }
     if (!entries->empty()) {
