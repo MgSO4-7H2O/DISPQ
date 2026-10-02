@@ -238,6 +238,30 @@ inline Result<MatrixRM> TransformSourceRangeToWhitened(
   return whitened;
 }
 
+inline Result<MatrixRM> TransformSourceRangeToIndexSpace(
+    const BaseVectorSource& source,
+    uint32_t begin,
+    uint32_t rows,
+    bool use_whitening,
+    VersionId version,
+    const std::shared_ptr<WhiteningModel>& whitening,
+    bool use_cosine) {
+  if (use_whitening) {
+    return TransformSourceRangeToWhitened(
+        source, begin, rows, version, whitening, use_cosine);
+  }
+  auto raw_res = source.LoadRange(begin, rows);
+  if (!raw_res.ok()) {
+    return raw_res.status();
+  }
+  MatrixRM vectors = std::move(raw_res.value());
+  Status norm = NormalizeRowsIfNeeded(&vectors, use_cosine);
+  if (!norm.ok()) {
+    return norm;
+  }
+  return vectors;
+}
+
 inline Status TransformSourcePrefixToWhitened(
     const BaseVectorSource& source,
     uint32_t rows,
@@ -265,6 +289,59 @@ inline Status TransformSourcePrefixToWhitened(
                     static_cast<Eigen::Index>(count)) = block_res.value();
   }
   return Status::OK();
+}
+
+inline Status TransformSourcePrefixToIndexSpace(
+    const BaseVectorSource& source,
+    uint32_t rows,
+    uint32_t block_rows,
+    bool use_whitening,
+    VersionId version,
+    const std::shared_ptr<WhiteningModel>& whitening,
+    bool use_cosine,
+    MatrixRM* out) {
+  if (out == nullptr) {
+    return Status::InvalidArgument("TransformSourcePrefixToIndexSpace: null output");
+  }
+  if (rows > source.rows) {
+    return Status::InvalidArgument("TransformSourcePrefixToIndexSpace: invalid rows");
+  }
+  out->resize(static_cast<Eigen::Index>(rows), static_cast<Eigen::Index>(source.dim));
+  const uint32_t step = std::max<uint32_t>(1, block_rows);
+  for (uint32_t begin = 0; begin < rows; begin += step) {
+    const uint32_t count = std::min<uint32_t>(step, rows - begin);
+    auto block_res = TransformSourceRangeToIndexSpace(
+        source, begin, count, use_whitening, version, whitening, use_cosine);
+    if (!block_res.ok()) {
+      return block_res.status();
+    }
+    out->middleRows(static_cast<Eigen::Index>(begin),
+                    static_cast<Eigen::Index>(count)) = block_res.value();
+  }
+  return Status::OK();
+}
+
+inline Result<MatrixRM> TransformBatchToIndexSpace(
+    Eigen::Ref<const MatrixRM> vectors,
+    bool use_whitening,
+    VersionId version,
+    const std::shared_ptr<WhiteningModel>& whitening,
+    bool use_cosine) {
+  MatrixRM transformed;
+  if (use_whitening) {
+    auto transformed_res = whitening->TransformBatch(vectors, version);
+    if (!transformed_res.ok()) {
+      return transformed_res.status();
+    }
+    transformed = std::move(transformed_res.value());
+  } else {
+    transformed = vectors;
+  }
+  Status norm = NormalizeRowsIfNeeded(&transformed, use_cosine);
+  if (!norm.ok()) {
+    return norm;
+  }
+  return transformed;
 }
 
 inline Status RetargetWhitenedPrefix(

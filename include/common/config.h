@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "common/result.h"
 
@@ -11,11 +12,16 @@ struct Config {
   uint32_t ivf_nlist{1024};
   uint32_t topk{10};
   uint32_t nprobe{8};
+  // Non-empty list enables final-state recall/latency sweep instead of
+  // evaluating intermediate streaming snapshots.
+  std::vector<uint32_t> nprobe_sweep;
+  // Optional reusable terminal-state artifact. "save" writes it after a full run;
+  // "load" bypasses mutation replay and evaluates the cached final state.
+  std::string final_state_cache_mode{"off"};
+  std::string final_state_cache_path;
+  bool final_state_cache_store_vectors{true};
   bool use_whitening{true};
   bool use_cosine{false};
-  bool enable_dual_route{true};
-  // When true, query only main index route and skip delta routes.
-  bool main_query_only{false};
   uint32_t dim{128};
   uint32_t seed{42};
   bool pq_enable{false};
@@ -30,6 +36,8 @@ struct Config {
   // this only for build/merge/query throughput profiling; recall fields are
   // then unavailable rather than zero-recall measurements.
   bool enable_dynamic_ground_truth{true};
+  // Skip exact ground-truth generation and all recall comparisons in run_eval.
+  bool skip_query_ground_truth{false};
   bool enable_miss_diag{true};
   bool enable_rerank_source_diag{false};
   // When true, emit extra latency diagnostics for route-level breakdown and slow queries.
@@ -72,6 +80,7 @@ struct Config {
   double merge_trigger_delta_main_ratio{0.0};
   // Trigger when max_list_size / avg_non_empty_list_size >= threshold. 0 disables it.
   double merge_trigger_imbalance_ratio{0.0};
+  bool enable_merge{true};
   // Delta->main assignment mode during merge:
   // - "nearest": always nearest main centroid
   // - "balanced_append": constrained local balancing + neighborhood repartition patching

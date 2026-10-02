@@ -43,7 +43,7 @@ class ConcreteHybridSearcher : public HybridSearcher {
     if (!ivf_) {
       return Status::Unavailable("IVF index not initialized");
     }
-    const uint8_t from_new = params.enable_dual_route ? 1 : 0;
+    constexpr uint8_t from_new = 1;
     if (params.use_whitening && whitening_) {
       Eigen::VectorXf query_buf(query.size());
       auto tstatus = whitening_->Transform(query, whitening_version_, query_buf);

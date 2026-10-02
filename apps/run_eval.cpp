@@ -30,6 +30,7 @@
 #endif
 
 #include "common/config.h"
+#include "common/final_state_cache.h"
 #include "common/dataset.h"
 #include "common/prebuilt_index.h"
 #include "common/timer.h"
@@ -51,6 +52,10 @@ constexpr uint32_t kSlowQueryDebugCount = 5;
 constexpr uint32_t kAddBlockRows = 65536;
 constexpr uint32_t kWhitenedMinGrowthRows = 65536;
 constexpr size_t kGroundTruthBlockTargetBytes = static_cast<size_t>(64) << 20;
+
+bool ShouldComputeGroundTruth(const Config& config) {
+  return config.enable_dynamic_ground_truth && !config.skip_query_ground_truth;
+}
 
 void TrimAllocatorRetainedMemory(const char* stage) {
 #ifdef __GLIBC__
@@ -1259,7 +1264,9 @@ Result<EvalMetrics> EvaluateState(const Config& config,
                                   const VersionSet& main_versions,
                                   const std::optional<DeltaShard>& frozen_delta,
                                   const std::optional<DeltaShard>& active_delta,
-                                  const SearchParams& params) {
+                                  const SearchParams& params,
+                                  const std::vector<std::vector<DocId>>* cached_ground_truth = nullptr,
+                                  std::vector<std::vector<DocId>>* ground_truth_out = nullptr) {
   if (seen_rows == 0 || seen_rows > static_cast<uint32_t>(base_whitened.rows())) {
     return Status::InvalidArgument("EvaluateState: invalid seen_rows");
   }
@@ -1273,8 +1280,10 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     return Status::InvalidArgument("EvaluateState: main index is null");
   }
 
-  std::vector<std::vector<DocId>> ground_truth;
-  if (config.enable_dynamic_ground_truth) {
+  const bool compute_ground_truth = ShouldComputeGroundTruth(config);
+  std::vector<std::vector<DocId>> ground_truth_storage;
+  const std::vector<std::vector<DocId>>* ground_truth = cached_ground_truth;
+  if (compute_ground_truth && ground_truth == nullptr) {
     auto main_doc_ids_res = main_ivf->SnapshotDocIds(main_versions);
     if (!main_doc_ids_res.ok()) {
       return main_doc_ids_res.status();
@@ -1331,20 +1340,25 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     if (!gt_res.ok()) {
       return gt_res.status();
     }
-    ground_truth = std::move(gt_res.value());
+    ground_truth_storage = std::move(gt_res.value());
+    ground_truth = &ground_truth_storage;
+    if (ground_truth_out != nullptr) *ground_truth_out = ground_truth_storage;
+  }
+  if (compute_ground_truth &&
+      (ground_truth == nullptr ||
+       ground_truth->size() != static_cast<size_t>(queries_raw.rows()))) {
+    return Status::InvalidArgument("EvaluateState: cached ground truth shape mismatch");
   }
 
   std::vector<SearchRoute> routes;
   routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main", main_rows});
-  if (!config.main_query_only) {
-    if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
-      routes.push_back(
-          SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1, "frozen_delta", frozen_delta->rows});
-    }
-    if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
-      routes.push_back(
-          SearchRoute{active_delta->ivf, active_delta->versions, 1, "active_delta", active_delta->rows});
-    }
+  if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
+    routes.push_back(
+        SearchRoute{frozen_delta->ivf, frozen_delta->versions, 1, "frozen_delta", frozen_delta->rows});
+  }
+  if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
+    routes.push_back(
+        SearchRoute{active_delta->ivf, active_delta->versions, 1, "active_delta", active_delta->rows});
   }
 
   const uint32_t nq = static_cast<uint32_t>(queries_raw.rows());
@@ -1396,15 +1410,19 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     Eigen::VectorXf qvec = queries_raw.row(i).transpose();
     Timer wtimer;
     Eigen::VectorXf qbuf(qvec.size());
-    auto wstatus = whitening->Transform(qvec, whitening_version, qbuf);
-    const double whiten_elapsed = wtimer.ElapsedMillis();
-    if (!wstatus.ok()) {
-      std::lock_guard<std::mutex> lock(error_mu);
-      if (!failed.exchange(true)) {
-        error_status = wstatus.status();
+    if (config.use_whitening) {
+      auto wstatus = whitening->Transform(qvec, whitening_version, qbuf);
+      if (!wstatus.ok()) {
+        std::lock_guard<std::mutex> lock(error_mu);
+        if (!failed.exchange(true)) {
+          error_status = wstatus.status();
+        }
+        continue;
       }
-      continue;
+    } else {
+      qbuf = qvec;
     }
+    const double whiten_elapsed = wtimer.ElapsedMillis();
     if (config.use_cosine) {
       NormalizeVectorL2(&qbuf);
     }
@@ -1425,7 +1443,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
         route_nprobes[static_cast<size_t>(ri)],
         routes[static_cast<size_t>(ri)].versions,
         routes[static_cast<size_t>(ri)].from_new,
-        config.enable_miss_diag);
+        compute_ground_truth && config.enable_miss_diag);
     route_wall_ms[static_cast<size_t>(ri)] = route_timer.ElapsedMillis();
     if (!sres_batch.ok()) {
       return sres_batch.status();
@@ -1532,7 +1550,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
   double pq_rank_loss_sum = 0.0;
   uint64_t pq_rank_loss_count = 0;
   std::vector<std::string> worst_queries;
-  if (config.enable_dynamic_ground_truth && config.enable_miss_diag) {
+  if (compute_ground_truth && config.enable_miss_diag) {
     struct QueryMissDiag {
       double recall{0.0};
       uint32_t misses{0};
@@ -1542,7 +1560,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
     query_diags.reserve(nq);
 
     for (uint32_t qi = 0; qi < nq; ++qi) {
-      const auto& gt_row = ground_truth[static_cast<size_t>(qi)];
+      const auto& gt_row = (*ground_truth)[static_cast<size_t>(qi)];
       if (gt_row.empty()) {
         continue;
       }
@@ -1707,14 +1725,14 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 
   RecallAgeMetrics age_metrics;
   double recall = 0.0;
-  if (config.enable_dynamic_ground_truth) {
-    auto recall_res = RecallAtK(ground_truth, predictions, config.topk);
+  if (compute_ground_truth) {
+    auto recall_res = RecallAtK(*ground_truth, predictions, config.topk);
     if (!recall_res.ok()) {
       return recall_res.status();
     }
     recall = recall_res.value();
     age_metrics =
-        ComputeRecallByRecentInsert(ground_truth, predictions, new_begin, new_end, seen_rows);
+        ComputeRecallByRecentInsert(*ground_truth, predictions, new_begin, new_end, seen_rows);
   }
   auto whiten_summary = SummarizeLatencies(whitening_ms);
   if (!whiten_summary.ok()) {
@@ -1759,7 +1777,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
       nq > 0 ? (wall_elapsed_no_merge_ms / static_cast<double>(nq)) : 0.0;
 
   EvalMetrics metrics;
-  metrics.recall_available = config.enable_dynamic_ground_truth;
+  metrics.recall_available = compute_ground_truth;
   metrics.recall = recall;
   metrics.recall_new = age_metrics.recall_new;
   metrics.recall_old = age_metrics.recall_old;
@@ -1813,7 +1831,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
           static_cast<double>(rerank_topk_delta_total) / static_cast<double>(nq);
     }
   }
-  if (config.enable_miss_diag) {
+  if (compute_ground_truth && config.enable_miss_diag) {
     metrics.gt_probed_rate =
         gt_total > 0 ? static_cast<double>(gt_probed) / static_cast<double>(gt_total) : 0.0;
     metrics.recall_on_probed_gt =
@@ -1890,6 +1908,7 @@ Result<EvalMetrics> EvaluateState(const Config& config,
 }  // namespace
 
 int main(int argc, char** argv) {
+  Timer full_run_timer;
   auto runtime_opts_res = ParseRuntimeOptions(argc, argv);
   if (!runtime_opts_res.ok()) {
     const std::string message = runtime_opts_res.status().message();
@@ -1912,6 +1931,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   Config config = config_res.value();
+  if (!config.nprobe_sweep.empty()) config.nprobe = config.nprobe_sweep.front();
   std::cout << "Loaded " << config.ToString() << std::endl;
 
   std::optional<std::string> dataset_spec = runtime_opts.dataset_spec;
@@ -2080,7 +2100,6 @@ int main(int argc, char** argv) {
   params.topk = config.topk;
   params.nprobe = config.nprobe;
   params.use_whitening = false;
-  params.enable_dual_route = config.enable_dual_route;
 
   IVFParams ivf_params;
   ivf_params.nlist = std::max(1u, config.ivf_nlist);
@@ -2105,6 +2124,126 @@ int main(int argc, char** argv) {
   std::optional<DeltaShard> active_delta;
   std::optional<DeltaShard> frozen_delta;
   uint32_t whitening_version_count_estimate = 0;
+  std::optional<FinalStateCache> loaded_final_state_cache;
+  const bool prepare_final_state_cache = config.final_state_cache_mode == "prepare";
+  const bool load_final_state_cache = config.final_state_cache_mode == "load";
+  const std::string cache_base_identity =
+      base_dataset_path.value_or("synthetic");
+  const std::string cache_query_identity = query_dataset_path.value_or(
+      "random:" + std::to_string(config.seed + 1) + ":" + std::to_string(Q.rows()));
+  if (load_final_state_cache) {
+    if (runtime_opts.prebuilt_index_dir || runtime_opts.use_default_prebuilt_index) {
+      std::cerr << "final-state cache load cannot be combined with a prebuilt-index option"
+                << std::endl;
+      return 1;
+    }
+    auto cache_res = LoadFinalStateCache(config.final_state_cache_path);
+    if (!cache_res.ok()) {
+      std::cerr << cache_res.status().ToString() << std::endl;
+      return 1;
+    }
+    loaded_final_state_cache = std::move(cache_res.value());
+    const auto& meta = loaded_final_state_cache->metadata;
+    if (meta.dim != config.dim || meta.topk != config.topk || meta.seen_rows > nx ||
+        meta.seen_rows == 0 || meta.main_rows == 0 || meta.main_rows > meta.seen_rows ||
+        meta.base_identity != cache_base_identity ||
+        meta.query_identity != cache_query_identity ||
+        (meta.use_whitening != 0) != config.use_whitening ||
+        (loaded_final_state_cache->whitened_vectors.rows() != 0 &&
+         loaded_final_state_cache->whitened_vectors.rows() != meta.seen_rows) ||
+        loaded_final_state_cache->ground_truth.size() != static_cast<size_t>(Q.rows())) {
+      std::cerr << "final-state cache is incompatible with this dataset/config/query set"
+                << std::endl;
+      return 1;
+    }
+    if (config.use_whitening) {
+      Status whitening_status = whitening->Deserialize(loaded_final_state_cache->whitening);
+      if (!whitening_status.ok()) {
+        std::cerr << whitening_status.ToString() << std::endl;
+        return 1;
+      }
+    }
+    Status index_status = main_ivf->Deserialize(loaded_final_state_cache->main_index);
+    if (!index_status.ok()) {
+      std::cerr << index_status.ToString() << std::endl;
+      return 1;
+    }
+    whiten_version = meta.whiten_version;
+    main_versions = VersionSet{meta.whiten_version, meta.main_index_version};
+    if (loaded_final_state_cache->whitened_vectors.rows() == meta.seen_rows) {
+      X_whitened = loaded_final_state_cache->whitened_vectors;
+    } else {
+      std::cout << "[FINAL_STATE_CACHE] cached vectors absent; regenerating whitened base vectors"
+                << std::endl;
+      const Status vector_status = ann::eval_memory::TransformSourcePrefixToIndexSpace(
+          base_source, meta.seen_rows, kAddBlockRows, config.use_whitening,
+          whiten_version, whitening, config.use_cosine, &X_whitened);
+      if (!vector_status.ok()) { std::cerr << vector_status.ToString() << std::endl; return 1; }
+    }
+    X_whitened_norms = X_whitened.rowwise().squaredNorm();
+    next_insert_idx = meta.seen_rows;
+    main_rows_current = meta.main_rows;
+    if (meta.has_active) {
+      auto delta_index = CreateIVFIndex();
+      const Status s = delta_index->Deserialize(loaded_final_state_cache->active_index);
+      if (!s.ok()) { std::cerr << s.ToString() << std::endl; return 1; }
+      active_delta = DeltaShard{delta_index,
+          VersionSet{meta.active_whiten_version, meta.active_index_version},
+          meta.active_rows, meta.active_shard_id};
+    }
+    if (meta.has_frozen) {
+      auto delta_index = CreateIVFIndex();
+      const Status s = delta_index->Deserialize(loaded_final_state_cache->frozen_index);
+      if (!s.ok()) { std::cerr << s.ToString() << std::endl; return 1; }
+      frozen_delta = DeltaShard{delta_index,
+          VersionSet{meta.frozen_whiten_version, meta.frozen_index_version},
+          meta.frozen_rows, meta.frozen_shard_id};
+    }
+    std::vector<DocId> indexed_ids;
+    auto append_indexed_ids = [&](const std::shared_ptr<IVFIndex>& ivf,
+                                  const VersionSet& versions) -> Status {
+      if (!ivf) return Status::OK();
+      auto ids = ivf->SnapshotDocIds(versions);
+      if (!ids.ok()) return ids.status();
+      indexed_ids.insert(indexed_ids.end(), ids.value().begin(), ids.value().end());
+      return Status::OK();
+    };
+    Status route_status = append_indexed_ids(main_ivf, main_versions);
+    if (route_status.ok() && frozen_delta)
+      route_status = append_indexed_ids(frozen_delta->ivf, frozen_delta->versions);
+    if (route_status.ok() && active_delta)
+      route_status = append_indexed_ids(active_delta->ivf, active_delta->versions);
+    if (!route_status.ok()) { std::cerr << route_status.ToString() << std::endl; return 1; }
+    std::sort(indexed_ids.begin(), indexed_ids.end());
+    const uint32_t expected_gt_k = std::min(config.topk, meta.live_rows);
+    bool valid_gt = true;
+    for (const auto& row : loaded_final_state_cache->ground_truth) {
+      if (row.size() != expected_gt_k ||
+          std::any_of(row.begin(), row.end(), [&](DocId id) {
+            return id >= meta.seen_rows;
+          })) {
+        valid_gt = false;
+        break;
+      }
+    }
+    if (meta.live_rows != meta.seen_rows || indexed_ids.size() != meta.live_rows ||
+        std::adjacent_find(indexed_ids.begin(), indexed_ids.end()) != indexed_ids.end() ||
+        !valid_gt) {
+      std::cerr << "final-state cache index/GT contents are inconsistent" << std::endl;
+      return 1;
+    }
+    for (uint32_t id = 0; id < meta.seen_rows; ++id) {
+      if (indexed_ids[id] != id) {
+        std::cerr << "final-state cache index IDs do not match its vector rows" << std::endl;
+        return 1;
+      }
+    }
+    whitening_version_count_estimate = config.use_whitening ? 1 : 0;
+    std::cout << "[FINAL_STATE_CACHE] loaded path=" << config.final_state_cache_path
+              << ", seen_rows=" << meta.seen_rows << ", main_rows=" << meta.main_rows
+              << ", has_active=" << meta.has_active << ", has_frozen=" << meta.has_frozen
+              << std::endl;
+  }
 
   ann::eval_memory::MemoryTraceRecorder memory_trace;
   auto collect_memory_components = [&]() {
@@ -2154,7 +2293,10 @@ int main(int argc, char** argv) {
   IngestProfiling initial_main_ingest_profile;
   IngestProfiling initial_delta_seed_ingest_profile;
 
-  if (runtime_opts.prebuilt_index_dir) {
+  if (load_final_state_cache) {
+    used_prebuilt_index = true;
+    init_load_ms = init_total_timer.ElapsedMillis();
+  } else if (runtime_opts.prebuilt_index_dir) {
     Timer load_timer;
     auto artifact_res = LoadPrebuiltMainIndex(*runtime_opts.prebuilt_index_dir);
     if (!artifact_res.ok()) {
@@ -2177,10 +2319,16 @@ int main(int argc, char** argv) {
                 << " mismatches runtime total_rows " << nx << std::endl;
       return 1;
     }
-    Status whitening_status = whitening->Deserialize(artifact.whitening_bytes);
-    if (!whitening_status.ok()) {
-      std::cerr << whitening_status.ToString() << std::endl;
+    if (artifact.metadata.use_whitening != config.use_whitening) {
+      std::cerr << "Prebuilt index whitening mode does not match runtime config" << std::endl;
       return 1;
+    }
+    if (config.use_whitening) {
+      Status whitening_status = whitening->Deserialize(artifact.whitening_bytes);
+      if (!whitening_status.ok()) {
+        std::cerr << whitening_status.ToString() << std::endl;
+        return 1;
+      }
     }
     Status index_status = main_ivf->Deserialize(artifact.index_bytes);
     if (!index_status.ok()) {
@@ -2188,7 +2336,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     whiten_version = artifact.metadata.whiten_version;
-    whitening_version_count_estimate = 1;
+    whitening_version_count_estimate = config.use_whitening ? 1 : 0;
     main_versions = VersionSet{whiten_version, artifact.metadata.index_version};
     auto main_sizes_res = main_ivf->GetPartitionSizes(main_versions);
     if (!main_sizes_res.ok()) {
@@ -2204,7 +2352,7 @@ int main(int argc, char** argv) {
                 << artifact.metadata.dataset_path
                 << ", runtime dataset_path=" << *base_dataset_path << std::endl;
     }
-  } else {
+  } else if (config.use_whitening) {
     Timer init_fit_timer;
     auto whiten_version_res = ann::eval_memory::FitWhiteningFromSourcePrefix(
         base_source, main_rows_initial, kAddBlockRows, whitening);
@@ -2215,43 +2363,51 @@ int main(int argc, char** argv) {
     whiten_version = whiten_version_res.value();
     whitening_version_count_estimate = 1;
     init_whitening_ms = init_fit_timer.ElapsedMillis();
+  } else {
+    whiten_version = 0;
+    whitening_version_count_estimate = 0;
   }
   record_memory("after_initial_whitening_fit",
                 0,
-                ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
+                config.use_whitening
+                    ? ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim)
+                    : 0);
 
-  Timer init_transform_timer;
-  Status init_transform_status =
-      ann::eval_memory::TransformSourcePrefixToWhitened(base_source,
-                                                        init_visible_rows,
-                                                        kAddBlockRows,
-                                                        whiten_version,
-                                                        whitening,
-                                                        config.use_cosine,
-                                                        &X_whitened);
-  if (!init_transform_status.ok()) {
-    std::cerr << init_transform_status.ToString() << std::endl;
-    return 1;
+  if (!load_final_state_cache) {
+    Timer init_transform_timer;
+    Status init_transform_status =
+        ann::eval_memory::TransformSourcePrefixToIndexSpace(base_source,
+                                                            init_visible_rows,
+                                                            kAddBlockRows,
+                                                            config.use_whitening,
+                                                            whiten_version,
+                                                            whitening,
+                                                            config.use_cosine,
+                                                            &X_whitened);
+    if (!init_transform_status.ok()) {
+      std::cerr << init_transform_status.ToString() << std::endl;
+      return 1;
+    }
+    X_whitened_norms = X_whitened.rowwise().squaredNorm();
+    init_whitening_transform_ms = init_transform_timer.ElapsedMillis();
   }
-  X_whitened_norms = X_whitened.rowwise().squaredNorm();
-  init_whitening_transform_ms = init_transform_timer.ElapsedMillis();
   record_memory("after_initial_base_transform",
                 init_visible_rows,
                 2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
 
-  auto qb_res = whitening->TransformBatch(Q, whiten_version);
+  auto qb_res = ann::eval_memory::TransformBatchToIndexSpace(
+      Q, config.use_whitening, whiten_version, whitening, config.use_cosine);
   if (!qb_res.ok()) {
     std::cerr << qb_res.status().ToString() << std::endl;
     return 1;
   }
   Q_whitened = std::move(qb_res.value());
   if (config.use_cosine) {
-    NormalizeRowsL2(&Q_whitened);
     std::cout << "[INFO] Cosine mode enabled: normalized whitened base/query rows"
               << std::endl;
   }
 
-  if (!used_prebuilt_index) {
+  if (!used_prebuilt_index && !load_final_state_cache) {
     std::vector<DocId> main_ids(static_cast<size_t>(main_rows_initial));
     std::iota(main_ids.begin(), main_ids.end(), 0);
     Timer init_build_timer;
@@ -2334,7 +2490,7 @@ int main(int argc, char** argv) {
   merge_options.assignment_gamma = config.merge_assignment_gamma;
   merge_options.assignment_hard_cap_ratio = config.merge_assignment_hard_cap_ratio;
   merge_options.assignment_lambda = config.merge_assignment_lambda;
-  if (config.enable_streaming && rows_after_main > 0) {
+  if (config.enable_streaming && rows_after_main > 0 && !load_final_state_cache) {
     // Train delta with the reserved window, then preload the same window as existing delta docs.
     auto delta_train = X_whitened.middleRows(main_rows_initial, delta_train_rows);
     IVFParams delta_params = ivf_params;
@@ -2555,6 +2711,10 @@ int main(int argc, char** argv) {
       decision.reason = "none";
       return decision;
     }
+    if (!config.enable_merge) {
+      decision.reason = "merge_disabled";
+      return decision;
+    }
 
     decision.rows_trigger = merge_trigger_rows > 0 && shard.rows >= merge_trigger_rows;
     decision.qe_ratio_trigger =
@@ -2756,46 +2916,56 @@ int main(int argc, char** argv) {
     double memory_trace_ms = 0.0;
     double profiling_collect_ms = 0.0;
 
-    Timer fit_timer;
-    Result<VersionId> new_whiten_res =
-        config.use_cosine
-            ? ann::eval_memory::FitWhiteningFromSourcePrefix(
-                  base_source, seen_rows, kAddBlockRows, whitening)
-            : ann::eval_memory::FitWhiteningFromWhitenedPrefix(
-                  X_whitened, seen_rows, old_whiten_version, kAddBlockRows, whitening);
-    if (!new_whiten_res.ok()) {
-      return new_whiten_res.status();
+    VersionId new_whiten_version = old_whiten_version;
+    double whitening_ms = 0.0;
+    if (config.use_whitening) {
+      Timer fit_timer;
+      auto new_whiten_res =
+          config.use_cosine
+              ? ann::eval_memory::FitWhiteningFromSourcePrefix(
+                    base_source, seen_rows, kAddBlockRows, whitening)
+              : ann::eval_memory::FitWhiteningFromWhitenedPrefix(
+                    X_whitened, seen_rows, old_whiten_version, kAddBlockRows, whitening);
+      if (!new_whiten_res.ok()) {
+        return new_whiten_res.status();
+      }
+      new_whiten_version = new_whiten_res.value();
+      ++whitening_version_count_estimate;
+      whitening_ms = fit_timer.ElapsedMillis();
     }
-    const VersionId new_whiten_version = new_whiten_res.value();
-    ++whitening_version_count_estimate;
-    const double whitening_ms = fit_timer.ElapsedMillis();
     Timer memory_trace_timer;
     record_memory("global_rebuild_after_fit",
                   seen_rows,
-                  config.use_cosine
+                  !config.use_whitening
+                      ? 0
+                      : config.use_cosine
                       ? ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim)
                       : 2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
     memory_trace_ms += memory_trace_timer.ElapsedMillis();
 
     Timer base_retarget_timer;
     MatrixRM new_x_whitened;
-    Status transform_status =
-        config.use_cosine
-            ? ann::eval_memory::TransformSourcePrefixToWhitened(base_source,
-                                                                seen_rows,
-                                                                kAddBlockRows,
-                                                                new_whiten_version,
-                                                                whitening,
-                                                                config.use_cosine,
-                                                                &new_x_whitened)
-            : ann::eval_memory::RetargetWhitenedPrefix(X_whitened,
-                                                       seen_rows,
-                                                       kAddBlockRows,
-                                                       old_whiten_version,
-                                                       new_whiten_version,
-                                                       whitening,
-                                                       config.use_cosine,
-                                                       &new_x_whitened);
+    Status transform_status;
+    if (!config.use_whitening || config.use_cosine) {
+      transform_status = ann::eval_memory::TransformSourcePrefixToIndexSpace(
+          base_source,
+          seen_rows,
+          kAddBlockRows,
+          config.use_whitening,
+          new_whiten_version,
+          whitening,
+          config.use_cosine,
+          &new_x_whitened);
+    } else {
+      transform_status = ann::eval_memory::RetargetWhitenedPrefix(X_whitened,
+                                                                  seen_rows,
+                                                                  kAddBlockRows,
+                                                                  old_whiten_version,
+                                                                  new_whiten_version,
+                                                                  whitening,
+                                                                  config.use_cosine,
+                                                                  &new_x_whitened);
+    }
     if (!transform_status.ok()) {
       return transform_status;
     }
@@ -2808,14 +2978,12 @@ int main(int argc, char** argv) {
     memory_trace_ms += base_memory_trace_timer.ElapsedMillis();
 
     Timer query_transform_timer;
-    auto qb_res = whitening->TransformBatch(Q, new_whiten_version);
+    auto qb_res = ann::eval_memory::TransformBatchToIndexSpace(
+        Q, config.use_whitening, new_whiten_version, whitening, config.use_cosine);
     if (!qb_res.ok()) {
       return qb_res.status();
     }
     MatrixRM new_q_whitened = std::move(qb_res.value());
-    if (config.use_cosine) {
-      NormalizeRowsL2(&new_q_whitened);
-    }
     const double query_transform_ms = query_transform_timer.ElapsedMillis();
 
     Timer main_setup_timer;
@@ -3126,12 +3294,21 @@ int main(int argc, char** argv) {
   uint64_t eval_seq = 0;
   uint32_t last_insert_begin = stream_start_idx;
   uint32_t last_insert_end = stream_start_idx;
+  if (loaded_final_state_cache) {
+    last_insert_begin = loaded_final_state_cache->metadata.last_insert_begin;
+    last_insert_end = loaded_final_state_cache->metadata.last_insert_end;
+  }
 
   auto evaluate_rows = [&](uint32_t active_rows,
                            const char* stage,
                            uint32_t new_begin,
-                           uint32_t new_end) -> Result<EvalMetrics> {
-    auto res = EvaluateState(config,
+                           uint32_t new_end,
+                           const std::vector<std::vector<DocId>>* cached_ground_truth = nullptr,
+                           std::vector<std::vector<DocId>>* ground_truth_out = nullptr,
+                           const Config* evaluation_config = nullptr)
+      -> Result<EvalMetrics> {
+    const Config& eval_config = evaluation_config != nullptr ? *evaluation_config : config;
+    auto res = EvaluateState(eval_config,
                              X_whitened,
                              X_whitened_norms,
                              active_rows,
@@ -3146,7 +3323,9 @@ int main(int argc, char** argv) {
                              main_versions,
                              frozen_delta,
                              active_delta,
-                             params);
+                             params,
+                             cached_ground_truth,
+                             ground_truth_out);
     if (!res.ok()) {
       return res.status();
     }
@@ -3277,7 +3456,7 @@ int main(int argc, char** argv) {
     std::cout << "[SNAPSHOT] base_rows=" << snap.base_rows
               << ", snapshot_rows=" << snap.snapshot_rows
               << ", recall@" << config.topk << "="
-              << (config.enable_dynamic_ground_truth ? std::to_string(snap.recall) : "unavailable")
+              << (ShouldComputeGroundTruth(config) ? std::to_string(snap.recall) : "unavailable")
               << ", latency_ms=" << snap.latency_ms
               << ", qps=" << snap.query_qps
               << ", throughput=" << snap.update_throughput_vecps
@@ -3289,7 +3468,8 @@ int main(int argc, char** argv) {
     return Status::OK();
   };
 
-  if (config.enable_streaming && rows_after_main > 0) {
+  if (!load_final_state_cache && config.enable_streaming && rows_after_main > 0 &&
+      config.nprobe_sweep.empty() && !prepare_final_state_cache) {
     auto pre_res = evaluate_rows(stream_start_idx, "pre_stream", stream_start_idx, stream_start_idx);
     if (!pre_res.ok()) {
       std::cerr << pre_res.status().ToString() << std::endl;
@@ -3320,8 +3500,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (config.enable_streaming && total_stream_rows > 0) {
-    const bool eval_after_each_minibatch = config.enable_miss_diag;
+  if (!load_final_state_cache && config.enable_streaming && total_stream_rows > 0) {
+    const bool eval_after_each_minibatch = !prepare_final_state_cache && config.enable_miss_diag &&
+                                           config.nprobe_sweep.empty();
     uint32_t next_snapshot_target = snapshot_span;
     uint32_t minibatch_id = 0;
     std::vector<MinibatchRecord> snapshot_minibatches;
@@ -3365,12 +3546,13 @@ int main(int argc, char** argv) {
 
       Timer whitening_timer;
       auto chunk_whiten_res =
-          ann::eval_memory::TransformSourceRangeToWhitened(base_source,
-                                                           begin,
-                                                           chunk,
-                                                           whiten_version,
-                                                           whitening,
-                                                           config.use_cosine);
+          ann::eval_memory::TransformSourceRangeToIndexSpace(base_source,
+                                                             begin,
+                                                             chunk,
+                                                             config.use_whitening,
+                                                             whiten_version,
+                                                             whitening,
+                                                             config.use_cosine);
       if (!chunk_whiten_res.ok()) {
         std::cerr << chunk_whiten_res.status().ToString() << std::endl;
         return 1;
@@ -3805,7 +3987,8 @@ int main(int argc, char** argv) {
         }
       }
 
-      if (hit_periodic_snapshot || hit_final_snapshot) {
+      if (!prepare_final_state_cache && config.nprobe_sweep.empty() &&
+          (hit_periodic_snapshot || hit_final_snapshot)) {
         EvalMetrics snapshot_metrics;
         if (batch_metrics.has_value() && !snapshot_state_changed) {
           snapshot_metrics = batch_metrics.value();
@@ -3856,12 +4039,215 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto final_res = evaluate_rows(next_insert_idx, "final", last_insert_begin, last_insert_end);
-  if (!final_res.ok()) {
-    std::cerr << final_res.status().ToString() << std::endl;
-    return 1;
+  EvalMetrics final_metrics;
+  std::vector<std::pair<uint32_t, EvalMetrics>> query_recall_curve;
+  Config final_evaluation_config = config;
+  if (config.final_state_cache_mode == "save" || load_final_state_cache) {
+    final_evaluation_config.enable_dynamic_ground_truth = true;
+    final_evaluation_config.skip_query_ground_truth = false;
   }
-  EvalMetrics final_metrics = final_res.value();
+  std::vector<std::vector<DocId>> final_ground_truth =
+      loaded_final_state_cache ? loaded_final_state_cache->ground_truth
+                               : std::vector<std::vector<DocId>>{};
+  if (prepare_final_state_cache) {
+    if (next_insert_idx == 0) {
+      std::cerr << "cannot prepare final-state cache without live index rows" << std::endl;
+      return 1;
+    }
+    std::vector<DocId> searchable_doc_ids;
+    auto append_route_ids = [&](const std::shared_ptr<IVFIndex>& ivf,
+                                const VersionSet& versions) -> Status {
+      if (!ivf) return Status::OK();
+      auto ids = ivf->SnapshotDocIds(versions);
+      if (!ids.ok()) return ids.status();
+      searchable_doc_ids.insert(searchable_doc_ids.end(), ids.value().begin(), ids.value().end());
+      return Status::OK();
+    };
+    Status route_status = append_route_ids(main_ivf, main_versions);
+    if (route_status.ok() && frozen_delta)
+      route_status = append_route_ids(frozen_delta->ivf, frozen_delta->versions);
+    if (route_status.ok() && active_delta)
+      route_status = append_route_ids(active_delta->ivf, active_delta->versions);
+    if (!route_status.ok()) { std::cerr << route_status.ToString() << std::endl; return 1; }
+    std::sort(searchable_doc_ids.begin(), searchable_doc_ids.end());
+    if (std::adjacent_find(searchable_doc_ids.begin(), searchable_doc_ids.end()) !=
+        searchable_doc_ids.end()) {
+      std::cerr << "final-state index routes contain duplicate vector IDs" << std::endl;
+      return 1;
+    }
+    auto gt_res = ExactSearchDocIdsBlockwise(Q_whitened, X_whitened,
+                                              searchable_doc_ids, config.topk);
+    if (!gt_res.ok()) { std::cerr << gt_res.status().ToString() << std::endl; return 1; }
+    final_ground_truth = std::move(gt_res.value());
+  } else if (config.nprobe_sweep.empty()) {
+    auto final_res = evaluate_rows(next_insert_idx,
+                                   "final",
+                                   last_insert_begin,
+                                   last_insert_end,
+                                   nullptr,
+                                   config.final_state_cache_mode == "save"
+                                       ? &final_ground_truth
+                                       : nullptr,
+                                   &final_evaluation_config);
+    if (!final_res.ok()) {
+      std::cerr << final_res.status().ToString() << std::endl;
+      return 1;
+    }
+    final_metrics = final_res.value();
+  } else {
+    if ((!config.enable_dynamic_ground_truth || config.skip_query_ground_truth) &&
+        config.final_state_cache_mode != "save" && !loaded_final_state_cache) {
+      std::cerr << "nprobe_sweep requires exact ground truth to be enabled" << std::endl;
+      return 1;
+    }
+    std::vector<std::vector<DocId>> cached_ground_truth = final_ground_truth;
+    for (size_t i = 0; i < config.nprobe_sweep.size(); ++i) {
+      SearchParams sweep_params = params;
+      sweep_params.nprobe = config.nprobe_sweep[i];
+      auto result = EvaluateState(final_evaluation_config,
+                                  X_whitened,
+                                  X_whitened_norms,
+                                  next_insert_idx,
+                                  last_insert_begin,
+                                  last_insert_end,
+                                  main_rows_current,
+                                  Q,
+                                  Q_whitened,
+                                  whitening,
+                                  whiten_version,
+                                  main_ivf,
+                                  main_versions,
+                                  frozen_delta,
+                                  active_delta,
+                                  sweep_params,
+                                  cached_ground_truth.empty() ? nullptr : &cached_ground_truth,
+                                  (i == 0 && cached_ground_truth.empty())
+                                      ? &cached_ground_truth
+                                      : nullptr);
+      if (!result.ok()) {
+        std::cerr << result.status().ToString() << std::endl;
+        return 1;
+      }
+      query_recall_curve.emplace_back(config.nprobe_sweep[i], result.value());
+      if (i == 0) final_metrics = result.value();
+      std::cout << "[QUERY_RECALL_CURVE] nprobe=" << config.nprobe_sweep[i]
+                << ", recall@" << config.topk << "=" << result.value().recall
+                << ", latency_ms=" << result.value().avg_query_ms
+                << ", qps=" << result.value().query_qps << std::endl;
+    }
+    final_ground_truth = std::move(cached_ground_truth);
+  }
+  if (config.final_state_cache_mode == "save" || prepare_final_state_cache) {
+    if (final_ground_truth.size() != static_cast<size_t>(Q.rows())) {
+      std::cerr << "final-state cache GT query count mismatch" << std::endl;
+      return 1;
+    }
+    const uint32_t expected_gt_k = std::min(config.topk, next_insert_idx);
+    for (const auto& row : final_ground_truth) {
+      if (row.size() != expected_gt_k ||
+          std::any_of(row.begin(), row.end(), [&](DocId id) { return id >= next_insert_idx; })) {
+        std::cerr << "final-state GT does not match the saved index state" << std::endl;
+        return 1;
+      }
+    }
+    std::vector<uint8_t> whitening_bytes;
+    if (config.use_whitening) {
+      auto whitening_bytes_res = whitening->Serialize();
+      if (!whitening_bytes_res.ok()) {
+        std::cerr << whitening_bytes_res.status().ToString() << std::endl;
+        return 1;
+      }
+      whitening_bytes = std::move(whitening_bytes_res.value());
+    }
+    auto main_bytes = main_ivf->Serialize();
+    if (!main_bytes.ok()) {
+      std::cerr << main_bytes.status().ToString() << std::endl;
+      return 1;
+    }
+    FinalStateCache cache;
+    cache.metadata.dim = config.dim;
+    cache.metadata.topk = config.topk;
+    cache.metadata.seen_rows = next_insert_idx;
+    cache.metadata.live_rows = next_insert_idx;
+    cache.metadata.main_rows = main_rows_current;
+    cache.metadata.base_identity = cache_base_identity;
+    cache.metadata.query_identity = cache_query_identity;
+    cache.metadata.last_insert_begin = last_insert_begin;
+    cache.metadata.last_insert_end = last_insert_end;
+    cache.metadata.whiten_version = whiten_version;
+    cache.metadata.use_whitening = config.use_whitening ? 1u : 0u;
+    cache.metadata.main_index_version = main_versions.index_version;
+    cache.whitening = std::move(whitening_bytes);
+    cache.main_index = std::move(main_bytes.value());
+    cache.ground_truth = std::move(final_ground_truth);
+    if (config.final_state_cache_store_vectors) {
+      cache.whitened_vectors = X_whitened.topRows(next_insert_idx);
+    }
+    std::vector<DocId> indexed_ids;
+    auto append_indexed_ids = [&](const std::shared_ptr<IVFIndex>& ivf,
+                                  const VersionSet& versions) -> Status {
+      if (!ivf) return Status::OK();
+      auto ids = ivf->SnapshotDocIds(versions);
+      if (!ids.ok()) return ids.status();
+      indexed_ids.insert(indexed_ids.end(), ids.value().begin(), ids.value().end());
+      return Status::OK();
+    };
+    Status save_status = append_indexed_ids(main_ivf, main_versions);
+    if (save_status.ok() && frozen_delta)
+      save_status = append_indexed_ids(frozen_delta->ivf, frozen_delta->versions);
+    if (save_status.ok() && active_delta)
+      save_status = append_indexed_ids(active_delta->ivf, active_delta->versions);
+    std::sort(indexed_ids.begin(), indexed_ids.end());
+    if (!save_status.ok()) { std::cerr << save_status.ToString() << std::endl; return 1; }
+    if (indexed_ids.size() != next_insert_idx ||
+        std::adjacent_find(indexed_ids.begin(), indexed_ids.end()) != indexed_ids.end()) {
+      std::cerr << "final-state index routes do not cover each cached vector exactly once" << std::endl;
+      return 1;
+    }
+    for (uint32_t id = 0; id < next_insert_idx; ++id) {
+      if (indexed_ids[id] != id) {
+        std::cerr << "final-state index IDs do not match cached vector rows" << std::endl;
+        return 1;
+      }
+    }
+    auto save_delta = [&](const std::optional<DeltaShard>& shard,
+                          bool is_active) -> Status {
+      if (!shard.has_value() || shard->rows == 0) return Status::OK();
+      auto bytes = shard->ivf->Serialize();
+      if (!bytes.ok()) return bytes.status();
+      if (is_active) {
+        cache.metadata.has_active = 1;
+        cache.metadata.active_rows = shard->rows;
+        cache.metadata.active_shard_id = shard->shard_id;
+        cache.metadata.active_whiten_version = shard->versions.whiten_version;
+        cache.metadata.active_index_version = shard->versions.index_version;
+        cache.active_index = std::move(bytes.value());
+      } else {
+        cache.metadata.has_frozen = 1;
+        cache.metadata.frozen_rows = shard->rows;
+        cache.metadata.frozen_shard_id = shard->shard_id;
+        cache.metadata.frozen_whiten_version = shard->versions.whiten_version;
+        cache.metadata.frozen_index_version = shard->versions.index_version;
+        cache.frozen_index = std::move(bytes.value());
+      }
+      return Status::OK();
+    };
+    if (save_status.ok()) save_status = save_delta(active_delta, true);
+    if (save_status.ok()) save_status = save_delta(frozen_delta, false);
+    if (save_status.ok()) save_status = SaveFinalStateCache(config.final_state_cache_path, cache);
+    if (!save_status.ok()) {
+      std::cerr << save_status.ToString() << std::endl;
+      return 1;
+    }
+    std::cout << "[FINAL_STATE_CACHE] saved path=" << config.final_state_cache_path
+              << ", seen_rows=" << next_insert_idx << ", gt_queries="
+              << cache.ground_truth.size() << std::endl;
+  }
+
+  if (prepare_final_state_cache) {
+    std::cout << "[FINAL_STATE_CACHE] prepare complete; ANN queries were skipped" << std::endl;
+    return 0;
+  }
   const double online_update_total_ms =
       total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
   final_metrics.update_total_ms = online_update_total_ms;
@@ -3888,7 +4274,7 @@ int main(int argc, char** argv) {
   if (final_metrics.recall_available) {
     std::cout << "Recall@" << config.topk << " = " << final_metrics.recall;
   } else {
-    std::cout << "Recall disabled (enable_dynamic_ground_truth=false)";
+    std::cout << "Recall disabled (ground truth unavailable)";
   }
   std::cout << " (nprobe=" << params.nprobe
             << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
@@ -3935,7 +4321,7 @@ int main(int argc, char** argv) {
   std::cout << "[QUERY ROUTING] main_queries=" << final_metrics.main_route_queries
             << ", frozen_delta_queries=" << final_metrics.frozen_delta_route_queries
             << ", active_delta_queries=" << final_metrics.active_delta_route_queries << std::endl;
-  if (config.enable_miss_diag) {
+  if (ShouldComputeGroundTruth(config) && config.enable_miss_diag) {
     std::cout << "[MISS DIAG] gt_probed_rate=" << final_metrics.gt_probed_rate
               << ", recall_on_probed_gt=" << final_metrics.recall_on_probed_gt
               << ", exact_recall_on_probed_candidates="
@@ -3943,6 +4329,8 @@ int main(int argc, char** argv) {
               << ", miss_not_probed=" << final_metrics.miss_not_probed
               << ", miss_probed_filtered_by_pq=" << final_metrics.miss_probed_filtered_by_pq
               << ", avg_pq_rank_loss=" << final_metrics.avg_pq_rank_loss << std::endl;
+  } else if (!ShouldComputeGroundTruth(config)) {
+    std::cout << "[MISS DIAG] unavailable (ground truth disabled)" << std::endl;
   } else {
     std::cout << "[MISS DIAG] disabled by config(enable_miss_diag=false)" << std::endl;
   }
@@ -3960,11 +4348,38 @@ int main(int argc, char** argv) {
 
   std::string file_name = "online_eval.json";
   std::filesystem::path result_path = results_dir / file_name;
+  const double full_run_wall_ms = full_run_timer.ElapsedMillis();
   std::ofstream ofs(result_path);
   if (!ofs) {
     std::cerr << "Failed to write results to " << result_path << std::endl;
     return 1;
   }
+  auto write_query_recall_curve = [&]() -> Status {
+    if (query_recall_curve.empty()) return Status::OK();
+    const std::filesystem::path curve_path =
+        result_path.parent_path() / "query_recall_curve.json";
+    std::ofstream curve_ofs(curve_path);
+    if (!curve_ofs) return Status::IOError("Failed to write " + curve_path.string());
+    curve_ofs << "{\n  \"nprobe_sweep\": [";
+    for (size_t i = 0; i < query_recall_curve.size(); ++i) {
+      curve_ofs << query_recall_curve[i].first
+                << (i + 1 < query_recall_curve.size() ? ", " : "");
+    }
+    curve_ofs << "],\n  \"points\": [\n";
+    for (size_t i = 0; i < query_recall_curve.size(); ++i) {
+      const auto& point = query_recall_curve[i];
+      curve_ofs << "    {\"nprobe\": " << point.first
+                << ", \"recall\": " << point.second.recall
+                << ", \"avg_query_ms\": " << point.second.avg_query_ms
+                << ", \"p50_query_ms\": " << point.second.search_p50
+                << ", \"p99_query_ms\": " << point.second.search_p99
+                << ", \"qps\": " << point.second.query_qps
+                << ", \"scanned_avg\": " << point.second.scanned_avg << "}"
+                << (i + 1 < query_recall_curve.size() ? "," : "") << "\n";
+    }
+    curve_ofs << "  ]\n}\n";
+    return Status::OK();
+  };
 
 
   std::vector<double> recall_values;
@@ -4056,6 +4471,8 @@ int main(int argc, char** argv) {
     ofs << "    \"topk\": " << config.topk << ",\n";
     ofs << "    \"enable_dynamic_ground_truth\": "
         << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
+    ofs << "    \"skip_query_ground_truth\": "
+        << (config.skip_query_ground_truth ? "true" : "false") << ",\n";
     ofs << "    \"nprobe\": " << params.nprobe << ",\n";
     ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
     ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
@@ -4063,6 +4480,7 @@ int main(int argc, char** argv) {
         << (config.pq_codebook_dimension_major ? "true" : "false") << ",\n";
     ofs << "    \"pq_codes_subquantizer_major\": "
         << (config.pq_codes_subquantizer_major ? "true" : "false") << ",\n";
+    ofs << "    \"use_whitening\": " << (config.use_whitening ? "true" : "false") << ",\n";
     ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
     ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
         << ",\n";
@@ -4073,12 +4491,14 @@ int main(int argc, char** argv) {
     ofs << "    \"merge_score_alpha\": " << config.merge_score_alpha << ",\n";
     ofs << "    \"merge_score_beta\": " << config.merge_score_beta << ",\n";
     ofs << "    \"merge_score_threshold\": " << config.merge_score_threshold << ",\n";
+    ofs << "    \"enable_merge\": " << (config.enable_merge ? "true" : "false") << ",\n";
     ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
     ofs << "  },\n";
     ofs << "  \"metrics\": {\n";
     ofs << "    \"recall_available\": "
         << (final_metrics.recall_available ? "true" : "false") << ",\n";
     ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
+    ofs << "    \"full_run_wall_ms\": " << full_run_wall_ms << ",\n";
     ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
     ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
     ofs << "    \"gt_new_ratio\": " << final_metrics.gt_new_ratio << ",\n";
@@ -4232,7 +4652,7 @@ int main(int argc, char** argv) {
       ofs << "    {\n";
       ofs << "      \"snapshot_size\": " << snap.base_rows << ",\n";
       ofs << "      \"recall_available\": "
-          << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
+          << (ShouldComputeGroundTruth(config) ? "true" : "false") << ",\n";
       ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
       ofs << "      \"recall_new\": " << snap.recall_new << ",\n";
       ofs << "      \"recall_old\": " << snap.recall_old << ",\n";
@@ -4276,6 +4696,11 @@ int main(int argc, char** argv) {
       std::cerr << memory_write_status.ToString() << std::endl;
       return 1;
     }
+    const Status curve_status = write_query_recall_curve();
+    if (!curve_status.ok()) {
+      std::cerr << curve_status.ToString() << std::endl;
+      return 1;
+    }
     std::cout << "Saved metrics to " << result_path << std::endl;
     std::cout << "Saved memory trace to " << memory_trace_path << std::endl;
     return 0;
@@ -4293,8 +4718,8 @@ int main(int argc, char** argv) {
       << (config.pq_codebook_dimension_major ? "true" : "false") << ",\n";
   ofs << "    \"pq_codes_subquantizer_major\": "
       << (config.pq_codes_subquantizer_major ? "true" : "false") << ",\n";
+  ofs << "    \"use_whitening\": " << (config.use_whitening ? "true" : "false") << ",\n";
   ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
-  ofs << "    \"main_query_only\": " << (config.main_query_only ? "true" : "false") << ",\n";
   ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
   ofs << "    \"main_index_rows_initial\": " << main_rows_initial << ",\n";
   ofs << "    \"main_rows_final\": " << main_rows_current << ",\n";
@@ -4307,6 +4732,7 @@ int main(int argc, char** argv) {
   ofs << "    \"merge_score_beta\": " << config.merge_score_beta << ",\n";
   ofs << "    \"merge_score_threshold\": " << config.merge_score_threshold << ",\n";
   ofs << "    \"merge_trigger_mode\": \"" << config.merge_trigger_mode << "\",\n";
+  ofs << "    \"enable_merge\": " << (config.enable_merge ? "true" : "false") << ",\n";
   ofs << "    \"merge_trigger_rows\": " << config.merge_trigger_rows << ",\n";
   ofs << "    \"merge_trigger_rows_resolved\": " << merge_trigger_rows << ",\n";
   ofs << "    \"merge_trigger_qe_ratio\": " << config.merge_trigger_qe_ratio << ",\n";
@@ -4340,6 +4766,8 @@ int main(int argc, char** argv) {
       << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
   ofs << "    \"enable_dynamic_ground_truth\": "
       << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
+  ofs << "    \"skip_query_ground_truth\": "
+      << (config.skip_query_ground_truth ? "true" : "false") << ",\n";
   ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
   ofs << "    \"enable_rerank_source_diag\": "
       << (config.enable_rerank_source_diag ? "true" : "false") << ",\n";
@@ -4389,6 +4817,7 @@ int main(int argc, char** argv) {
   ofs << "    \"avg_pq_lut_build_us\": " << final_metrics.avg_pq_lut_build_us << ",\n";
   ofs << "    \"avg_pq_adc_scan_us\": " << final_metrics.avg_pq_adc_scan_us << ",\n";
   ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
+  ofs << "    \"full_run_wall_ms\": " << full_run_wall_ms << ",\n";
   ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
   ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
   ofs << "    \"gt_new_ratio\": " << final_metrics.gt_new_ratio << ",\n";
@@ -4938,6 +5367,11 @@ int main(int argc, char** argv) {
   Status memory_write_status = write_memory_trace();
   if (!memory_write_status.ok()) {
     std::cerr << memory_write_status.ToString() << std::endl;
+    return 1;
+  }
+  const Status curve_status = write_query_recall_curve();
+  if (!curve_status.ok()) {
+    std::cerr << curve_status.ToString() << std::endl;
     return 1;
   }
   std::cout << "Saved metrics to " << result_path << std::endl;

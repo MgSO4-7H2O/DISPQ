@@ -10,7 +10,7 @@
 namespace ann {
 namespace {
 
-constexpr uint32_t kPrebuiltIndexFormatVersion = 1;
+constexpr uint32_t kPrebuiltIndexFormatVersion = 2;
 constexpr const char* kManifestFileName = "manifest.json";
 constexpr const char* kWhiteningFileName = "whitening.bin";
 constexpr const char* kMainIndexFileName = "main_ivf.bin";
@@ -59,6 +59,15 @@ Result<std::string> ExtractString(const std::string& text, const std::string& ke
   return match[1].str();
 }
 
+Result<bool> ExtractBool(const std::string& text, const std::string& key) {
+  const std::regex pattern("\\\"" + key + "\\\"\\s*:\\s*(true|false)");
+  std::smatch match;
+  if (!std::regex_search(text, match, pattern)) {
+    return Status::InvalidArgument("Missing or invalid manifest bool field: " + key);
+  }
+  return match[1].str() == "true";
+}
+
 }  // namespace
 
 Result<void> SavePrebuiltMainIndex(const std::string& dir,
@@ -97,6 +106,7 @@ Result<void> SavePrebuiltMainIndex(const std::string& dir,
       << "  \"total_rows\": " << artifact.metadata.total_rows << ",\n"
       << "  \"whiten_version\": " << artifact.metadata.whiten_version << ",\n"
       << "  \"index_version\": " << artifact.metadata.index_version << ",\n"
+      << "  \"use_whitening\": " << (artifact.metadata.use_whitening ? "true" : "false") << ",\n"
       << "  \"config_path\": \"" << JsonEscape(artifact.metadata.config_path) << "\",\n"
       << "  \"dataset_path\": \"" << JsonEscape(artifact.metadata.dataset_path) << "\"\n"
       << "}\n";
@@ -121,7 +131,8 @@ Result<PrebuiltMainIndexArtifact> LoadPrebuiltMainIndex(const std::string& dir) 
     return format_version.status();
   }
   artifact.metadata.format_version = format_version.value();
-  if (artifact.metadata.format_version != kPrebuiltIndexFormatVersion) {
+  if (artifact.metadata.format_version != 1 &&
+      artifact.metadata.format_version != kPrebuiltIndexFormatVersion) {
     return Status::InvalidArgument("Unsupported prebuilt index format_version");
   }
 
@@ -137,6 +148,11 @@ Result<PrebuiltMainIndexArtifact> LoadPrebuiltMainIndex(const std::string& dir) 
   if (!total_rows.ok()) return total_rows.status();
   if (!whiten_version.ok()) return whiten_version.status();
   if (!index_version.ok()) return index_version.status();
+  if (artifact.metadata.format_version >= 2) {
+    auto use_whitening = ExtractBool(manifest, "use_whitening");
+    if (!use_whitening.ok()) return use_whitening.status();
+    artifact.metadata.use_whitening = use_whitening.value();
+  }
   if (!config_path.ok()) return config_path.status();
   if (!dataset_path.ok()) return dataset_path.status();
 

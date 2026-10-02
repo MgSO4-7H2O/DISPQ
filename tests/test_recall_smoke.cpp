@@ -43,7 +43,6 @@ int main() {
   params.topk = cfg.topk;
   params.nprobe = cfg.nprobe;
   params.use_whitening = cfg.use_whitening;
-  params.enable_dual_route = cfg.enable_dual_route;
 
   std::vector<std::vector<DocId>> pred;
   for (int i = 0; i < Q.rows(); ++i) {

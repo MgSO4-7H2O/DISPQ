@@ -929,28 +929,22 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
   std::vector<SearchRoute> routes;
   routes.push_back(SearchRoute{main_ivf, main_versions, 0, "main", main_rows});
 
-  if (!config.main_query_only) {
-    if (frozen_delta.has_value() &&
-        frozen_delta->rows > 0 &&
-        frozen_delta->ivf) {
-      routes.push_back(SearchRoute{
-          frozen_delta->ivf,
-          frozen_delta->versions,
-          1,
-          "frozen_delta",
-          frozen_delta->rows});
-    }
+  if (frozen_delta.has_value() && frozen_delta->rows > 0 && frozen_delta->ivf) {
+    routes.push_back(SearchRoute{
+        frozen_delta->ivf,
+        frozen_delta->versions,
+        1,
+        "frozen_delta",
+        frozen_delta->rows});
+  }
 
-    if (active_delta.has_value() &&
-        active_delta->rows > 0 &&
-        active_delta->ivf) {
-      routes.push_back(SearchRoute{
-          active_delta->ivf,
-          active_delta->versions,
-          1,
-          "active_delta",
-          active_delta->rows});
-    }
+  if (active_delta.has_value() && active_delta->rows > 0 && active_delta->ivf) {
+    routes.push_back(SearchRoute{
+        active_delta->ivf,
+        active_delta->versions,
+        1,
+        "active_delta",
+        active_delta->rows});
   }
 
   const uint32_t nq = static_cast<uint32_t>(queries_whitened.rows());
@@ -1177,6 +1171,8 @@ void WriteSummaryJson(const std::string& path,
   ofs << "  \"final_seen_rows\": " << final_seen_rows << ",\n";
   ofs << "  \"topk\": " << config.topk << ",\n";
   ofs << "  \"nprobe\": " << config.nprobe << ",\n";
+  ofs << "  \"use_whitening\": " << (config.use_whitening ? "true" : "false") << ",\n";
+  ofs << "  \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
   ofs << "  \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
   ofs << "  \"final_recall\": " << final_recall << ",\n";
   ofs << "  \"init_ms\": " << init_ms << ",\n";
@@ -1517,7 +1513,6 @@ int main(int argc, char** argv) {
   search_params.topk = config.topk;
   search_params.nprobe = config.nprobe;
   search_params.use_whitening = false;
-  search_params.enable_dual_route = config.enable_dual_route;
 
   OnlinePQUpdateOptions online_opts;
   online_opts.enable =
@@ -1684,7 +1679,7 @@ int main(int argc, char** argv) {
       return Status::InvalidArgument(
           "ensure_whitened_materialized: required rows exceed base rows");
     }
-    if (whiten_version == 0) {
+    if (config.use_whitening && whiten_version == 0) {
       return Status::InvalidArgument(
           "ensure_whitened_materialized: whitening version missing");
     }
@@ -1700,12 +1695,13 @@ int main(int argc, char** argv) {
       const uint32_t count =
           std::min<uint32_t>(kAddBlockRows, required_rows - begin);
       auto block_res =
-          ann::eval_memory::TransformSourceRangeToWhitened(base_source,
-                                                           begin,
-                                                           count,
-                                                           whiten_version,
-                                                           whitening,
-                                                           config.use_cosine);
+          ann::eval_memory::TransformSourceRangeToIndexSpace(base_source,
+                                                             begin,
+                                                             count,
+                                                             config.use_whitening,
+                                                             whiten_version,
+                                                             whitening,
+                                                             config.use_cosine);
       if (!block_res.ok()) {
         return block_res.status();
       }
@@ -2062,51 +2058,60 @@ int main(int argc, char** argv) {
 
     const VersionId old_whiten_version = whiten_version;
 
-    Timer wt;
-    Result<VersionId> new_wv =
-        config.use_cosine
-            ? ann::eval_memory::FitWhiteningFromSourcePrefix(
-                  base_source, rebuild_seen, kAddBlockRows, whitening)
-            : ann::eval_memory::FitWhiteningFromWhitenedPrefix(
-                  Xw, rebuild_seen, old_whiten_version, kAddBlockRows, whitening);
-    if (!new_wv.ok()) return new_wv.status();
-    const double whitening_ms = wt.ElapsedMillis();
-    ++whitening_version_count_estimate;
+    VersionId new_whiten_version = old_whiten_version;
+    double whitening_ms = 0.0;
+    if (config.use_whitening) {
+      Timer wt;
+      auto new_wv =
+          config.use_cosine
+              ? ann::eval_memory::FitWhiteningFromSourcePrefix(
+                    base_source, rebuild_seen, kAddBlockRows, whitening)
+              : ann::eval_memory::FitWhiteningFromWhitenedPrefix(
+                    Xw, rebuild_seen, old_whiten_version, kAddBlockRows, whitening);
+      if (!new_wv.ok()) return new_wv.status();
+      new_whiten_version = new_wv.value();
+      whitening_ms = wt.ElapsedMillis();
+      ++whitening_version_count_estimate;
+    }
     record_memory("global_rebuild_after_fit",
                   rebuild_seen,
-                  config.use_cosine
+                  !config.use_whitening
+                      ? 0
+                      : config.use_cosine
                       ? ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim)
                       : 2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
 
     Timer transform_timer;
     MatrixRM Xw_new;
-    Status retarget_status =
-        config.use_cosine
-            ? ann::eval_memory::TransformSourcePrefixToWhitened(base_source,
-                                                                rebuild_seen,
-                                                                kAddBlockRows,
-                                                                new_wv.value(),
-                                                                whitening,
-                                                                config.use_cosine,
-                                                                &Xw_new)
-            : ann::eval_memory::RetargetWhitenedPrefix(Xw,
-                                                       rebuild_seen,
-                                                       kAddBlockRows,
-                                                       old_whiten_version,
-                                                       new_wv.value(),
-                                                       whitening,
-                                                       config.use_cosine,
-                                                       &Xw_new);
+    Status retarget_status;
+    if (!config.use_whitening || config.use_cosine) {
+      retarget_status = ann::eval_memory::TransformSourcePrefixToIndexSpace(
+          base_source,
+          rebuild_seen,
+          kAddBlockRows,
+          config.use_whitening,
+          new_whiten_version,
+          whitening,
+          config.use_cosine,
+          &Xw_new);
+    } else {
+      retarget_status = ann::eval_memory::RetargetWhitenedPrefix(Xw,
+                                                                 rebuild_seen,
+                                                                 kAddBlockRows,
+                                                                 old_whiten_version,
+                                                                 new_whiten_version,
+                                                                 whitening,
+                                                                 config.use_cosine,
+                                                                 &Xw_new);
+    }
     if (!retarget_status.ok()) return retarget_status;
 
-    auto new_q = whitening->TransformBatch(Q, new_wv.value());
+    auto new_q = ann::eval_memory::TransformBatchToIndexSpace(
+        Q, config.use_whitening, new_whiten_version, whitening, config.use_cosine);
     if (!new_q.ok()) return new_q.status();
 
     MatrixRM Qw_new = new_q.value();
 
-    if (config.use_cosine) {
-      NormalizeRowsL2(&Qw_new);
-    }
 
     const double whitening_transform_ms = transform_timer.ElapsedMillis();
     record_memory("global_rebuild_after_base_retarget",
@@ -2177,7 +2182,7 @@ int main(int argc, char** argv) {
       delta_seed_ms = delta_timer.ElapsedMillis();
     }
 
-    whiten_version = new_wv.value();
+    whiten_version = new_whiten_version;
     Xw = std::move(Xw_new);
     Xw_norms = Xw.rowwise().squaredNorm();
     whitened_rows_materialized = rebuild_seen;
@@ -2237,45 +2242,52 @@ int main(int argc, char** argv) {
               << ", main_rows=" << main_bootstrap_rows
               << std::endl;
 
-    Timer wt;
-    auto wfit = ann::eval_memory::FitWhiteningFromSourcePrefix(
-        base_source, main_bootstrap_rows, kAddBlockRows, whitening);
-    if (!wfit.ok()) return wfit.status();
-
-    whiten_version = wfit.value();
-    whitening_version_count_estimate = 1;
-    const double whitening_ms = wt.ElapsedMillis();
+    double whitening_ms = 0.0;
+    if (config.use_whitening) {
+      Timer wt;
+      auto wfit = ann::eval_memory::FitWhiteningFromSourcePrefix(
+          base_source, main_bootstrap_rows, kAddBlockRows, whitening);
+      if (!wfit.ok()) return wfit.status();
+      whiten_version = wfit.value();
+      whitening_version_count_estimate = 1;
+      whitening_ms = wt.ElapsedMillis();
+    } else {
+      whiten_version = 0;
+      whitening_version_count_estimate = 0;
+    }
     record_memory("bootstrap_after_whitening_fit",
                   seen_rows,
-                  ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
+                  config.use_whitening
+                      ? ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim)
+                      : 0);
 
     Timer transform_timer;
 
-    Status xb_status = ann::eval_memory::TransformSourcePrefixToWhitened(
+    Status xb_status = ann::eval_memory::TransformSourcePrefixToIndexSpace(
         base_source,
         seen_rows,
         kAddBlockRows,
+        config.use_whitening,
         whiten_version,
         whitening,
         config.use_cosine,
         &Xw);
     if (!xb_status.ok()) return xb_status;
 
-    auto qb = whitening->TransformBatch(Q, whiten_version);
+    auto qb = ann::eval_memory::TransformBatchToIndexSpace(
+        Q, config.use_whitening, whiten_version, whitening, config.use_cosine);
     if (!qb.ok()) return qb.status();
 
     Qw = qb.value();
 
-    if (config.use_cosine) {
-      NormalizeRowsL2(&Qw);
-    }
     Xw_norms = Xw.rowwise().squaredNorm();
     whitened_rows_materialized = seen_rows;
 
     const double transform_ms = transform_timer.ElapsedMillis();
     record_memory("bootstrap_after_base_transform",
                   seen_rows,
-                  2ull * ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
+                  (config.use_whitening ? 2ull : 1ull) *
+                      ann::eval_memory::MatrixActiveBytes(kAddBlockRows, config.dim));
 
     std::vector<DocId> main_ids(main_bootstrap_rows);
     std::iota(main_ids.begin(), main_ids.end(), 0);

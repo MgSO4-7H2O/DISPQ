@@ -16,6 +16,7 @@ struct PrebuiltMainIndexMetadata {
   uint32_t total_rows{0};
   VersionId whiten_version{0};
   VersionId index_version{0};
+  bool use_whitening{true};
   std::string config_path;
   std::string dataset_path;
 };

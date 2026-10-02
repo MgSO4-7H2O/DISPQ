@@ -224,32 +224,42 @@ int main(int argc, char** argv) {
 
   Timer total_timer;
   auto whitening = CreateWhiteningModel();
-  Timer fit_timer;
-  auto whiten_version_res = whitening->Fit(X.topRows(main_rows));
-  if (!whiten_version_res.ok()) {
-    std::cerr << whiten_version_res.status().ToString() << std::endl;
-    return 1;
+  VersionId whiten_version = 0;
+  double whitening_ms = 0.0;
+  if (config.use_whitening) {
+    Timer fit_timer;
+    auto whiten_version_res = whitening->Fit(X.topRows(main_rows));
+    if (!whiten_version_res.ok()) {
+      std::cerr << whiten_version_res.status().ToString() << std::endl;
+      return 1;
+    }
+    whiten_version = whiten_version_res.value();
+    whitening_ms = fit_timer.ElapsedMillis();
   }
-  const VersionId whiten_version = whiten_version_res.value();
-  const double whitening_ms = fit_timer.ElapsedMillis();
 
-  Timer transform_timer;
-  auto xw_res = whitening->TransformBatch(X.topRows(main_rows), whiten_version);
-  if (!xw_res.ok()) {
-    std::cerr << xw_res.status().ToString() << std::endl;
-    return 1;
+  MatrixRM X_index_space;
+  double whitening_transform_ms = 0.0;
+  if (config.use_whitening) {
+    Timer transform_timer;
+    auto xw_res = whitening->TransformBatch(X.topRows(main_rows), whiten_version);
+    if (!xw_res.ok()) {
+      std::cerr << xw_res.status().ToString() << std::endl;
+      return 1;
+    }
+    X_index_space = std::move(xw_res.value());
+    whitening_transform_ms = transform_timer.ElapsedMillis();
+  } else {
+    X_index_space = X.topRows(main_rows);
   }
-  MatrixRM X_whitened = std::move(xw_res.value());
   if (config.use_cosine) {
-    NormalizeRowsL2(&X_whitened);
+    NormalizeRowsL2(&X_index_space);
   }
-  const double whitening_transform_ms = transform_timer.ElapsedMillis();
 
   std::vector<DocId> main_ids(static_cast<size_t>(main_rows));
   std::iota(main_ids.begin(), main_ids.end(), 0);
   auto main_ivf = CreateIVFIndex();
   Timer build_timer;
-  auto main_version_res = main_ivf->Build(X_whitened.topRows(main_rows),
+  auto main_version_res = main_ivf->Build(X_index_space.topRows(main_rows),
                                           main_ids,
                                           ivf_params,
                                           0);
@@ -262,7 +272,7 @@ int main(int argc, char** argv) {
 
   Timer add_timer;
   const Status add_status = AddRangeToIndex(main_ivf,
-                                            X_whitened,
+                                            X_index_space,
                                             0,
                                             main_rows,
                                             config.dim,
@@ -273,10 +283,14 @@ int main(int argc, char** argv) {
   }
   const double main_add_ms = add_timer.ElapsedMillis();
 
-  auto whitening_bytes_res = whitening->Serialize();
-  if (!whitening_bytes_res.ok()) {
-    std::cerr << whitening_bytes_res.status().ToString() << std::endl;
-    return 1;
+  std::vector<uint8_t> whitening_bytes;
+  if (config.use_whitening) {
+    auto whitening_bytes_res = whitening->Serialize();
+    if (!whitening_bytes_res.ok()) {
+      std::cerr << whitening_bytes_res.status().ToString() << std::endl;
+      return 1;
+    }
+    whitening_bytes = std::move(whitening_bytes_res.value());
   }
   auto index_bytes_res = main_ivf->Serialize();
   if (!index_bytes_res.ok()) {
@@ -290,9 +304,10 @@ int main(int argc, char** argv) {
   artifact.metadata.total_rows = nx;
   artifact.metadata.whiten_version = whiten_version;
   artifact.metadata.index_version = main_index_version;
+  artifact.metadata.use_whitening = config.use_whitening;
   artifact.metadata.config_path = config_path;
   artifact.metadata.dataset_path = base_dataset_path.value_or("synthetic");
-  artifact.whitening_bytes = std::move(whitening_bytes_res.value());
+  artifact.whitening_bytes = std::move(whitening_bytes);
   artifact.index_bytes = std::move(index_bytes_res.value());
 
   Timer save_timer;

@@ -1,8 +1,12 @@
 #include "common/config.h"
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
+#include <vector>
 
 namespace ann {
 
@@ -16,6 +20,25 @@ bool ExtractUint(const std::string& text, const std::string& key, uint32_t* out)
     return true;
   }
   return false;
+}
+
+bool ExtractUintArray(const std::string& text,
+                      const std::string& key,
+                      std::vector<uint32_t>* out) {
+  std::regex re("\\\"" + key + "\\\"\\s*:\\s*\\[([^\\]]*)\\]");
+  std::smatch match;
+  if (!std::regex_search(text, match, re)) return false;
+  out->clear();
+  const std::string body = match[1];
+  std::regex number("[0-9]+");
+  for (std::sregex_iterator it(body.begin(), body.end(), number), end; it != end; ++it) {
+    const unsigned long long value = std::stoull((*it)[0]);
+    if (value > std::numeric_limits<uint32_t>::max()) {
+      throw std::out_of_range("nprobe_sweep value exceeds uint32_t");
+    }
+    out->push_back(static_cast<uint32_t>(value));
+  }
+  return true;
 }
 
 bool ExtractBool(const std::string& text, const std::string& key, bool* out) {
@@ -57,10 +80,12 @@ std::string Config::ToString() const {
       << "ivf_nlist=" << ivf_nlist << ", "
       << "topk=" << topk << ", "
       << "nprobe=" << nprobe << ", "
+      << "nprobe_sweep_size=" << nprobe_sweep.size() << ", "
+      << "final_state_cache_mode=" << final_state_cache_mode << ", "
+      << "final_state_cache_store_vectors=" << std::boolalpha
+      << final_state_cache_store_vectors << ", "
       << "use_whitening=" << std::boolalpha << use_whitening << ", "
       << "use_cosine=" << std::boolalpha << use_cosine << ", "
-      << "enable_dual_route=" << std::boolalpha << enable_dual_route << ", "
-      << "main_query_only=" << std::boolalpha << main_query_only << ", "
       << "dim=" << dim << ", "
       << "seed=" << seed << ", "
       << "pq_enable=" << std::boolalpha << pq_enable << ", "
@@ -73,6 +98,7 @@ std::string Config::ToString() const {
       << "snapshot_interval=" << snapshot_interval << ", "
       << "enable_dynamic_ground_truth=" << std::boolalpha << enable_dynamic_ground_truth
       << ", "
+      << "skip_query_ground_truth=" << std::boolalpha << skip_query_ground_truth << ", "
       << "enable_miss_diag=" << std::boolalpha << enable_miss_diag << ", "
       << "enable_rerank_source_diag=" << std::boolalpha << enable_rerank_source_diag << ", "
       << "enable_latency_debug=" << std::boolalpha << enable_latency_debug << ", "
@@ -94,6 +120,7 @@ std::string Config::ToString() const {
       << "merge_trigger_drift=" << merge_trigger_drift << ", "
       << "merge_trigger_delta_main_ratio=" << merge_trigger_delta_main_ratio << ", "
       << "merge_trigger_imbalance_ratio=" << merge_trigger_imbalance_ratio << ", "
+      << "enable_merge=" << std::boolalpha << enable_merge << ", "
       << "merge_assignment_mode=" << merge_assignment_mode << ", "
       << "merge_assignment_top_r=" << merge_assignment_top_r << ", "
       << "merge_assignment_gamma=" << merge_assignment_gamma << ", "
@@ -140,12 +167,14 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "ivf_nlist", &cfg.ivf_nlist);
   ExtractUint(text, "topk", &cfg.topk);
   ExtractUint(text, "nprobe", &cfg.nprobe);
+  ExtractUintArray(text, "nprobe_sweep", &cfg.nprobe_sweep);
+  ExtractString(text, "final_state_cache_mode", &cfg.final_state_cache_mode);
+  ExtractString(text, "final_state_cache_path", &cfg.final_state_cache_path);
+  ExtractBool(text, "final_state_cache_store_vectors", &cfg.final_state_cache_store_vectors);
   ExtractUint(text, "dim", &cfg.dim);
   ExtractUint(text, "seed", &cfg.seed);
   ExtractBool(text, "use_whitening", &cfg.use_whitening);
   ExtractBool(text, "use_cosine", &cfg.use_cosine);
-  ExtractBool(text, "enable_dual_route", &cfg.enable_dual_route);
-  ExtractBool(text, "main_query_only", &cfg.main_query_only);
   ExtractBool(text, "pq_enable", &cfg.pq_enable);
   ExtractUint(text, "pq_m", &cfg.pq_m);
   ExtractUint(text, "pq_nbits", &cfg.pq_nbits);
@@ -155,6 +184,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "max_queries", &cfg.max_queries);
   ExtractUint(text, "snapshot_interval", &cfg.snapshot_interval);
   ExtractBool(text, "enable_dynamic_ground_truth", &cfg.enable_dynamic_ground_truth);
+  ExtractBool(text, "skip_query_ground_truth", &cfg.skip_query_ground_truth);
   ExtractBool(text, "enable_miss_diag", &cfg.enable_miss_diag);
   ExtractBool(text, "enable_rerank_source_diag", &cfg.enable_rerank_source_diag);
   ExtractBool(text, "enable_latency_debug", &cfg.enable_latency_debug);
@@ -178,6 +208,7 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractDouble(text, "merge_trigger_drift", &cfg.merge_trigger_drift);
   ExtractDouble(text, "merge_trigger_delta_main_ratio", &cfg.merge_trigger_delta_main_ratio);
   ExtractDouble(text, "merge_trigger_imbalance_ratio", &cfg.merge_trigger_imbalance_ratio);
+  ExtractBool(text, "enable_merge", &cfg.enable_merge);
   ExtractString(text, "merge_assignment_mode", &cfg.merge_assignment_mode);
   ExtractUint(text, "merge_assignment_top_r", &cfg.merge_assignment_top_r);
   ExtractDouble(text, "merge_assignment_gamma", &cfg.merge_assignment_gamma);
@@ -359,6 +390,23 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
     return Status::InvalidArgument("online_pq_lambda must be in (0,1]");
   }
 
+  if (std::any_of(cfg.nprobe_sweep.begin(), cfg.nprobe_sweep.end(),
+                  [](uint32_t value) { return value == 0; })) {
+    return Status::InvalidArgument("nprobe_sweep values must be positive");
+  }
+  if (cfg.final_state_cache_mode != "off" && cfg.final_state_cache_mode != "save" &&
+      cfg.final_state_cache_mode != "load" && cfg.final_state_cache_mode != "prepare") {
+    return Status::InvalidArgument("final_state_cache_mode must be off, save, load, or prepare");
+  }
+  if (cfg.final_state_cache_mode != "off" && cfg.final_state_cache_path.empty()) {
+    return Status::InvalidArgument("final_state_cache_path is required when cache mode is enabled");
+  }
+  if (cfg.final_state_cache_mode == "load" && cfg.nprobe_sweep.empty()) {
+    return Status::InvalidArgument("final-state cache load requires non-empty nprobe_sweep");
+  }
+  if (cfg.final_state_cache_mode == "prepare" && !cfg.nprobe_sweep.empty()) {
+    return Status::InvalidArgument("final-state cache prepare cannot be combined with nprobe_sweep");
+  }
   return cfg;
 }
 
