@@ -36,13 +36,17 @@
 #include "common/timer.h"
 #include "common/types.h"
 #include "eval_memory.h"
+#include "eval/eval_counter.h"
+#include "eval/eval_output.h"
 #include "eval/metrics.h"
+#include "eval/eval_type.h"
 #include "index/ivf.h"
 #include "index/merge.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
 
 using namespace ann;
+using namespace ann::eval::run_eval;
 
 namespace {
 
@@ -83,14 +87,6 @@ void EnsureWhitenedCapacity(MatrixRM* matrix,
                              static_cast<Eigen::Index>(dim));
 }
 
-struct DistributionStats {
-  double avg{0.0};
-  double p50{0.0};
-  double p90{0.0};
-  double p99{0.0};
-  double max{0.0};
-};
-
 double Percentile(std::vector<double> values, double q) {
   if (values.empty()) {
     return 0.0;
@@ -120,16 +116,6 @@ DistributionStats SummarizeDistribution(const std::vector<double>& values) {
   return stats;
 }
 
-struct SeriesStats {
-  double avg{0.0};
-  double p5{0.0};
-  double p50{0.0};
-  double p95{0.0};
-  double p99{0.0};
-  double min{0.0};
-  double max{0.0};
-};
-
 SeriesStats SummarizeSeries(const std::vector<double>& values) {
   SeriesStats stats;
   if (values.empty()) {
@@ -144,25 +130,6 @@ SeriesStats SummarizeSeries(const std::vector<double>& values) {
   stats.min = *std::min_element(values.begin(), values.end());
   stats.max = *std::max_element(values.begin(), values.end());
   return stats;
-}
-
-uint64_t ReadProcStatusBytes(const std::string& key) {
-  std::ifstream ifs("/proc/self/status");
-  if (!ifs) {
-    return 0;
-  }
-  std::string line;
-  while (std::getline(ifs, line)) {
-    if (line.rfind(key, 0) != 0) {
-      continue;
-    }
-    std::istringstream iss(line.substr(key.size()));
-    uint64_t kb = 0;
-    std::string unit;
-    iss >> kb >> unit;
-    return kb * 1024ull;
-  }
-  return 0;
 }
 
 uint32_t RuntimeMaxThreads() {
@@ -201,39 +168,6 @@ float SquaredL2FromNormDot(float a_norm, float b_norm, float dot) {
   const float dist = a_norm + b_norm - 2.0f * dot;
   return dist >= 0.0f ? dist : 0.0f;
 }
-
-struct RouteDebugStats {
-  std::string route_name;
-  uint8_t from_new{0};
-  DistributionStats search_ms;
-  DistributionStats scanned_candidates;
-};
-
-struct SlowQueryDebug {
-  uint32_t query_id{0};
-  double total_search_ms{0.0};
-  double merge_ms{0.0};
-  double max_route_search_ms{0.0};
-  double merged_scanned{0.0};
-  std::vector<double> route_search_ms;
-  std::vector<double> route_scanned_candidates;
-};
-
-struct LatencyDebugMetrics {
-  uint32_t route_count{0};
-  DistributionStats merge_ms;
-  DistributionStats max_route_search_ms;
-  std::vector<RouteDebugStats> routes;
-  std::vector<SlowQueryDebug> slow_queries;
-};
-
-struct IndexPartitionDebug {
-  std::string route_name;
-  uint32_t nlist{0};
-  uint32_t non_empty_lists{0};
-  uint64_t total_docs{0};
-  DistributionStats list_size;
-};
 
 Result<IndexPartitionDebug> BuildPartitionDebug(const std::string& route_name,
                                                 const std::shared_ptr<IVFIndex>& ivf,
@@ -328,15 +262,6 @@ uint32_t ResolveDeltaTrainRows(const Config& config,
                                       : static_cast<uint32_t>(requested_rows_u64);
   return std::min<uint32_t>(available_stream_rows, requested_rows);
 }
-
-struct RuntimeOptions {
-  std::string config_path{"configs/sift/sift.json"};
-  std::optional<std::string> dataset_spec;
-  std::optional<std::string> query_spec;
-  std::optional<std::string> prebuilt_index_dir;
-  bool use_default_prebuilt_index{false};
-  bool fresh_index{false};
-};
 
 std::string SanitizePathPart(const std::string& value) {
   std::string out;
@@ -452,77 +377,6 @@ double ComputeNonEmptyListImbalance(const std::vector<uint32_t>& sizes,
   return static_cast<double>(max_list) / std::max(1.0, avg_non_empty);
 }
 
-struct DeltaShard {
-  std::shared_ptr<IVFIndex> ivf;
-  VersionSet versions{};
-  uint32_t rows{0};
-  uint32_t shard_id{0};
-};
-
-struct EvalMetrics {
-  bool recall_available{false};
-  double recall{0.0};
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-  double whitening_p50{0.0};
-  double whitening_p99{0.0};
-  double avg_whiten_ms{0.0};
-  double avg_search_ms{0.0};
-  double avg_pq_lut_build_us{0.0};
-  double avg_pq_adc_scan_us{0.0};
-  double search_p50{0.0};
-  double search_p99{0.0};
-  double total_p50{0.0};
-  double total_p99{0.0};
-  double avg_query_ms{0.0};
-  double end_to_end_overhead_ms{0.0};
-  double query_qps{0.0};
-  double rebuild_ms{0.0};
-  double scanned_avg{0.0};
-  double scanned_p50{0.0};
-  double scanned_p99{0.0};
-  double scanned_max{0.0};
-  double update_total_ms{0.0};
-  double update_per_vector_ms{0.0};
-  double update_throughput_vecps{0.0};
-  double query_eval_ms{0.0};
-  uint32_t query_count{0};
-  double gt_probed_rate{0.0};
-  double recall_on_probed_gt{0.0};
-  double exact_recall_on_probed_candidates{0.0};
-  double avg_pq_rank_loss{0.0};
-  uint32_t miss_not_probed{0};
-  uint32_t miss_probed_filtered_by_pq{0};
-  uint32_t pq_rank_loss_count{0};
-  uint64_t rerank_topk_main_total{0};
-  uint64_t rerank_topk_delta_total{0};
-  double rerank_topk_main_ratio{0.0};
-  double rerank_topk_delta_ratio{0.0};
-  double rerank_topk_main_avg{0.0};
-  double rerank_topk_delta_avg{0.0};
-  uint32_t main_route_queries{0};
-  uint32_t active_delta_route_queries{0};
-  uint32_t frozen_delta_route_queries{0};
-  std::vector<std::string> worst_queries;
-  std::optional<LatencyDebugMetrics> latency_debug;
-};
-
-
-struct RecallAgeMetrics {
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-};
-
 RecallAgeMetrics ComputeRecallByRecentInsert(const std::vector<std::vector<DocId>>& gt,
                                              const std::vector<std::vector<DocId>>& pred,
                                              uint32_t new_begin,
@@ -571,225 +425,6 @@ RecallAgeMetrics ComputeRecallByRecentInsert(const std::vector<std::vector<DocId
   return out;
 }
 
-struct MinibatchRecord {
-  uint32_t batch_id{0};
-  uint32_t base_rows{0};
-  uint32_t stream_rows_total{0};
-  uint32_t batch_rows{0};
-  uint32_t snapshot_rows_total{0};
-  double recall{0.0};
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-  double latency_ms{0.0};
-  double end_to_end_overhead_ms{0.0};
-  double avg_search_ms{0.0};
-  double avg_scanned{0.0};
-  double query_qps{0.0};
-  double update_ms{0.0};
-  double update_whitening_ms{0.0};
-  double update_insert_ms{0.0};
-  double update_record_build_ms{0.0};
-  double update_insert_encode_ms{0.0};
-  double update_insert_commit_ms{0.0};
-  double update_onlinepq_maintenance_ms{0.0};
-  double update_delete_ms{0.0};
-  double update_codebook_update_ms{0.0};
-  double update_reencode_ms{0.0};
-  double update_throughput_vecps{0.0};
-  double query_eval_ms{0.0};
-  double nqe_batch{0.0};
-  double qe_ratio{1.0};
-  double codebook_drift{0.0};
-  bool pq_updated{false};
-  bool in_warmup{false};
-  uint32_t warmup_batches_left{0};
-  double gt_probed_rate{0.0};
-  double recall_on_probed_gt{0.0};
-  double exact_recall_on_probed_candidates{0.0};
-  double avg_pq_rank_loss{0.0};
-  uint32_t miss_not_probed{0};
-  uint32_t miss_probed_filtered_by_pq{0};
-  uint32_t pq_rank_loss_count{0};
-};
-
-struct SnapshotRecord {
-  uint32_t base_rows{0};
-  uint32_t main_rows{0};
-  uint32_t frozen_delta_docs{0};
-  uint32_t delta_rows{0};
-  uint32_t active_delta_docs{0};
-  uint32_t snapshot_rows{0};
-  double recall{0.0};
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-  double latency_ms{0.0};
-  double end_to_end_overhead_ms{0.0};
-  double avg_search_ms{0.0};
-  double avg_scanned{0.0};
-  double query_qps{0.0};
-  double update_ms{0.0};
-  double update_whitening_ms{0.0};
-  double update_insert_ms{0.0};
-  double update_record_build_ms{0.0};
-  double update_insert_encode_ms{0.0};
-  double update_insert_commit_ms{0.0};
-  double update_onlinepq_maintenance_ms{0.0};
-  double update_delete_ms{0.0};
-  double update_codebook_update_ms{0.0};
-  double update_reencode_ms{0.0};
-  double query_eval_ms{0.0};
-  double merge_compute_ms{0.0};
-  double global_rebuild_ms{0.0};
-  double snapshot_total_ms{0.0};
-  double update_throughput_vecps{0.0};
-  double amortized_update_throughput_vecps{0.0};
-  double nqe_batch{0.0};
-  double qe_ratio{1.0};
-  double codebook_drift{0.0};
-  bool pq_updated{false};
-  bool in_warmup{false};
-  uint32_t warmup_batches_left{0};
-  double gt_probed_rate{0.0};
-  double recall_on_probed_gt{0.0};
-  double exact_recall_on_probed_candidates{0.0};
-  double avg_pq_rank_loss{0.0};
-  uint32_t miss_not_probed{0};
-  uint32_t miss_probed_filtered_by_pq{0};
-  uint32_t pq_rank_loss_count{0};
-  uint64_t rerank_topk_main_total{0};
-  uint64_t rerank_topk_delta_total{0};
-  double rerank_topk_main_ratio{0.0};
-  double rerank_topk_delta_ratio{0.0};
-  double rerank_topk_main_avg{0.0};
-  double rerank_topk_delta_avg{0.0};
-  std::vector<std::string> worst_queries;
-  std::vector<MinibatchRecord> minibatches;
-  bool active_window_ready{false};
-  bool will_commit_merge{false};
-  std::optional<LatencyDebugMetrics> latency_debug;
-  std::vector<IndexPartitionDebug> partition_debug;
-};
-
-struct MergeEventRecord {
-  uint32_t base_rows{0};
-  uint32_t frozen_rows{0};
-  uint32_t patched_partitions{0};
-  uint32_t append_partitions{0};
-  uint32_t recluster_partitions{0};
-  double moved_delta_ratio{0.0};
-  double avg_assignment_dist_ratio{1.0};
-  double max_assignment_dist_ratio{1.0};
-  double imbalance_before{0.0};
-  double imbalance_after{0.0};
-  uint32_t main_non_empty_lists_after{0};
-  uint32_t main_max_list_after{0};
-  double main_avg_non_empty_list_after{0.0};
-  double main_imbalance_after_real{0.0};
-  std::string trigger_mode;
-  std::string trigger_reason;
-  bool trigger_rows{false};
-  bool trigger_structure{false};
-  bool trigger_qe_ratio{false};
-  bool trigger_drift{false};
-  bool trigger_delta_main_ratio{false};
-  bool trigger_imbalance{false};
-  double trigger_qe_ratio_value{0.0};
-  double trigger_drift_value{0.0};
-  double trigger_delta_main_ratio_value{0.0};
-  double trigger_imbalance_value{0.0};
-  uint32_t trigger_active_rows{0};
-  uint32_t trigger_active_nlist{0};
-  uint32_t trigger_active_non_empty_lists{0};
-  uint32_t trigger_active_max_list{0};
-  double trigger_active_avg_non_empty_list{0.0};
-  double merge_compute_ms{0.0};
-  double merge_ms{0.0};
-  double codebook_rebuild_ms{0.0};
-  MergeProfiling profiling;
-};
-
-struct MergeTriggerDecision {
-  bool rows_trigger{false};
-  bool qe_ratio_trigger{false};
-  bool drift_trigger{false};
-  bool delta_main_ratio_trigger{false};
-  bool imbalance_trigger{false};
-  bool structure_trigger{false};
-  bool should_trigger{false};
-  uint32_t active_rows{0};
-  uint32_t active_nlist{0};
-  uint32_t active_non_empty_lists{0};
-  uint32_t active_max_list_size{0};
-  double active_avg_non_empty_list_size{0.0};
-  double qe_ratio_value{0.0};
-  double drift_value{0.0};
-  double delta_main_ratio_value{0.0};
-  double imbalance_value{0.0};
-  std::string mode;
-  std::string reason;
-};
-
-struct GlobalRebuildDecision {
-  bool should_trigger{false};
-  bool main_rows_trigger{false};
-  bool imbalance_trigger{false};
-  uint32_t seen_rows{0};
-  uint32_t main_rows_current{0};
-  uint32_t main_rows_since_last_rebuild{0};
-  uint32_t main_nlist{0};
-  uint32_t main_non_empty_lists{0};
-  uint32_t main_max_list_size{0};
-  double main_avg_non_empty_list_size{0.0};
-  double main_imbalance_ratio{0.0};
-  std::string reason;
-};
-
-struct GlobalRebuildEventRecord {
-  uint32_t base_rows{0};
-  uint32_t old_main_rows{0};
-  uint32_t new_main_rows{0};
-  uint32_t active_seed_rows{0};
-  uint32_t rebuild_count{0};
-  uint32_t max_count{0};
-  uint32_t main_nlist{0};
-  uint32_t main_non_empty_lists{0};
-  uint32_t main_max_list_size{0};
-  double main_avg_non_empty_list_size{0.0};
-  bool trigger_main_rows{false};
-  bool trigger_imbalance{false};
-  uint32_t trigger_main_rows_since_last_rebuild{0};
-  uint32_t trigger_main_rows_threshold{0};
-  double trigger_imbalance_threshold{0.0};
-  double threshold{0.0};
-  double main_imbalance_ratio{0.0};
-  double whitening_ms{0.0};
-  double whitening_transform_ms{0.0};
-  double main_build_ms{0.0};
-  double main_add_ms{0.0};
-  double delta_seed_ms{0.0};
-  double total_ms{0.0};
-  double wall_total_ms{0.0};
-  std::string reason;
-};
-
-struct SearchRoute {
-  std::shared_ptr<IVFIndex> ivf;
-  VersionSet versions{};
-  uint8_t from_new{0};
-  std::string name;
-  uint32_t rows{0};
-};
-
 uint32_t ResolveRouteExactRerankCandidates(const Config& config, const SearchRoute& route) {
   uint32_t candidates = config.exact_rerank_candidates_per_route;
   if (route.name == "main" && config.main_exact_rerank_candidates > 0) {
@@ -801,23 +436,6 @@ uint32_t ResolveRouteExactRerankCandidates(const Config& config, const SearchRou
   }
   return std::max<uint32_t>(1u, candidates);
 }
-
-struct OnlinePQRollup {
-  uint32_t batches{0};
-  uint32_t warmup_batches{0};
-  uint32_t triggered{0};
-  uint32_t updated{0};
-  uint32_t reencoded{0};
-  uint32_t updated_subspaces{0};
-  uint32_t updated_codewords{0};
-  double sum_nqe_batch{0.0};
-  double sum_qe_ratio{0.0};
-  double sum_codebook_drift{0.0};
-  double last_nqe_batch{0.0};
-  double last_qe_ratio{1.0};
-  double last_codebook_drift{0.0};
-  uint32_t last_warmup_batches_left{0};
-};
 
 Status AddRangeToIndex(const std::shared_ptr<IVFIndex>& ivf,
                        const MatrixRM& x_whitened,
@@ -1010,11 +628,6 @@ Result<DeltaShard> BuildDeltaShard(Eigen::Ref<const MatrixRM> train_data,
   shard.shard_id = shard_id;
   return shard;
 }
-
-struct ExactDocCandidate {
-  float dist{0.0f};
-  DocId doc_id{0};
-};
 
 bool ExactDocBetter(const ExactDocCandidate& a, const ExactDocCandidate& b) {
   if (a.dist != b.dist) {
@@ -2517,8 +2130,13 @@ int main(int argc, char** argv) {
     record_memory("after_initial_delta_seed", stream_start_idx);
   }
 
-  double total_delta_ingest_assignment_us = 0.0;
-  uint64_t total_delta_ingest_assignment_records = 0;
+  ann::eval::RunEvalCounters counters(init_rebuild_ms);
+  const auto& counter_values = counters.Values();
+  const auto& rebuild_ms_total = counter_values.rebuild_ms_total;
+  const auto& total_delta_ingest_assignment_us =
+      counter_values.total_delta_ingest_assignment_us;
+  const auto& total_delta_ingest_assignment_records =
+      counter_values.total_delta_ingest_assignment_records;
 
   auto ActivatePendingDeltaFromSubsequentWindow = [&](uint32_t end_row) -> Result<double> {
     if (!pending_active_train || active_delta.has_value()) {
@@ -2562,8 +2180,8 @@ int main(int argc, char** argv) {
     if (!add_delta_seed.ok()) {
       return add_delta_seed;
     }
-    total_delta_ingest_assignment_us += delta_seed_profile.assignment_us;
-    total_delta_ingest_assignment_records += delta_seed_profile.records;
+    counters.AddDeltaIngestAssignment(delta_seed_profile.assignment_us,
+                                      delta_seed_profile.records);
     std::cout << "[STREAM_PROFILE] phase=delta_activation"
               << ", begin=" << train_begin
               << ", end=" << (train_begin + train_rows)
@@ -2625,31 +2243,33 @@ int main(int argc, char** argv) {
               << pending_active_train_begin << std::endl;
     return Status::OK();
   };
-  double rebuild_ms_total = init_rebuild_ms;
-  double total_update_ms = 0.0;
-  double total_update_whitening_ms = 0.0;
-  double total_update_insert_ms = 0.0;
-  double total_update_record_build_ms = 0.0;
-  double total_update_insert_encode_ms = 0.0;
-  double total_update_insert_commit_ms = 0.0;
-  double total_update_onlinepq_maintenance_ms = 0.0;
-  double total_update_delete_ms = 0.0;
-  double total_update_codebook_update_ms = 0.0;
-  double total_update_reencode_ms = 0.0;
-  double pending_update_ms = 0.0;
-  double pending_update_whitening_ms = 0.0;
-  double pending_update_insert_ms = 0.0;
-  double pending_update_record_build_ms = 0.0;
-  double pending_update_insert_encode_ms = 0.0;
-  double pending_update_insert_commit_ms = 0.0;
-  double pending_update_onlinepq_maintenance_ms = 0.0;
-  double pending_update_delete_ms = 0.0;
-  double pending_update_codebook_update_ms = 0.0;
-  double pending_update_reencode_ms = 0.0;
-  double total_merge_compute_ms = 0.0;
-  double pending_merge_compute_ms = 0.0;
-  double total_global_rebuild_ms = 0.0;
-  double pending_global_rebuild_ms = 0.0;
+  const auto& total_update_ms = counter_values.total_update_ms;
+  const auto& total_update_whitening_ms = counter_values.total_update_whitening_ms;
+  const auto& total_update_insert_ms = counter_values.total_update_insert_ms;
+  const auto& total_update_record_build_ms = counter_values.total_update_record_build_ms;
+  const auto& total_update_insert_encode_ms = counter_values.total_update_insert_encode_ms;
+  const auto& total_update_insert_commit_ms = counter_values.total_update_insert_commit_ms;
+  const auto& total_update_onlinepq_maintenance_ms =
+      counter_values.total_update_onlinepq_maintenance_ms;
+  const auto& total_update_delete_ms = counter_values.total_update_delete_ms;
+  const auto& total_update_codebook_update_ms = counter_values.total_update_codebook_update_ms;
+  const auto& total_update_reencode_ms = counter_values.total_update_reencode_ms;
+  const auto& pending_update_ms = counter_values.pending_update_ms;
+  const auto& pending_update_whitening_ms = counter_values.pending_update_whitening_ms;
+  const auto& pending_update_insert_ms = counter_values.pending_update_insert_ms;
+  const auto& pending_update_record_build_ms = counter_values.pending_update_record_build_ms;
+  const auto& pending_update_insert_encode_ms = counter_values.pending_update_insert_encode_ms;
+  const auto& pending_update_insert_commit_ms = counter_values.pending_update_insert_commit_ms;
+  const auto& pending_update_onlinepq_maintenance_ms =
+      counter_values.pending_update_onlinepq_maintenance_ms;
+  const auto& pending_update_delete_ms = counter_values.pending_update_delete_ms;
+  const auto& pending_update_codebook_update_ms =
+      counter_values.pending_update_codebook_update_ms;
+  const auto& pending_update_reencode_ms = counter_values.pending_update_reencode_ms;
+  const auto& total_merge_compute_ms = counter_values.total_merge_compute_ms;
+  const auto& pending_merge_compute_ms = counter_values.pending_merge_compute_ms;
+  const auto& total_global_rebuild_ms = counter_values.total_global_rebuild_ms;
+  const auto& pending_global_rebuild_ms = counter_values.pending_global_rebuild_ms;
 
   OnlinePQUpdateOptions online_pq_options;
   online_pq_options.enable = config.online_pq_enable && config.pq_enable && config.pq_residual;
@@ -2688,10 +2308,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  OnlinePQRollup online_pq_rollup;
+  const auto& online_pq_rollup = counter_values.online_pq_rollup;
   OnlinePQUpdateStats last_online_pq_stats;
   std::vector<GlobalRebuildEventRecord> global_rebuild_events;
-  uint32_t global_rebuild_count = 0;
+  const auto& global_rebuild_count = counter_values.global_rebuild_count;
   uint32_t last_global_rebuild_rows = 0;
   uint32_t last_global_rebuild_main_rows = main_rows_current;
   auto EvaluateMergeTriggerDecision =
@@ -3112,10 +2732,7 @@ int main(int argc, char** argv) {
         publication_ms + malloc_trim_ms;
     const double unaccounted_ms = wall_total_ms - accounted_stage_sum_ms;
     const double total_ms = whitening_ms + whitening_transform_ms + main_build_ms + main_add_ms;
-    rebuild_ms_total += total_ms;
-    total_global_rebuild_ms += total_ms;
-    pending_global_rebuild_ms += total_ms;
-    global_rebuild_count++;
+    counters.AddGlobalRebuild(total_ms);
     last_global_rebuild_rows = seen_rows;
     last_global_rebuild_main_rows = main_rows_current;
 
@@ -3147,82 +2764,26 @@ int main(int argc, char** argv) {
     event.reason = trigger.reason;
     global_rebuild_events.push_back(event);
 
-    std::cout << "[GLOBAL_REBUILD_BUILD_PROFILE]"
-              << " build_coarse_centroid_init_us="
-              << main_build_profile.build_coarse_centroid_init_us
-              << ", build_coarse_kmeans_us="
-              << main_build_profile.build_coarse_kmeans_us
-              << ", build_coarse_kmeans_assignment_us="
-              << main_build_profile.build_coarse_kmeans_assignment_us
-              << ", build_coarse_kmeans_update_us="
-              << main_build_profile.build_coarse_kmeans_update_us
-              << ", build_coarse_kmeans_rows="
-              << main_build_profile.build_coarse_kmeans_rows
-              << ", build_coarse_kmeans_k="
-              << main_build_profile.build_coarse_kmeans_k
-              << ", build_coarse_kmeans_dim="
-              << main_build_profile.build_coarse_kmeans_dim
-              << ", build_coarse_kmeans_iterations="
-              << main_build_profile.build_coarse_kmeans_iterations
-              << ", build_pq_routing_assignment_us="
-              << main_build_profile.build_pq_routing_assignment_us
-              << ", build_pq_routing_assignment_rows="
-              << main_build_profile.build_pq_routing_assignment_rows
-              << ", build_pq_subspace_materialize_us="
-              << main_build_profile.build_pq_subspace_materialize_us
-              << ", build_pq_subspace_materialized_rows="
-              << main_build_profile.build_pq_subspace_materialized_rows
-              << ", build_pq_subspace_materialized_bytes="
-              << main_build_profile.build_pq_subspace_materialized_bytes
-              << ", build_pq_centroid_init_us="
-              << main_build_profile.build_pq_centroid_init_us
-              << ", build_pq_kmeans_assignment_us="
-              << main_build_profile.build_pq_kmeans_assignment_us
-              << ", build_pq_kmeans_update_us="
-              << main_build_profile.build_pq_kmeans_update_us
-              << ", build_pq_kmeans_us="
-              << main_build_profile.build_pq_kmeans_us
-              << ", build_pq_training_total_us="
-              << main_build_profile.build_pq_training_total_us
-              << ", build_pq_codebook_soa_us="
-              << main_build_profile.build_pq_codebook_soa_us
-              << ", build_pq_precomputed_table_us="
-              << main_build_profile.build_pq_precomputed_table_us
-              << ", build_publication_us="
-              << main_build_profile.build_publication_us
-              << ", build_pq_max_live_subspaces="
-              << main_build_profile.build_pq_max_live_subspaces
-              << ", build_pq_full_residual_bytes="
-              << main_build_profile.build_pq_full_residual_bytes
-              << ", build_pq_training_concurrency="
-              << main_build_profile.build_pq_training_concurrency << std::endl;
-    std::cout << "[GLOBAL_REBUILD_ADD_PROFILE]"
-              << " records=" << main_add_profile.records
-              << ", record_construction_us=" << main_add_profile.record_construction_us
-              << ", validation_us=" << main_add_profile.validation_us
-              << ", assignment_us=" << main_add_profile.assignment_us
-              << ", encode_us=" << main_add_profile.encode_us
-              << ", deferred_pq_stats_us=" << main_add_profile.deferred_pq_stats_us
-              << ", commit_us=" << main_add_profile.commit_us << std::endl;
-    std::cout << "[GLOBAL_REBUILD_PROFILE_SUMMARY]"
-              << " setup_ms=" << setup_ms
-              << ", whitening_fit_ms=" << whitening_ms
-              << ", base_retarget_ms=" << base_retarget_ms
-              << ", query_transform_ms=" << query_transform_ms
-              << ", main_build_ms=" << main_build_ms
-              << ", main_add_ms=" << main_add_ms
-              << ", delta_build_ms=" << delta_build_ms
-              << ", delta_add_ms=" << delta_add_ms
-              << ", delta_finalize_ms=" << delta_finalize_ms
-              << ", delta_seed_ms=" << delta_seed_ms
-              << ", norms_recompute_ms=" << norms_recompute_ms
-              << ", publication_ms=" << publication_ms
-              << ", malloc_trim_ms=" << malloc_trim_ms
-              << ", memory_trace_ms=" << memory_trace_ms
-              << ", profiling_collect_ms=" << profiling_collect_ms
-              << ", accounted_stage_sum_ms=" << accounted_stage_sum_ms
-              << ", wall_total_ms=" << wall_total_ms
-              << ", unaccounted_ms=" << unaccounted_ms << std::endl;
+ann::eval::PrintGlobalRebuildBuildProfile(main_build_profile);
+ann::eval::PrintGlobalRebuildAddProfile(main_add_profile);
+ann::eval::PrintGlobalRebuildProfileSummary(setup_ms,
+                                                        whitening_ms,
+                                                        base_retarget_ms,
+                                                        query_transform_ms,
+                                                        main_build_ms,
+                                                        main_add_ms,
+                                                        delta_build_ms,
+                                                        delta_add_ms,
+                                                        delta_finalize_ms,
+                                                        delta_seed_ms,
+                                                        norms_recompute_ms,
+                                                        publication_ms,
+                                                        malloc_trim_ms,
+                                                        memory_trace_ms,
+                                                        profiling_collect_ms,
+                                                        accounted_stage_sum_ms,
+                                                        wall_total_ms,
+                                                        unaccounted_ms);
 
     std::cout << "[GLOBAL REBUILD] done: base_rows=" << seen_rows
               << ", reason=" << trigger.reason
@@ -3244,38 +2805,9 @@ int main(int argc, char** argv) {
     return Status::OK();
   };
 
-  std::string config_name = std::filesystem::path(config_path).stem().string();
-
-  std::string dataset_name = dataset_label;
-  std::string metric_name = "default";
-  
-  if (base_dataset_path) {
-    std::filesystem::path p(*base_dataset_path);
-    std::vector<std::string> parts;
-    for (const auto& part : p) {
-      parts.push_back(part.string());
-    }
-  
-    for (size_t i = 0; i < parts.size(); ++i) {
-      if (parts[i] == "data" && i + 2 < parts.size()) {
-        dataset_name = parts[i + 1];
-  
-        std::string metric;
-        for (size_t j = i + 2; j + 1 < parts.size(); ++j) {
-          if (!metric.empty()) metric += "_";
-          metric += parts[j];
-        }
-        if (!metric.empty()) metric_name = metric;
-        break;
-      }
-    }
-  }
-  
-  std::filesystem::path results_dir =
-      std::filesystem::path("result") / dataset_name / metric_name / config_name;
-  std::error_code ec;
-  std::filesystem::create_directories(results_dir, ec);
-  const std::filesystem::path memory_trace_path = results_dir / "memory_trace.json";
+  const auto output_paths = ann::eval::BuildRunEvalOutputPaths(
+      config_path, base_dataset_path, dataset_label);
+  const std::filesystem::path& memory_trace_path = output_paths.memory_trace_path;
   const auto ts = std::chrono::duration_cast<std::chrono::seconds>(
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
@@ -3291,7 +2823,6 @@ int main(int argc, char** argv) {
   std::optional<EvalMetrics> pre_stream_metrics;
   uint32_t inserted_rows = 0;
 
-  uint64_t eval_seq = 0;
   uint32_t last_insert_begin = stream_start_idx;
   uint32_t last_insert_end = stream_start_idx;
   if (loaded_final_state_cache) {
@@ -3331,11 +2862,8 @@ int main(int argc, char** argv) {
     }
     EvalMetrics m = res.value();
     m.rebuild_ms = rebuild_ms_total;
-    const uint64_t eval_id = ++eval_seq;
-    std::cout << "[EVAL] #" << eval_id << " stage=" << stage << ", base_rows=" << active_rows
-              << ", recall@" << config.topk << "="
-              << (m.recall_available ? std::to_string(m.recall) : "unavailable")
-              << ", latency_ms=" << m.avg_query_ms << ", qps=" << m.query_qps << std::endl;
+    const uint64_t eval_id = counters.NextEvalSequence();
+    ann::eval::PrintEval(eval_id, stage, active_rows, config.topk, m);
     return m;
   };
 
@@ -3453,16 +2981,9 @@ int main(int argc, char** argv) {
     }
     snap.minibatches = std::move(minibatches);
     record_memory("snapshot", active_rows);
-    std::cout << "[SNAPSHOT] base_rows=" << snap.base_rows
-              << ", snapshot_rows=" << snap.snapshot_rows
-              << ", recall@" << config.topk << "="
-              << (ShouldComputeGroundTruth(config) ? std::to_string(snap.recall) : "unavailable")
-              << ", latency_ms=" << snap.latency_ms
-              << ", qps=" << snap.query_qps
-              << ", throughput=" << snap.update_throughput_vecps
-              << ", maintenance_ms=" << snap.snapshot_total_ms
-              << ", amortized_update_throughput="
-              << snap.amortized_update_throughput_vecps << std::endl;
+    ann::eval::PrintSnapshot(snap,
+                             config.topk,
+                             ShouldComputeGroundTruth(config));
     snapshots.push_back(std::move(snap));
     last_snapshot_active_rows = active_rows;
     return Status::OK();
@@ -3514,10 +3035,16 @@ int main(int argc, char** argv) {
         return 1;
       }
       if (activate_status.value() > 0.0) {
-        total_update_ms += activate_status.value();
-        total_update_insert_ms += activate_status.value();
-        pending_update_ms += activate_status.value();
-        pending_update_insert_ms += activate_status.value();
+        counters.AddUpdate(activate_status.value(),
+                           0.0,
+                           activate_status.value(),
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0);
       }
       if (!frozen_delta.has_value() && active_delta.has_value()) {
         auto trigger_res = EvaluateMergeTriggerDecision(active_delta.value(), last_online_pq_stats);
@@ -3614,36 +3141,15 @@ int main(int argc, char** argv) {
           return 1;
         }
         last_online_pq_stats = add_res.value();
-        total_delta_ingest_assignment_us += last_online_pq_stats.insert_assignment_us;
-        total_delta_ingest_assignment_records += last_online_pq_stats.processed_vectors;
+        counters.AddDeltaIngestAssignment(last_online_pq_stats.insert_assignment_us,
+                                          last_online_pq_stats.processed_vectors);
         std::cout << "[STREAM_PROFILE] begin=" << begin
                   << ", end=" << end
                   << ", delta_ingest_assignment_us="
                   << last_online_pq_stats.insert_assignment_us
                   << ", records=" << last_online_pq_stats.processed_vectors
                   << std::endl;
-        online_pq_rollup.batches++;
-        online_pq_rollup.sum_nqe_batch += last_online_pq_stats.nqe_batch;
-        online_pq_rollup.sum_qe_ratio += last_online_pq_stats.qe_ratio;
-        online_pq_rollup.sum_codebook_drift += last_online_pq_stats.codebook_drift_l2;
-        online_pq_rollup.last_nqe_batch = last_online_pq_stats.nqe_batch;
-        online_pq_rollup.last_qe_ratio = last_online_pq_stats.qe_ratio;
-        online_pq_rollup.last_codebook_drift = last_online_pq_stats.codebook_drift_l2;
-        online_pq_rollup.last_warmup_batches_left = last_online_pq_stats.warmup_batches_left;
-        if (last_online_pq_stats.in_warmup) {
-          online_pq_rollup.warmup_batches++;
-        }
-        if (last_online_pq_stats.trigger_update) {
-          online_pq_rollup.triggered++;
-        }
-        if (last_online_pq_stats.updated_codebook) {
-          online_pq_rollup.updated++;
-        }
-        if (last_online_pq_stats.reencoded_batch) {
-          online_pq_rollup.reencoded++;
-        }
-        online_pq_rollup.updated_subspaces += last_online_pq_stats.updated_subspaces;
-        online_pq_rollup.updated_codewords += last_online_pq_stats.updated_codewords;
+        counters.ObserveOnlinePQ(last_online_pq_stats);
         if (use_sliding_window) {
           const uint32_t deleted_rows = static_cast<uint32_t>(delete_doc_ids.size());
           for (uint32_t i = 0; i < deleted_rows; ++i) {
@@ -3665,26 +3171,16 @@ int main(int argc, char** argv) {
       last_insert_begin = begin;
       last_insert_end = end;
       inserted_rows = next_insert_idx - stream_start_idx;
-      total_update_ms += step_update_ms;
-      total_update_whitening_ms += step_whitening_ms;
-      total_update_insert_ms += step_insert_ms;
-      total_update_record_build_ms += last_online_pq_stats.record_build_ms;
-      total_update_insert_encode_ms += last_online_pq_stats.insert_encode_ms;
-      total_update_insert_commit_ms += last_online_pq_stats.insert_commit_ms;
-      total_update_onlinepq_maintenance_ms += last_online_pq_stats.maintenance_ms;
-      total_update_delete_ms += last_online_pq_stats.delete_ms;
-      total_update_codebook_update_ms += last_online_pq_stats.codebook_update_ms;
-      total_update_reencode_ms += last_online_pq_stats.reencode_ms;
-      pending_update_ms += step_update_ms;
-      pending_update_whitening_ms += step_whitening_ms;
-      pending_update_insert_ms += step_insert_ms;
-      pending_update_record_build_ms += last_online_pq_stats.record_build_ms;
-      pending_update_insert_encode_ms += last_online_pq_stats.insert_encode_ms;
-      pending_update_insert_commit_ms += last_online_pq_stats.insert_commit_ms;
-      pending_update_onlinepq_maintenance_ms += last_online_pq_stats.maintenance_ms;
-      pending_update_delete_ms += last_online_pq_stats.delete_ms;
-      pending_update_codebook_update_ms += last_online_pq_stats.codebook_update_ms;
-      pending_update_reencode_ms += last_online_pq_stats.reencode_ms;
+      counters.AddUpdate(step_update_ms,
+                         step_whitening_ms,
+                         step_insert_ms,
+                         last_online_pq_stats.record_build_ms,
+                         last_online_pq_stats.insert_encode_ms,
+                         last_online_pq_stats.insert_commit_ms,
+                         last_online_pq_stats.maintenance_ms,
+                         last_online_pq_stats.delete_ms,
+                         last_online_pq_stats.codebook_update_ms,
+                         last_online_pq_stats.reencode_ms);
 
       activate_status = ActivatePendingDeltaFromSubsequentWindow(next_insert_idx);
       if (!activate_status.ok()) {
@@ -3692,10 +3188,16 @@ int main(int argc, char** argv) {
         return 1;
       }
       if (activate_status.value() > 0.0) {
-        total_update_ms += activate_status.value();
-        total_update_insert_ms += activate_status.value();
-        pending_update_ms += activate_status.value();
-        pending_update_insert_ms += activate_status.value();
+        counters.AddUpdate(activate_status.value(),
+                           0.0,
+                           activate_status.value(),
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0,
+                           0.0);
       }
 
       bool can_start_merge = false;
@@ -3816,9 +3318,8 @@ int main(int argc, char** argv) {
           return 1;
         }
         const double merge_commit_ms = merge_commit_timer.ElapsedMillis();
-        total_merge_compute_ms += merge_res.value().merge_compute_ms;
-        pending_merge_compute_ms += merge_res.value().merge_compute_ms;
-        rebuild_ms_total += merge_commit_ms;
+        counters.AddMergeCompute(merge_res.value().merge_compute_ms);
+        counters.AddMergeRebuildWall(merge_commit_ms);
         main_rows_current = std::min<uint32_t>(
             next_insert_idx, main_rows_current + merge_res.value().frozen_records);
         auto main_sizes_after_merge_res = main_ivf->GetPartitionSizes(main_versions);
@@ -3893,67 +3394,7 @@ int main(int argc, char** argv) {
                   << ", merge_compute_ms=" << merge_res.value().merge_compute_ms
                   << ", codebook_rebuild_ms=" << merge_res.value().codebook_rebuild_ms
                   << ", merge_ms=" << merge_commit_ms << std::endl;
-        const auto& profile = merge_res.value().profiling;
-        std::cout << "[MERGE_PROFILE] effective_nlist=" << profile.effective_nlist
-                  << ", frozen_records=" << profile.frozen_records
-                  << ", assignment_descriptor_records="
-                  << profile.assignment_descriptor_records
-                  << ", assignment_full_vector_copy_bytes="
-                  << profile.assignment_full_vector_copy_bytes
-                  << ", frozen_payload_records_moved="
-                  << profile.frozen_payload_records_moved
-                  << ", vector_accessor_materialize_calls="
-                  << profile.vector_accessor_materialize_calls
-                  << ", vector_accessor_materialized_rows="
-                  << profile.vector_accessor_materialized_rows
-                  << ", vector_accessor_materialized_bytes="
-                  << profile.vector_accessor_materialized_bytes
-                  << ", vector_accessor_max_materialize_rows="
-                  << profile.vector_accessor_max_materialize_rows
-                  << ", seed_partitions=" << profile.seed_partitions
-                  << ", neighborhoods=" << profile.neighborhoods
-                  << ", main_records_loaded=" << profile.main_records_loaded
-                  << ", pooled_records=" << profile.pooled_records
-                  << ", repartitioned_records=" << profile.repartitioned_records
-                  << ", patch_records=" << profile.patch_records
-                  << ", patch_dense_vector_bytes=" << profile.patch_dense_vector_bytes
-                  << ", patch_retained_vector_bytes="
-                  << profile.patch_retained_vector_bytes
-                  << ", patch_elided_vector_bytes=" << profile.patch_elided_vector_bytes
-                  << ", patch_final_pq_code_bytes="
-                  << profile.patch_final_pq_code_bytes
-                  << ", pq_codes_reused=" << profile.pq_codes_reused
-                  << ", pq_codes_reencoded=" << profile.pq_codes_reencoded
-                  << ", prepare_pq_codes_reused="
-                  << profile.prepare_pq_codes_reused
-                  << ", prepare_pq_codes_reencoded="
-                  << profile.prepare_pq_codes_reencoded
-                  << ", merge_delta_to_main_assignment_us="
-                  << profile.merge_delta_to_main_assignment_us
-                  << ", merge_assignment_distance_us="
-                  << profile.merge_assignment_distance_us
-                  << ", merge_assignment_top_r_us="
-                  << profile.merge_assignment_top_r_us
-                  << ", merge_assignment_balance_us="
-                  << profile.merge_assignment_balance_us
-                  << ", merge_assignment_materialize_us="
-                  << profile.merge_assignment_materialize_us
-                  << ", stats_us=" << profile.stats_us
-                  << ", scoring_us=" << profile.scoring_us
-                  << ", top_r_neighbor_us=" << profile.top_r_neighbor_us
-                  << ", fetch_main_records_us=" << profile.fetch_main_records_us
-                  << ", repartition_pool_us=" << profile.repartition_pool_us
-                  << ", repartition_distance_us=" << profile.repartition_distance_us
-                  << ", repartition_candidate_selection_us="
-                  << profile.repartition_candidate_selection_us
-                  << ", repartition_sort_us=" << profile.repartition_sort_us
-                  << ", patch_prepare_us=" << profile.patch_prepare_us
-                  << ", prepare_pq_encode_us=" << profile.prepare_pq_encode_us
-                  << ", commit_us=" << profile.commit_us
-                  << ", pq_code_assignment_us=" << profile.pq_code_assignment_us
-                  << ", pq_code_copy_or_reuse_us=" << profile.pq_code_copy_or_reuse_us
-                  << ", pq_list_flatten_us=" << profile.pq_list_flatten_us
-                  << std::endl;
+        ann::eval::PrintMergeProfile(merge_res.value().profiling);
         frozen_delta.reset();
         frozen_trigger_decision.reset();
         TrimAllocatorRetainedMemory("stream_after_merge_commit");
@@ -4023,18 +3464,7 @@ int main(int argc, char** argv) {
           return 1;
         }
         snapshot_minibatches.clear();
-        pending_update_ms = 0.0;
-        pending_update_whitening_ms = 0.0;
-        pending_update_insert_ms = 0.0;
-        pending_update_record_build_ms = 0.0;
-        pending_update_insert_encode_ms = 0.0;
-        pending_update_insert_commit_ms = 0.0;
-        pending_update_onlinepq_maintenance_ms = 0.0;
-        pending_update_delete_ms = 0.0;
-        pending_update_codebook_update_ms = 0.0;
-        pending_update_reencode_ms = 0.0;
-        pending_merge_compute_ms = 0.0;
-        pending_global_rebuild_ms = 0.0;
+        counters.ResetPending();
       }
     }
   }
@@ -4270,118 +3700,24 @@ int main(int argc, char** argv) {
           ? online_pq_rollup.sum_codebook_drift / static_cast<double>(online_pq_rollup.batches)
           : 0.0;
 
-  std::cout << "[ONLINE EVAL] ";
-  if (final_metrics.recall_available) {
-    std::cout << "Recall@" << config.topk << " = " << final_metrics.recall;
-  } else {
-    std::cout << "Recall disabled (ground truth unavailable)";
-  }
-  std::cout << " (nprobe=" << params.nprobe
-            << ", exact_rerank=" << std::boolalpha << config.exact_rerank_enable
-            << ", rerank_candidates_per_route=" << config.exact_rerank_candidates_per_route
-            << ")" << std::endl;
-  std::cout << "Latency(no_merge_wall)=" << final_metrics.avg_query_ms << "ms; "
-            << "End-to-end overhead=" << final_metrics.end_to_end_overhead_ms << "ms; "
-            << "Search p50=" << final_metrics.search_p50 << "ms, p99=" << final_metrics.search_p99
-            << "ms; "
-            << "Total p50=" << final_metrics.total_p50 << "ms, p99=" << final_metrics.total_p99
-            << "ms; "
-            << "Build/Rebuild=" << rebuild_ms_total << "ms; "
-            << "Update maintenance total=" << final_metrics.update_total_ms
-            << "ms (apply=" << total_update_ms
-            << ", merge_compute=" << total_merge_compute_ms
-            << ", global_rebuild=" << total_global_rebuild_ms
-            << "), per_vec=" << final_metrics.update_per_vector_ms << "ms; "
-            << "Scanned avg=" << final_metrics.scanned_avg << ", p50=" << final_metrics.scanned_p50
-            << ", p99=" << final_metrics.scanned_p99 << ", max=" << final_metrics.scanned_max
-            << "; Query QPS=" << final_metrics.query_qps
-            << ", Update throughput=" << final_metrics.update_throughput_vecps << " vec/s"
-            << std::endl;
-  std::cout << "[STREAM_PROFILE_TOTAL] delta_ingest_assignment_us="
-            << total_delta_ingest_assignment_us
-            << ", records=" << total_delta_ingest_assignment_records
-            << std::endl;
-  std::cout << "[GLOBAL REBUILD] enabled=" << std::boolalpha << config.enable_global_rebuild
-            << ", count=" << global_rebuild_count << "/" << config.global_rebuild_max_count
-            << ", trigger_main_imbalance=" << config.global_rebuild_main_imbalance_ratio
-            << ", trigger_main_rows=" << config.global_rebuild_force_main_rows
-            << ", cooldown_rows=" << config.global_rebuild_cooldown_rows << std::endl;
-  std::cout << "[ONLINE PQ] enabled=" << std::boolalpha << online_pq_options.enable
-            << ", mode=" << config.online_pq_update_scheme
-            << ", batches=" << online_pq_rollup.batches
-            << ", warmup_batches=" << online_pq_rollup.warmup_batches
-            << ", triggered=" << online_pq_rollup.triggered
-            << ", updated=" << online_pq_rollup.updated
-            << ", reencoded=" << online_pq_rollup.reencoded
-            << ", avg_nqe=" << online_avg_nqe
-            << ", warmup_left=" << online_pq_rollup.last_warmup_batches_left
-            << ", last_qe_ratio=" << online_pq_rollup.last_qe_ratio
-            << ", avg_qe_ratio=" << online_avg_qe_ratio
-            << ", avg_codebook_drift=" << online_avg_drift << std::endl;
-  std::cout << "[QUERY ROUTING] main_queries=" << final_metrics.main_route_queries
-            << ", frozen_delta_queries=" << final_metrics.frozen_delta_route_queries
-            << ", active_delta_queries=" << final_metrics.active_delta_route_queries << std::endl;
-  if (ShouldComputeGroundTruth(config) && config.enable_miss_diag) {
-    std::cout << "[MISS DIAG] gt_probed_rate=" << final_metrics.gt_probed_rate
-              << ", recall_on_probed_gt=" << final_metrics.recall_on_probed_gt
-              << ", exact_recall_on_probed_candidates="
-              << final_metrics.exact_recall_on_probed_candidates
-              << ", miss_not_probed=" << final_metrics.miss_not_probed
-              << ", miss_probed_filtered_by_pq=" << final_metrics.miss_probed_filtered_by_pq
-              << ", avg_pq_rank_loss=" << final_metrics.avg_pq_rank_loss << std::endl;
-  } else if (!ShouldComputeGroundTruth(config)) {
-    std::cout << "[MISS DIAG] unavailable (ground truth disabled)" << std::endl;
-  } else {
-    std::cout << "[MISS DIAG] disabled by config(enable_miss_diag=false)" << std::endl;
-  }
-  if (config.enable_rerank_source_diag) {
-    std::cout << "[RERANK SOURCE DIAG] main_total=" << final_metrics.rerank_topk_main_total
-              << ", delta_total=" << final_metrics.rerank_topk_delta_total
-              << ", main_ratio=" << final_metrics.rerank_topk_main_ratio
-              << ", delta_ratio=" << final_metrics.rerank_topk_delta_ratio
-              << ", main_avg_topk=" << final_metrics.rerank_topk_main_avg
-              << ", delta_avg_topk=" << final_metrics.rerank_topk_delta_avg << std::endl;
-  } else {
-    std::cout << "[RERANK SOURCE DIAG] disabled by config(enable_rerank_source_diag=false)"
-              << std::endl;
-  }
+  ann::eval::PrintRunEvalSummary(config,
+                                final_metrics,
+                                online_pq_rollup,
+                                params.nprobe,
+                                rebuild_ms_total,
+                                total_update_ms,
+                                total_merge_compute_ms,
+                                total_global_rebuild_ms,
+                                total_delta_ingest_assignment_us,
+                                total_delta_ingest_assignment_records,
+                                global_rebuild_count,
+                                online_avg_nqe,
+                                online_avg_qe_ratio,
+                                online_avg_drift,
+                                ShouldComputeGroundTruth(config));
 
-  std::string file_name = "online_eval.json";
-  std::filesystem::path result_path = results_dir / file_name;
+  const std::filesystem::path& result_path = output_paths.result_path;
   const double full_run_wall_ms = full_run_timer.ElapsedMillis();
-  std::ofstream ofs(result_path);
-  if (!ofs) {
-    std::cerr << "Failed to write results to " << result_path << std::endl;
-    return 1;
-  }
-  auto write_query_recall_curve = [&]() -> Status {
-    if (query_recall_curve.empty()) return Status::OK();
-    const std::filesystem::path curve_path =
-        result_path.parent_path() / "query_recall_curve.json";
-    std::ofstream curve_ofs(curve_path);
-    if (!curve_ofs) return Status::IOError("Failed to write " + curve_path.string());
-    curve_ofs << "{\n  \"nprobe_sweep\": [";
-    for (size_t i = 0; i < query_recall_curve.size(); ++i) {
-      curve_ofs << query_recall_curve[i].first
-                << (i + 1 < query_recall_curve.size() ? ", " : "");
-    }
-    curve_ofs << "],\n  \"points\": [\n";
-    for (size_t i = 0; i < query_recall_curve.size(); ++i) {
-      const auto& point = query_recall_curve[i];
-      curve_ofs << "    {\"nprobe\": " << point.first
-                << ", \"recall\": " << point.second.recall
-                << ", \"avg_query_ms\": " << point.second.avg_query_ms
-                << ", \"p50_query_ms\": " << point.second.search_p50
-                << ", \"p99_query_ms\": " << point.second.search_p99
-                << ", \"qps\": " << point.second.query_qps
-                << ", \"scanned_avg\": " << point.second.scanned_avg << "}"
-                << (i + 1 < query_recall_curve.size() ? "," : "") << "\n";
-    }
-    curve_ofs << "  ]\n}\n";
-    return Status::OK();
-  };
-
-
   std::vector<double> recall_values;
   std::vector<double> qps_values;
   std::vector<double> latency_values;
@@ -4461,915 +3797,76 @@ int main(int argc, char** argv) {
         {"query_dim", static_cast<uint64_t>(Q.cols())},
         {"memory_block_rows", kAddBlockRows},
         {"raw_base_is_resident", base_source.UsesResidentMatrix() ? 1ull : 0ull}};
-    return memory_trace.WriteJson(memory_trace_path.string(), memory_metadata);
+    return ann::eval::WriteMemoryTraceJson(
+        memory_trace, memory_trace_path.string(), memory_metadata);
   };
-  if (!debug_output_enabled) {
-    ofs << "{\n";
-    ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
-    ofs << "  \"timestamp\": " << ts << ",\n";
-    ofs << "  \"params\": {\n";
-    ofs << "    \"topk\": " << config.topk << ",\n";
-    ofs << "    \"enable_dynamic_ground_truth\": "
-        << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
-    ofs << "    \"skip_query_ground_truth\": "
-        << (config.skip_query_ground_truth ? "true" : "false") << ",\n";
-    ofs << "    \"nprobe\": " << params.nprobe << ",\n";
-    ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
-    ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
-    ofs << "    \"pq_codebook_dimension_major\": "
-        << (config.pq_codebook_dimension_major ? "true" : "false") << ",\n";
-    ofs << "    \"pq_codes_subquantizer_major\": "
-        << (config.pq_codes_subquantizer_major ? "true" : "false") << ",\n";
-    ofs << "    \"use_whitening\": " << (config.use_whitening ? "true" : "false") << ",\n";
-    ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
-    ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
-        << ",\n";
-    ofs << "    \"active_exact_rerank_candidates\": " << config.active_exact_rerank_candidates
-        << ",\n";
-    ofs << "    \"frozen_exact_rerank_candidates\": " << config.frozen_exact_rerank_candidates
-        << ",\n";
-    ofs << "    \"merge_score_alpha\": " << config.merge_score_alpha << ",\n";
-    ofs << "    \"merge_score_beta\": " << config.merge_score_beta << ",\n";
-    ofs << "    \"merge_score_threshold\": " << config.merge_score_threshold << ",\n";
-    ofs << "    \"enable_merge\": " << (config.enable_merge ? "true" : "false") << ",\n";
-    ofs << "    \"snapshot_span\": " << snapshot_span << "\n";
-    ofs << "  },\n";
-    ofs << "  \"metrics\": {\n";
-    ofs << "    \"recall_available\": "
-        << (final_metrics.recall_available ? "true" : "false") << ",\n";
-    ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
-    ofs << "    \"full_run_wall_ms\": " << full_run_wall_ms << ",\n";
-    ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
-    ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
-    ofs << "    \"gt_new_ratio\": " << final_metrics.gt_new_ratio << ",\n";
-    ofs << "    \"gt_new_total\": " << final_metrics.gt_new_total << ",\n";
-    ofs << "    \"gt_old_total\": " << final_metrics.gt_old_total << ",\n";
-    ofs << "    \"hit_new_total\": " << final_metrics.hit_new_total << ",\n";
-    ofs << "    \"hit_old_total\": " << final_metrics.hit_old_total << ",\n";
-    ofs << "    \"latency_ms\": " << final_metrics.avg_query_ms << ",\n";
-    ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
-    ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
-    ofs << "    \"avg_pq_lut_build_us\": " << final_metrics.avg_pq_lut_build_us << ",\n";
-    ofs << "    \"avg_pq_adc_scan_us\": " << final_metrics.avg_pq_adc_scan_us << ",\n";
-    ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
-    ofs << "    \"update_whitening_ms\": " << total_update_whitening_ms << ",\n";
-    ofs << "    \"update_insert_ms\": " << total_update_insert_ms << ",\n";
-    ofs << "    \"update_record_build_ms\": " << total_update_record_build_ms << ",\n";
-    ofs << "    \"update_insert_encode_ms\": " << total_update_insert_encode_ms << ",\n";
-    ofs << "    \"update_insert_commit_ms\": " << total_update_insert_commit_ms << ",\n";
-    ofs << "    \"update_onlinepq_maintenance_ms\": " << total_update_onlinepq_maintenance_ms << ",\n";
-    ofs << "    \"update_delete_ms\": " << total_update_delete_ms << ",\n";
-    ofs << "    \"update_codebook_update_ms\": " << total_update_codebook_update_ms << ",\n";
-    ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
-    ofs << "    \"delta_ingest_assignment_us\": "
-        << total_delta_ingest_assignment_us << ",\n";
-    ofs << "    \"delta_ingest_assignment_records\": "
-        << total_delta_ingest_assignment_records << ",\n";
-    ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
-    ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
-    ofs << "    \"initial_used_prebuilt_index\": "
-        << (used_prebuilt_index ? "true" : "false") << ",\n";
-    ofs << "    \"initial_index_load_ms\": " << init_load_ms << ",\n";
-    ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
-    ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
-    ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
-    ofs << "    \"initial_main_pq_encode_us\": "
-        << initial_main_ingest_profile.encode_us << ",\n";
-    ofs << "    \"initial_delta_seed_pq_encode_us\": "
-        << initial_delta_seed_ingest_profile.encode_us << ",\n";
-    ofs << "    \"initial_build_profile_available\": "
-        << (initial_build_profile.has_value() ? "true" : "false") << ",\n";
-    ofs << "    \"initial_build_coarse_kmeans_us\": "
-        << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_us : 0.0) << ",\n";
-    ofs << "    \"initial_build_coarse_assignment_us\": "
-        << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_assignment_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_coarse_update_us\": "
-        << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_update_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_pq_training_us\": "
-        << (initial_build_profile ? initial_build_profile->build_pq_training_total_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_pq_codebook_soa_us\": "
-        << (initial_build_profile ? initial_build_profile->build_pq_codebook_soa_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_pq_precomputed_table_us\": "
-        << (initial_build_profile ? initial_build_profile->build_pq_precomputed_table_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_pq_assignment_us\": "
-        << (initial_build_profile ? initial_build_profile->build_pq_kmeans_assignment_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_pq_update_us\": "
-        << (initial_build_profile ? initial_build_profile->build_pq_kmeans_update_us : 0.0)
-        << ",\n";
-    ofs << "    \"initial_build_publication_us\": "
-        << (initial_build_profile ? initial_build_profile->build_publication_us : 0.0) << ",\n";
-    ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
-    ofs << "    \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
-    ofs << "    \"throughput\": " << final_metrics.update_throughput_vecps << "\n";
-    ofs << "  },\n";
-    ofs << "  \"summary\": {\n";
-    ofs << "    \"recall_avg\": " << recall_summary.avg << ",\n";
-    ofs << "    \"recall_p5\": " << recall_summary.p5 << ",\n";
-    ofs << "    \"recall_min\": " << recall_summary.min << ",\n";
-    ofs << "    \"recall_final\": " << final_metrics.recall << ",\n";
-    ofs << "    \"recall_new\": " << summary_recall_new << ",\n";
-    ofs << "    \"recall_old\": " << summary_recall_old << ",\n";
-    ofs << "    \"gt_new_ratio\": " << summary_gt_new_ratio << ",\n";
-    ofs << "    \"gt_new_total\": " << summary_gt_new_total << ",\n";
-    ofs << "    \"gt_old_total\": " << summary_gt_old_total << ",\n";
-    ofs << "    \"hit_new_total\": " << summary_hit_new_total << ",\n";
-    ofs << "    \"hit_old_total\": " << summary_hit_old_total << ",\n";
-    ofs << "    \"qps_avg\": " << qps_summary.avg << ",\n";
-    ofs << "    \"qps_p5\": " << qps_summary.p5 << ",\n";
-    ofs << "    \"latency_avg_ms\": " << latency_summary.avg << ",\n";
-    ofs << "    \"latency_p95_ms\": " << latency_summary.p95 << ",\n";
-    ofs << "    \"latency_p99_ms\": " << latency_summary.p99 << ",\n";
-    ofs << "    \"e2e_latency_avg_ms\": " << e2e_latency_summary.avg << ",\n";
-    ofs << "    \"update_throughput_avg_vecps\": "
-        << update_throughput_summary.avg << ",\n";
-    ofs << "    \"amortized_update_throughput_avg_vecps\": "
-        << amortized_update_throughput_summary.avg << ",\n";
-    ofs << "    \"merge_count\": " << merge_events.size() << ",\n";
-    ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
-    ofs << "    \"merge_nodes\": [";
-    for (size_t ni = 0; ni < merge_events.size(); ++ni) {
-      ofs << merge_events[ni].base_rows;
-      if (ni + 1 < merge_events.size()) ofs << ", ";
-    }
-    ofs << "],\n";
-    ofs << "    \"global_rebuild_nodes\": [";
-    for (size_t ni = 0; ni < global_rebuild_events.size(); ++ni) {
-      ofs << global_rebuild_events[ni].base_rows;
-      if (ni + 1 < global_rebuild_events.size()) ofs << ", ";
-    }
-    ofs << "],\n";
-    ofs << "    \"process_rss_bytes\": " << ReadProcStatusBytes("VmRSS:") << ",\n";
-    ofs << "    \"process_peak_rss_bytes\": " << ReadProcStatusBytes("VmHWM:") << "\n";
-    ofs << "  },\n";
-    ofs << "  \"route_execution\": {\n";
-    ofs << "    \"main_queries\": " << final_metrics.main_route_queries << ",\n";
-    ofs << "    \"frozen_delta_queries\": " << final_metrics.frozen_delta_route_queries << ",\n";
-    ofs << "    \"active_delta_queries\": " << final_metrics.active_delta_route_queries << "\n";
-    ofs << "  },\n";
-    ofs << "  \"global_rebuild_count\": " << global_rebuild_count << ",\n";
-    ofs << "  \"merge_events\": [\n";
-    for (size_t i = 0; i < merge_events.size(); ++i) {
-      const auto& ev = merge_events[i];
-      ofs << "    {\n";
-      ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
-      ofs << "      \"frozen_rows\": " << ev.frozen_rows << ",\n";
-      ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
-      ofs << "      \"assignment_distance_us\": "
-          << ev.profiling.merge_assignment_distance_us << ",\n";
-      ofs << "      \"assignment_top_r_us\": "
-          << ev.profiling.merge_assignment_top_r_us << ",\n";
-      ofs << "      \"assignment_balance_us\": "
-          << ev.profiling.merge_assignment_balance_us << ",\n";
-      ofs << "      \"fetch_main_records_us\": "
-          << ev.profiling.fetch_main_records_us << ",\n";
-      ofs << "      \"repartition_distance_us\": "
-          << ev.profiling.repartition_distance_us << ",\n";
-      ofs << "      \"repartition_sort_us\": " << ev.profiling.repartition_sort_us << ",\n";
-      ofs << "      \"prepare_pq_encode_us\": "
-          << ev.profiling.prepare_pq_encode_us << ",\n";
-      ofs << "      \"commit_us\": " << ev.profiling.commit_us << ",\n";
-      ofs << "      \"pq_code_copy_or_reuse_us\": "
-          << ev.profiling.pq_code_copy_or_reuse_us << ",\n";
-      ofs << "      \"pq_list_flatten_us\": " << ev.profiling.pq_list_flatten_us << ",\n";
-      ofs << "      \"merge_ms\": " << ev.merge_ms << ",\n";
-      ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << "\n";
-      ofs << "    }";
-      if (i + 1 < merge_events.size()) {
-        ofs << ",";
-      }
-      ofs << "\n";
-    }
-    ofs << "  ],\n";
-    ofs << "  \"snapshots\": [\n";
-    for (size_t i = 0; i < snapshots.size(); ++i) {
-      const auto& snap = snapshots[i];
-      ofs << "    {\n";
-      ofs << "      \"snapshot_size\": " << snap.base_rows << ",\n";
-      ofs << "      \"recall_available\": "
-          << (ShouldComputeGroundTruth(config) ? "true" : "false") << ",\n";
-      ofs << "      \"recall@" << config.topk << "\": " << snap.recall << ",\n";
-      ofs << "      \"recall_new\": " << snap.recall_new << ",\n";
-      ofs << "      \"recall_old\": " << snap.recall_old << ",\n";
-      ofs << "      \"gt_new_ratio\": " << snap.gt_new_ratio << ",\n";
-      ofs << "      \"gt_new_total\": " << snap.gt_new_total << ",\n";
-      ofs << "      \"gt_old_total\": " << snap.gt_old_total << ",\n";
-      ofs << "      \"hit_new_total\": " << snap.hit_new_total << ",\n";
-      ofs << "      \"hit_old_total\": " << snap.hit_old_total << ",\n";
-      ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
-      ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
-      ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
-      ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
-      ofs << "      \"update_whitening_ms\": " << snap.update_whitening_ms << ",\n";
-      ofs << "      \"update_insert_ms\": " << snap.update_insert_ms << ",\n";
-      ofs << "      \"update_record_build_ms\": " << snap.update_record_build_ms << ",\n";
-      ofs << "      \"update_insert_encode_ms\": " << snap.update_insert_encode_ms << ",\n";
-      ofs << "      \"update_insert_commit_ms\": " << snap.update_insert_commit_ms << ",\n";
-      ofs << "      \"update_onlinepq_maintenance_ms\": "
-          << snap.update_onlinepq_maintenance_ms << ",\n";
-      ofs << "      \"update_delete_ms\": " << snap.update_delete_ms << ",\n";
-      ofs << "      \"update_codebook_update_ms\": "
-          << snap.update_codebook_update_ms << ",\n";
-      ofs << "      \"update_reencode_ms\": " << snap.update_reencode_ms << ",\n";
-      ofs << "      \"merge_compute_ms\": " << snap.merge_compute_ms << ",\n";
-      ofs << "      \"global_rebuild_ms\": " << snap.global_rebuild_ms << ",\n";
-      ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
-      ofs << "      \"throughput\": " << snap.update_throughput_vecps << ",\n";
-      ofs << "      \"amortized_update_throughput_vecps\": "
-          << snap.amortized_update_throughput_vecps << "\n";
-      ofs << "    }";
-      if (i + 1 < snapshots.size()) {
-        ofs << ",";
-      }
-      ofs << "\n";
-    }
-    ofs << "  ]\n";
-    ofs << "}\n";
-
-    Status memory_write_status = write_memory_trace();
-    if (!memory_write_status.ok()) {
-      std::cerr << memory_write_status.ToString() << std::endl;
-      return 1;
-    }
-    const Status curve_status = write_query_recall_curve();
-    if (!curve_status.ok()) {
-      std::cerr << curve_status.ToString() << std::endl;
-      return 1;
-    }
-    std::cout << "Saved metrics to " << result_path << std::endl;
-    std::cout << "Saved memory trace to " << memory_trace_path << std::endl;
-    return 0;
+  const ann::eval::RunEvalResultData output_data{
+      dataset_label,
+      static_cast<int64_t>(ts),
+      config,
+      params,
+      final_metrics,
+      snapshots,
+      merge_events,
+      global_rebuild_events,
+      counter_values,
+      recall_summary,
+      qps_summary,
+      latency_summary,
+      e2e_latency_summary,
+      update_throughput_summary,
+      amortized_update_throughput_summary,
+      total_maintenance_ms,
+      summary_gt_new_total,
+      summary_gt_old_total,
+      summary_hit_new_total,
+      summary_hit_old_total,
+      summary_recall_new,
+      summary_recall_old,
+      summary_gt_new_ratio,
+      used_prebuilt_index,
+      init_load_ms,
+      init_rebuild_ms,
+      init_main_build_ms,
+      init_main_add_ms,
+      init_total_wall_ms,
+      init_whitening_ms,
+      init_whitening_transform_ms,
+      initial_main_ingest_profile,
+      initial_delta_seed_ingest_profile,
+      initial_build_profile,
+      main_rows_initial,
+      main_rows_current,
+      rows_after_main,
+      delta_train_rows,
+      delta_ivf_nlist,
+      merge_trigger_rows,
+      stream_start_idx,
+      total_stream_rows,
+      snapshot_span,
+      sliding_window_rows,
+      kDeltaKMeansIterationsDefault,
+      pre_stream_metrics,
+      online_pq_options.enable,
+      online_avg_nqe,
+      online_avg_qe_ratio,
+      online_avg_drift,
+      debug_output_enabled,
+      ShouldComputeGroundTruth(config),
+      full_run_wall_ms};
+  const Status result_write_status =
+      ann::eval::WriteRunEvalResultJson(result_path, output_data);
+  if (!result_write_status.ok()) {
+    std::cerr << "Failed to write results to " << result_path << std::endl;
+    return 1;
   }
-
-  ofs << "{\n";
-  ofs << "  \"dataset\": \"" << dataset_label << "\",\n";
-  ofs << "  \"timestamp\": " << ts << ",\n";
-  ofs << "  \"params\": {\n";
-  ofs << "    \"topk\": " << config.topk << ",\n";
-  ofs << "    \"nprobe\": " << params.nprobe << ",\n";
-  ofs << "    \"nlist\": " << config.ivf_nlist << ",\n";
-  ofs << "    \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
-  ofs << "    \"pq_codebook_dimension_major\": "
-      << (config.pq_codebook_dimension_major ? "true" : "false") << ",\n";
-  ofs << "    \"pq_codes_subquantizer_major\": "
-      << (config.pq_codes_subquantizer_major ? "true" : "false") << ",\n";
-  ofs << "    \"use_whitening\": " << (config.use_whitening ? "true" : "false") << ",\n";
-  ofs << "    \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
-  ofs << "    \"enable_streaming\": " << (config.enable_streaming ? "true" : "false") << ",\n";
-  ofs << "    \"main_index_rows_initial\": " << main_rows_initial << ",\n";
-  ofs << "    \"main_rows_final\": " << main_rows_current << ",\n";
-  ofs << "    \"rows_after_main\": " << rows_after_main << ",\n";
-  ofs << "    \"delta_train_window\": " << config.delta_train_window << ",\n";
-  ofs << "    \"delta_train_rows\": " << delta_train_rows << ",\n";
-  ofs << "    \"delta_ivf_nlist\": " << config.delta_ivf_nlist << ",\n";
-  ofs << "    \"delta_ivf_nlist_resolved\": " << delta_ivf_nlist << ",\n";
-  ofs << "    \"merge_score_alpha\": " << config.merge_score_alpha << ",\n";
-  ofs << "    \"merge_score_beta\": " << config.merge_score_beta << ",\n";
-  ofs << "    \"merge_score_threshold\": " << config.merge_score_threshold << ",\n";
-  ofs << "    \"merge_trigger_mode\": \"" << config.merge_trigger_mode << "\",\n";
-  ofs << "    \"enable_merge\": " << (config.enable_merge ? "true" : "false") << ",\n";
-  ofs << "    \"merge_trigger_rows\": " << config.merge_trigger_rows << ",\n";
-  ofs << "    \"merge_trigger_rows_resolved\": " << merge_trigger_rows << ",\n";
-  ofs << "    \"merge_trigger_qe_ratio\": " << config.merge_trigger_qe_ratio << ",\n";
-  ofs << "    \"merge_trigger_drift\": " << config.merge_trigger_drift << ",\n";
-  ofs << "    \"merge_trigger_delta_main_ratio\": " << config.merge_trigger_delta_main_ratio
-      << ",\n";
-  ofs << "    \"merge_trigger_imbalance_ratio\": " << config.merge_trigger_imbalance_ratio
-      << ",\n";
-  ofs << "    \"merge_assignment_mode\": \"" << config.merge_assignment_mode << "\",\n";
-  ofs << "    \"merge_assignment_top_r\": " << config.merge_assignment_top_r << ",\n";
-  ofs << "    \"merge_assignment_gamma\": " << config.merge_assignment_gamma << ",\n";
-  ofs << "    \"merge_assignment_hard_cap_ratio\": " << config.merge_assignment_hard_cap_ratio
-      << ",\n";
-  ofs << "    \"merge_assignment_lambda\": " << config.merge_assignment_lambda << ",\n";
-  ofs << "    \"enable_global_rebuild\": "
-      << (config.enable_global_rebuild ? "true" : "false") << ",\n";
-  ofs << "    \"global_rebuild_max_count\": " << config.global_rebuild_max_count << ",\n";
-  ofs << "    \"global_rebuild_main_imbalance_ratio\": "
-      << config.global_rebuild_main_imbalance_ratio << ",\n";
-  ofs << "    \"global_rebuild_force_main_rows\": " << config.global_rebuild_force_main_rows
-      << ",\n";
-  ofs << "    \"global_rebuild_cooldown_rows\": " << config.global_rebuild_cooldown_rows
-      << ",\n";
-  ofs << "    \"delta_kmeans_iterations\": " << kDeltaKMeansIterationsDefault << ",\n";
-  ofs << "    \"stream_start_row\": " << stream_start_idx << ",\n";
-  ofs << "    \"stream_rows\": " << total_stream_rows << ",\n";
-  ofs << "    \"streaming_mode\": \""
-      << (config.enable_streaming ? config.streaming_mode : "offline") << "\",\n";
-  ofs << "    \"stream_batch_size\": " << config.stream_batch_size << ",\n";
-  ofs << "    \"streaming_use_stream_batch_size\": "
-      << (config.streaming_use_stream_batch_size ? "true" : "false") << ",\n";
-  ofs << "    \"enable_dynamic_ground_truth\": "
-      << (config.enable_dynamic_ground_truth ? "true" : "false") << ",\n";
-  ofs << "    \"skip_query_ground_truth\": "
-      << (config.skip_query_ground_truth ? "true" : "false") << ",\n";
-  ofs << "    \"enable_miss_diag\": " << (config.enable_miss_diag ? "true" : "false") << ",\n";
-  ofs << "    \"enable_rerank_source_diag\": "
-      << (config.enable_rerank_source_diag ? "true" : "false") << ",\n";
-  ofs << "    \"enable_latency_debug\": "
-      << (config.enable_latency_debug ? "true" : "false") << ",\n";
-  ofs << "    \"exact_rerank_enable\": " << (config.exact_rerank_enable ? "true" : "false")
-      << ",\n";
-  ofs << "    \"exact_rerank_candidates_per_route\": "
-      << config.exact_rerank_candidates_per_route << ",\n";
-  ofs << "    \"main_exact_rerank_candidates\": " << config.main_exact_rerank_candidates
-      << ",\n";
-  ofs << "    \"active_exact_rerank_candidates\": " << config.active_exact_rerank_candidates
-      << ",\n";
-  ofs << "    \"frozen_exact_rerank_candidates\": " << config.frozen_exact_rerank_candidates
-      << ",\n";
-  ofs << "    \"snapshot_interval\": " << config.snapshot_interval << ",\n";
-  ofs << "    \"snapshot_span\": " << snapshot_span << ",\n";
-  ofs << "    \"online_pq_enable\": " << (config.online_pq_enable ? "true" : "false") << ",\n";
-  ofs << "    \"online_pq_update_scheme\": \"" << config.online_pq_update_scheme << "\",\n";
-  ofs << "    \"online_pq_sliding_window_size\": " << config.online_pq_sliding_window_size << ",\n";
-  ofs << "    \"online_pq_sliding_window_use_batches\": "
-      << (config.online_pq_sliding_window_use_batches ? "true" : "false") << ",\n";
-  ofs << "    \"online_pq_sliding_window_rows\": " << sliding_window_rows << ",\n";
-  ofs << "    \"online_pq_qe_ratio_threshold\": " << config.online_pq_qe_ratio_threshold << ",\n";
-  ofs << "    \"online_pq_ema_alpha\": " << config.online_pq_ema_alpha << ",\n";
-  ofs << "    \"online_pq_eps\": " << config.online_pq_eps << ",\n";
-  ofs << "    \"online_pq_warmup_enable\": "
-      << (config.online_pq_warmup_enable ? "true" : "false") << ",\n";
-  ofs << "    \"online_pq_warmup_batches\": " << config.online_pq_warmup_batches << ",\n";
-  ofs << "    \"online_pq_force_update_interval\": "
-      << config.online_pq_force_update_interval << ",\n";
-  ofs << "    \"online_pq_partial_top_alpha\": "
-      << (config.online_pq_partial_top_alpha ? "true" : "false") << ",\n";
-  ofs << "    \"online_pq_alpha\": " << config.online_pq_alpha << ",\n";
-  ofs << "    \"online_pq_partial_top_lambda\": "
-      << (config.online_pq_partial_top_lambda ? "true" : "false") << ",\n";
-  ofs << "    \"online_pq_lambda\": " << config.online_pq_lambda << ",\n";
-  ofs << "    \"online_pq_reencode_batch\": "
-      << (config.online_pq_reencode_batch ? "true" : "false") << "\n";
-  ofs << "  },\n";
-  ofs << "  \"metrics\": {\n";
-  ofs << "    \"recall_available\": "
-      << (final_metrics.recall_available ? "true" : "false") << ",\n";
-  ofs << "    \"avg_query_ms\": " << final_metrics.avg_query_ms << ",\n";
-  ofs << "    \"end_to_end_overhead_ms\": " << final_metrics.end_to_end_overhead_ms << ",\n";
-  ofs << "    \"query_qps\": " << final_metrics.query_qps << ",\n";
-  ofs << "    \"avg_pq_lut_build_us\": " << final_metrics.avg_pq_lut_build_us << ",\n";
-  ofs << "    \"avg_pq_adc_scan_us\": " << final_metrics.avg_pq_adc_scan_us << ",\n";
-  ofs << "    \"recall@" << config.topk << "\": " << final_metrics.recall << ",\n";
-  ofs << "    \"full_run_wall_ms\": " << full_run_wall_ms << ",\n";
-  ofs << "    \"recall_new\": " << final_metrics.recall_new << ",\n";
-  ofs << "    \"recall_old\": " << final_metrics.recall_old << ",\n";
-  ofs << "    \"gt_new_ratio\": " << final_metrics.gt_new_ratio << ",\n";
-  ofs << "    \"gt_new_total\": " << final_metrics.gt_new_total << ",\n";
-  ofs << "    \"gt_old_total\": " << final_metrics.gt_old_total << ",\n";
-  ofs << "    \"hit_new_total\": " << final_metrics.hit_new_total << ",\n";
-  ofs << "    \"hit_old_total\": " << final_metrics.hit_old_total << ",\n";
-  ofs << "    \"build_rebuild_ms\": " << rebuild_ms_total << ",\n";
-  ofs << "    \"initial_used_prebuilt_index\": "
-      << (used_prebuilt_index ? "true" : "false") << ",\n";
-  ofs << "    \"initial_index_load_ms\": " << init_load_ms << ",\n";
-  ofs << "    \"initial_build_aligned_ms\": " << init_rebuild_ms << ",\n";
-  ofs << "    \"initial_whitening_ms\": " << init_whitening_ms << ",\n";
-  ofs << "    \"initial_whitening_transform_ms\": " << init_whitening_transform_ms << ",\n";
-  ofs << "    \"initial_main_build_ms\": " << init_main_build_ms << ",\n";
-  ofs << "    \"initial_main_add_ms\": " << init_main_add_ms << ",\n";
-  ofs << "    \"initial_main_pq_encode_us\": "
-      << initial_main_ingest_profile.encode_us << ",\n";
-  ofs << "    \"initial_delta_seed_pq_encode_us\": "
-      << initial_delta_seed_ingest_profile.encode_us << ",\n";
-  ofs << "    \"initial_build_profile_available\": "
-      << (initial_build_profile.has_value() ? "true" : "false") << ",\n";
-  ofs << "    \"initial_build_coarse_kmeans_us\": "
-      << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_us : 0.0) << ",\n";
-  ofs << "    \"initial_build_coarse_assignment_us\": "
-      << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_assignment_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_coarse_update_us\": "
-      << (initial_build_profile ? initial_build_profile->build_coarse_kmeans_update_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_pq_training_us\": "
-      << (initial_build_profile ? initial_build_profile->build_pq_training_total_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_pq_codebook_soa_us\": "
-      << (initial_build_profile ? initial_build_profile->build_pq_codebook_soa_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_pq_precomputed_table_us\": "
-      << (initial_build_profile ? initial_build_profile->build_pq_precomputed_table_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_pq_assignment_us\": "
-      << (initial_build_profile ? initial_build_profile->build_pq_kmeans_assignment_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_pq_update_us\": "
-      << (initial_build_profile ? initial_build_profile->build_pq_kmeans_update_us : 0.0)
-      << ",\n";
-  ofs << "    \"initial_build_publication_us\": "
-      << (initial_build_profile ? initial_build_profile->build_publication_us : 0.0) << ",\n";
-  ofs << "    \"initial_build_wall_ms\": " << init_total_wall_ms << ",\n";
-  ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
-  ofs << "    \"update_total_ms\": " << final_metrics.update_total_ms << ",\n";
-  ofs << "    \"update_apply_ms\": " << total_update_ms << ",\n";
-  ofs << "    \"update_whitening_ms\": " << total_update_whitening_ms << ",\n";
-  ofs << "    \"update_insert_ms\": " << total_update_insert_ms << ",\n";
-  ofs << "    \"update_record_build_ms\": " << total_update_record_build_ms << ",\n";
-  ofs << "    \"update_insert_encode_ms\": " << total_update_insert_encode_ms << ",\n";
-  ofs << "    \"update_insert_commit_ms\": " << total_update_insert_commit_ms << ",\n";
-  ofs << "    \"update_onlinepq_maintenance_ms\": " << total_update_onlinepq_maintenance_ms << ",\n";
-  ofs << "    \"update_delete_ms\": " << total_update_delete_ms << ",\n";
-  ofs << "    \"update_codebook_update_ms\": " << total_update_codebook_update_ms << ",\n";
-  ofs << "    \"update_reencode_ms\": " << total_update_reencode_ms << ",\n";
-  ofs << "    \"delta_ingest_assignment_us\": "
-      << total_delta_ingest_assignment_us << ",\n";
-  ofs << "    \"delta_ingest_assignment_records\": "
-      << total_delta_ingest_assignment_records << ",\n";
-  ofs << "    \"update_merge_compute_ms\": " << total_merge_compute_ms << ",\n";
-  ofs << "    \"update_global_rebuild_ms\": " << total_global_rebuild_ms << ",\n";
-  ofs << "    \"update_per_vector_ms\": " << final_metrics.update_per_vector_ms << ",\n";
-  ofs << "    \"update_throughput_vecps\": " << final_metrics.update_throughput_vecps << ",\n";
-  ofs << "    \"scanned_avg\": " << final_metrics.scanned_avg << ",\n";
-  ofs << "    \"gt_probed_rate\": " << final_metrics.gt_probed_rate << ",\n";
-  ofs << "    \"recall_on_probed_gt\": " << final_metrics.recall_on_probed_gt << ",\n";
-  ofs << "    \"exact_recall_on_probed_candidates\": "
-      << final_metrics.exact_recall_on_probed_candidates << ",\n";
-  ofs << "    \"avg_pq_rank_loss\": " << final_metrics.avg_pq_rank_loss << ",\n";
-  ofs << "    \"miss_not_probed\": " << final_metrics.miss_not_probed << ",\n";
-  ofs << "    \"miss_probed_filtered_by_pq\": " << final_metrics.miss_probed_filtered_by_pq << ",\n";
-  ofs << "    \"pq_rank_loss_count\": " << final_metrics.pq_rank_loss_count << ",\n";
-  ofs << "    \"rerank_topk_main_total\": " << final_metrics.rerank_topk_main_total << ",\n";
-  ofs << "    \"rerank_topk_delta_total\": " << final_metrics.rerank_topk_delta_total << ",\n";
-  ofs << "    \"rerank_topk_main_ratio\": " << final_metrics.rerank_topk_main_ratio << ",\n";
-  ofs << "    \"rerank_topk_delta_ratio\": " << final_metrics.rerank_topk_delta_ratio << ",\n";
-  ofs << "    \"rerank_topk_main_avg\": " << final_metrics.rerank_topk_main_avg << ",\n";
-  ofs << "    \"rerank_topk_delta_avg\": " << final_metrics.rerank_topk_delta_avg << "\n";
-  ofs << "  },\n";
-  ofs << "  \"summary\": {\n";
-  ofs << "    \"recall_avg\": " << recall_summary.avg << ",\n";
-  ofs << "    \"recall_p5\": " << recall_summary.p5 << ",\n";
-  ofs << "    \"recall_min\": " << recall_summary.min << ",\n";
-  ofs << "    \"recall_final\": " << final_metrics.recall << ",\n";
-  ofs << "    \"recall_new\": " << summary_recall_new << ",\n";
-  ofs << "    \"recall_old\": " << summary_recall_old << ",\n";
-  ofs << "    \"gt_new_ratio\": " << summary_gt_new_ratio << ",\n";
-  ofs << "    \"gt_new_total\": " << summary_gt_new_total << ",\n";
-  ofs << "    \"gt_old_total\": " << summary_gt_old_total << ",\n";
-  ofs << "    \"hit_new_total\": " << summary_hit_new_total << ",\n";
-  ofs << "    \"hit_old_total\": " << summary_hit_old_total << ",\n";
-  ofs << "    \"qps_avg\": " << qps_summary.avg << ",\n";
-  ofs << "    \"qps_p5\": " << qps_summary.p5 << ",\n";
-  ofs << "    \"latency_avg_ms\": " << latency_summary.avg << ",\n";
-  ofs << "    \"latency_p95_ms\": " << latency_summary.p95 << ",\n";
-  ofs << "    \"latency_p99_ms\": " << latency_summary.p99 << ",\n";
-  ofs << "    \"e2e_latency_avg_ms\": " << e2e_latency_summary.avg << ",\n";
-  ofs << "    \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
-  ofs << "    \"update_throughput_avg_vecps\": "
-      << update_throughput_summary.avg << ",\n";
-  ofs << "    \"amortized_update_throughput_avg_vecps\": "
-      << amortized_update_throughput_summary.avg << ",\n";
-  ofs << "    \"merge_count\": " << merge_events.size() << ",\n";
-  ofs << "    \"global_rebuild_count\": " << global_rebuild_count << ",\n";
-  ofs << "    \"merge_nodes\": [";
-  for (size_t ni = 0; ni < merge_events.size(); ++ni) {
-    ofs << merge_events[ni].base_rows;
-    if (ni + 1 < merge_events.size()) ofs << ", ";
-  }
-  ofs << "],\n";
-  ofs << "    \"global_rebuild_nodes\": [";
-  for (size_t ni = 0; ni < global_rebuild_events.size(); ++ni) {
-    ofs << global_rebuild_events[ni].base_rows;
-    if (ni + 1 < global_rebuild_events.size()) ofs << ", ";
-  }
-  ofs << "],\n";
-  ofs << "    \"process_rss_bytes\": " << ReadProcStatusBytes("VmRSS:") << ",\n";
-  ofs << "    \"process_peak_rss_bytes\": " << ReadProcStatusBytes("VmHWM:") << "\n";
-  ofs << "  },\n";
-  ofs << "  \"route_execution\": {\n";
-  ofs << "    \"main_queries\": " << final_metrics.main_route_queries << ",\n";
-  ofs << "    \"frozen_delta_queries\": " << final_metrics.frozen_delta_route_queries << ",\n";
-  ofs << "    \"active_delta_queries\": " << final_metrics.active_delta_route_queries << "\n";
-  ofs << "  },\n";
-  ofs << "  \"pre_stream_metrics\": ";
-  if (pre_stream_metrics.has_value()) {
-    ofs << "{\n";
-    ofs << "    \"base_rows\": " << stream_start_idx << ",\n";
-    ofs << "    \"recall\": " << pre_stream_metrics->recall << ",\n";
-    ofs << "    \"avg_query_ms\": " << pre_stream_metrics->avg_query_ms << ",\n";
-    ofs << "    \"end_to_end_overhead_ms\": " << pre_stream_metrics->end_to_end_overhead_ms << ",\n";
-    ofs << "    \"avg_search_ms\": " << pre_stream_metrics->avg_search_ms << ",\n";
-    ofs << "    \"query_qps\": " << pre_stream_metrics->query_qps << ",\n";
-    ofs << "    \"avg_scanned\": " << pre_stream_metrics->scanned_avg << ",\n";
-    ofs << "    \"query_eval_ms\": " << pre_stream_metrics->query_eval_ms << ",\n";
-    ofs << "    \"gt_probed_rate\": " << pre_stream_metrics->gt_probed_rate << ",\n";
-    ofs << "    \"recall_on_probed_gt\": " << pre_stream_metrics->recall_on_probed_gt << ",\n";
-    ofs << "    \"exact_recall_on_probed_candidates\": "
-        << pre_stream_metrics->exact_recall_on_probed_candidates << ",\n";
-    ofs << "    \"avg_pq_rank_loss\": " << pre_stream_metrics->avg_pq_rank_loss << ",\n";
-    ofs << "    \"miss_not_probed\": " << pre_stream_metrics->miss_not_probed << ",\n";
-    ofs << "    \"miss_probed_filtered_by_pq\": "
-        << pre_stream_metrics->miss_probed_filtered_by_pq << ",\n";
-    ofs << "    \"pq_rank_loss_count\": " << pre_stream_metrics->pq_rank_loss_count << ",\n";
-    ofs << "    \"rerank_topk_main_total\": " << pre_stream_metrics->rerank_topk_main_total
-        << ",\n";
-    ofs << "    \"rerank_topk_delta_total\": " << pre_stream_metrics->rerank_topk_delta_total
-        << ",\n";
-    ofs << "    \"rerank_topk_main_ratio\": " << pre_stream_metrics->rerank_topk_main_ratio
-        << ",\n";
-    ofs << "    \"rerank_topk_delta_ratio\": " << pre_stream_metrics->rerank_topk_delta_ratio
-        << ",\n";
-    ofs << "    \"rerank_topk_main_avg\": " << pre_stream_metrics->rerank_topk_main_avg << ",\n";
-    ofs << "    \"rerank_topk_delta_avg\": " << pre_stream_metrics->rerank_topk_delta_avg
-        << ",\n";
-    ofs << "    \"worst_queries\": [\n";
-    for (size_t wi = 0; wi < pre_stream_metrics->worst_queries.size(); ++wi) {
-      ofs << "      \"" << pre_stream_metrics->worst_queries[wi] << "\"";
-      if (wi + 1 < pre_stream_metrics->worst_queries.size()) {
-        ofs << ",";
-      }
-      ofs << "\n";
-    }
-    ofs << "    ]\n";
-    ofs << "  },\n";
-  } else {
-    ofs << "null,\n";
-  }
-  ofs << "  \"online_pq\": {\n";
-  ofs << "    \"enabled\": " << (online_pq_options.enable ? "true" : "false") << ",\n";
-  ofs << "    \"batches\": " << online_pq_rollup.batches << ",\n";
-  ofs << "    \"warmup_batches\": " << online_pq_rollup.warmup_batches << ",\n";
-  ofs << "    \"triggered\": " << online_pq_rollup.triggered << ",\n";
-  ofs << "    \"updated\": " << online_pq_rollup.updated << ",\n";
-  ofs << "    \"reencoded\": " << online_pq_rollup.reencoded << ",\n";
-  ofs << "    \"avg_nqe\": " << online_avg_nqe << ",\n";
-  ofs << "    \"last_nqe\": " << online_pq_rollup.last_nqe_batch << ",\n";
-  ofs << "    \"last_warmup_batches_left\": " << online_pq_rollup.last_warmup_batches_left << ",\n";
-  ofs << "    \"avg_qe_ratio\": " << online_avg_qe_ratio << ",\n";
-  ofs << "    \"last_qe_ratio\": " << online_pq_rollup.last_qe_ratio << ",\n";
-  ofs << "    \"avg_codebook_drift\": " << online_avg_drift << ",\n";
-  ofs << "    \"last_codebook_drift\": " << online_pq_rollup.last_codebook_drift << ",\n";
-  ofs << "    \"updated_subspaces\": " << online_pq_rollup.updated_subspaces << ",\n";
-  ofs << "    \"updated_codewords\": " << online_pq_rollup.updated_codewords << "\n";
-  ofs << "  },\n";
-  ofs << "  \"merge_events\": [\n";
-  for (size_t i = 0; i < merge_events.size(); ++i) {
-    const auto& ev = merge_events[i];
-    ofs << "    {\n";
-    ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
-    ofs << "      \"frozen_rows\": " << ev.frozen_rows << ",\n";
-    ofs << "      \"patched_partitions\": " << ev.patched_partitions << ",\n";
-    ofs << "      \"append_parts\": " << ev.append_partitions << ",\n";
-    ofs << "      \"recluster_parts\": " << ev.recluster_partitions << ",\n";
-    ofs << "      \"moved_delta_ratio\": " << ev.moved_delta_ratio << ",\n";
-    ofs << "      \"avg_assignment_dist_ratio\": " << ev.avg_assignment_dist_ratio << ",\n";
-    ofs << "      \"max_assignment_dist_ratio\": " << ev.max_assignment_dist_ratio << ",\n";
-    ofs << "      \"imbalance_before\": " << ev.imbalance_before << ",\n";
-    ofs << "      \"imbalance_after\": " << ev.imbalance_after << ",\n";
-    ofs << "      \"main_non_empty_lists_after\": " << ev.main_non_empty_lists_after << ",\n";
-    ofs << "      \"main_max_list_after\": " << ev.main_max_list_after << ",\n";
-    ofs << "      \"main_avg_non_empty_list_after\": " << ev.main_avg_non_empty_list_after
-        << ",\n";
-    ofs << "      \"main_imbalance_after_real\": " << ev.main_imbalance_after_real << ",\n";
-    ofs << "      \"trigger_mode\": \"" << ev.trigger_mode << "\",\n";
-    ofs << "      \"trigger_reason\": \"" << ev.trigger_reason << "\",\n";
-    ofs << "      \"trigger_rows\": " << (ev.trigger_rows ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_structure\": " << (ev.trigger_structure ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_qe_ratio\": " << (ev.trigger_qe_ratio ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_drift\": " << (ev.trigger_drift ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_delta_main_ratio\": "
-        << (ev.trigger_delta_main_ratio ? "true" : "false") << ",\n";
-    ofs << "      \"trigger_imbalance\": " << (ev.trigger_imbalance ? "true" : "false")
-        << ",\n";
-    ofs << "      \"trigger_qe_ratio_value\": " << ev.trigger_qe_ratio_value << ",\n";
-    ofs << "      \"trigger_drift_value\": " << ev.trigger_drift_value << ",\n";
-    ofs << "      \"trigger_delta_main_ratio_value\": " << ev.trigger_delta_main_ratio_value
-        << ",\n";
-    ofs << "      \"trigger_imbalance_value\": " << ev.trigger_imbalance_value << ",\n";
-    ofs << "      \"trigger_active_rows\": " << ev.trigger_active_rows << ",\n";
-    ofs << "      \"trigger_active_nlist\": " << ev.trigger_active_nlist << ",\n";
-    ofs << "      \"trigger_active_non_empty_lists\": " << ev.trigger_active_non_empty_lists
-        << ",\n";
-    ofs << "      \"trigger_active_max_list\": " << ev.trigger_active_max_list << ",\n";
-    ofs << "      \"trigger_active_avg_non_empty_list\": "
-        << ev.trigger_active_avg_non_empty_list << ",\n";
-    ofs << "      \"merge_compute_ms\": " << ev.merge_compute_ms << ",\n";
-    ofs << "      \"codebook_rebuild_ms\": " << ev.codebook_rebuild_ms << ",\n";
-    ofs << "      \"assignment_distance_us\": "
-        << ev.profiling.merge_assignment_distance_us << ",\n";
-    ofs << "      \"assignment_top_r_us\": "
-        << ev.profiling.merge_assignment_top_r_us << ",\n";
-    ofs << "      \"assignment_balance_us\": "
-        << ev.profiling.merge_assignment_balance_us << ",\n";
-    ofs << "      \"fetch_main_records_us\": "
-        << ev.profiling.fetch_main_records_us << ",\n";
-    ofs << "      \"repartition_distance_us\": "
-        << ev.profiling.repartition_distance_us << ",\n";
-    ofs << "      \"repartition_sort_us\": " << ev.profiling.repartition_sort_us << ",\n";
-    ofs << "      \"prepare_pq_encode_us\": "
-        << ev.profiling.prepare_pq_encode_us << ",\n";
-    ofs << "      \"commit_us\": " << ev.profiling.commit_us << ",\n";
-    ofs << "      \"pq_code_assignment_us\": "
-        << ev.profiling.pq_code_assignment_us << ",\n";
-    ofs << "      \"pq_code_copy_or_reuse_us\": "
-        << ev.profiling.pq_code_copy_or_reuse_us << ",\n";
-    ofs << "      \"pq_list_flatten_us\": " << ev.profiling.pq_list_flatten_us << ",\n";
-    ofs << "      \"merge_ms\": " << ev.merge_ms << "\n";
-    ofs << "    }";
-    if (i + 1 < merge_events.size()) {
-      ofs << ",";
-    }
-    ofs << "\n";
-  }
-  ofs << "  ],\n";
-  ofs << "  \"global_rebuild_events\": [\n";
-  for (size_t i = 0; i < global_rebuild_events.size(); ++i) {
-    const auto& ev = global_rebuild_events[i];
-    ofs << "    {\n";
-    ofs << "      \"base_rows\": " << ev.base_rows << ",\n";
-    ofs << "      \"old_main_rows\": " << ev.old_main_rows << ",\n";
-    ofs << "      \"new_main_rows\": " << ev.new_main_rows << ",\n";
-    ofs << "      \"active_seed_rows\": " << ev.active_seed_rows << ",\n";
-    ofs << "      \"rebuild_count\": " << ev.rebuild_count << ",\n";
-    ofs << "      \"max_count\": " << ev.max_count << ",\n";
-    ofs << "      \"main_nlist\": " << ev.main_nlist << ",\n";
-    ofs << "      \"main_non_empty_lists\": " << ev.main_non_empty_lists << ",\n";
-    ofs << "      \"main_max_list_size\": " << ev.main_max_list_size << ",\n";
-    ofs << "      \"main_avg_non_empty_list_size\": " << ev.main_avg_non_empty_list_size
-        << ",\n";
-    ofs << "      \"trigger_main_rows\": " << (ev.trigger_main_rows ? "true" : "false")
-        << ",\n";
-    ofs << "      \"trigger_imbalance\": " << (ev.trigger_imbalance ? "true" : "false")
-        << ",\n";
-    ofs << "      \"trigger_main_rows_since_last_rebuild\": "
-        << ev.trigger_main_rows_since_last_rebuild << ",\n";
-    ofs << "      \"trigger_main_rows_threshold\": " << ev.trigger_main_rows_threshold << ",\n";
-    ofs << "      \"trigger_imbalance_threshold\": " << ev.trigger_imbalance_threshold
-        << ",\n";
-    ofs << "      \"threshold\": " << ev.threshold << ",\n";
-    ofs << "      \"main_imbalance_ratio\": " << ev.main_imbalance_ratio << ",\n";
-    ofs << "      \"reason\": \"" << ev.reason << "\",\n";
-    ofs << "      \"whitening_ms\": " << ev.whitening_ms << ",\n";
-    ofs << "      \"whitening_transform_ms\": " << ev.whitening_transform_ms << ",\n";
-    ofs << "      \"main_build_ms\": " << ev.main_build_ms << ",\n";
-    ofs << "      \"main_add_ms\": " << ev.main_add_ms << ",\n";
-    ofs << "      \"delta_seed_ms\": " << ev.delta_seed_ms << ",\n";
-    ofs << "      \"total_ms\": " << ev.total_ms << ",\n";
-    ofs << "      \"wall_total_ms\": " << ev.wall_total_ms << "\n";
-    ofs << "    }";
-    if (i + 1 < global_rebuild_events.size()) {
-      ofs << ",";
-    }
-    ofs << "\n";
-  }
-  ofs << "  ],\n";
-  ofs << "  \"snapshots\": [\n";
-  for (size_t i = 0; i < snapshots.size(); ++i) {
-    const auto& snap = snapshots[i];
-    ofs << "    {\n";
-    ofs << "      \"base_rows\": " << snap.base_rows << ",\n";
-    ofs << "      \"main_rows\": " << snap.main_rows << ",\n";
-    ofs << "      \"frozen_delta_docs\": " << snap.frozen_delta_docs << ",\n";
-    ofs << "      \"delta_rows\": " << snap.delta_rows << ",\n";
-    ofs << "      \"active_delta_docs\": " << snap.active_delta_docs << ",\n";
-    ofs << "      \"snapshot_rows\": " << snap.snapshot_rows << ",\n";
-    ofs << "      \"recall\": " << snap.recall << ",\n";
-    ofs << "      \"recall_new\": " << snap.recall_new << ",\n";
-    ofs << "      \"recall_old\": " << snap.recall_old << ",\n";
-    ofs << "      \"gt_new_ratio\": " << snap.gt_new_ratio << ",\n";
-    ofs << "      \"gt_new_total\": " << snap.gt_new_total << ",\n";
-    ofs << "      \"gt_old_total\": " << snap.gt_old_total << ",\n";
-    ofs << "      \"hit_new_total\": " << snap.hit_new_total << ",\n";
-    ofs << "      \"hit_old_total\": " << snap.hit_old_total << ",\n";
-    ofs << "      \"latency_ms\": " << snap.latency_ms << ",\n";
-    ofs << "      \"end_to_end_overhead_ms\": " << snap.end_to_end_overhead_ms << ",\n";
-    ofs << "      \"avg_search_ms\": " << snap.avg_search_ms << ",\n";
-    ofs << "      \"avg_scanned\": " << snap.avg_scanned << ",\n";
-    ofs << "      \"query_qps\": " << snap.query_qps << ",\n";
-    ofs << "      \"update_ms\": " << snap.update_ms << ",\n";
-    ofs << "      \"update_whitening_ms\": " << snap.update_whitening_ms << ",\n";
-    ofs << "      \"update_insert_ms\": " << snap.update_insert_ms << ",\n";
-    ofs << "      \"update_record_build_ms\": " << snap.update_record_build_ms << ",\n";
-    ofs << "      \"update_insert_encode_ms\": " << snap.update_insert_encode_ms << ",\n";
-    ofs << "      \"update_insert_commit_ms\": " << snap.update_insert_commit_ms << ",\n";
-    ofs << "      \"update_onlinepq_maintenance_ms\": "
-        << snap.update_onlinepq_maintenance_ms << ",\n";
-    ofs << "      \"update_delete_ms\": " << snap.update_delete_ms << ",\n";
-    ofs << "      \"update_codebook_update_ms\": "
-        << snap.update_codebook_update_ms << ",\n";
-    ofs << "      \"update_reencode_ms\": " << snap.update_reencode_ms << ",\n";
-    ofs << "      \"merge_compute_ms\": " << snap.merge_compute_ms << ",\n";
-    ofs << "      \"global_rebuild_ms\": " << snap.global_rebuild_ms << ",\n";
-    ofs << "      \"query_eval_ms\": " << snap.query_eval_ms << ",\n";
-    ofs << "      \"snapshot_total_ms\": " << snap.snapshot_total_ms << ",\n";
-    ofs << "      \"update_throughput_vecps\": " << snap.update_throughput_vecps << ",\n";
-    ofs << "      \"amortized_update_throughput_vecps\": "
-        << snap.amortized_update_throughput_vecps << ",\n";
-    ofs << "      \"nqe_batch\": " << snap.nqe_batch << ",\n";
-    ofs << "      \"qe_ratio\": " << snap.qe_ratio << ",\n";
-    ofs << "      \"codebook_drift\": " << snap.codebook_drift << ",\n";
-    ofs << "      \"pq_updated\": " << (snap.pq_updated ? "true" : "false") << ",\n";
-    ofs << "      \"in_warmup\": " << (snap.in_warmup ? "true" : "false") << ",\n";
-    ofs << "      \"warmup_batches_left\": " << snap.warmup_batches_left << ",\n";
-    ofs << "      \"gt_probed_rate\": " << snap.gt_probed_rate << ",\n";
-    ofs << "      \"recall_on_probed_gt\": " << snap.recall_on_probed_gt << ",\n";
-    ofs << "      \"exact_recall_on_probed_candidates\": "
-        << snap.exact_recall_on_probed_candidates << ",\n";
-    ofs << "      \"avg_pq_rank_loss\": " << snap.avg_pq_rank_loss << ",\n";
-    ofs << "      \"miss_not_probed\": " << snap.miss_not_probed << ",\n";
-    ofs << "      \"miss_probed_filtered_by_pq\": " << snap.miss_probed_filtered_by_pq << ",\n";
-    ofs << "      \"pq_rank_loss_count\": " << snap.pq_rank_loss_count << ",\n";
-    ofs << "      \"rerank_topk_main_total\": " << snap.rerank_topk_main_total << ",\n";
-    ofs << "      \"rerank_topk_delta_total\": " << snap.rerank_topk_delta_total << ",\n";
-    ofs << "      \"rerank_topk_main_ratio\": " << snap.rerank_topk_main_ratio << ",\n";
-    ofs << "      \"rerank_topk_delta_ratio\": " << snap.rerank_topk_delta_ratio << ",\n";
-    ofs << "      \"rerank_topk_main_avg\": " << snap.rerank_topk_main_avg << ",\n";
-    ofs << "      \"rerank_topk_delta_avg\": " << snap.rerank_topk_delta_avg << ",\n";
-    ofs << "      \"worst_queries\": [\n";
-    for (size_t wi = 0; wi < snap.worst_queries.size(); ++wi) {
-      ofs << "        \"" << snap.worst_queries[wi] << "\"";
-      if (wi + 1 < snap.worst_queries.size()) {
-        ofs << ",";
-      }
-      ofs << "\n";
-    }
-    ofs << "      ],\n";
-    ofs << "      \"minibatches\": [\n";
-    for (size_t j = 0; j < snap.minibatches.size(); ++j) {
-      const auto& mb = snap.minibatches[j];
-      ofs << "        {\n";
-      ofs << "          \"batch_id\": " << mb.batch_id << ",\n";
-      ofs << "          \"base_rows\": " << mb.base_rows << ",\n";
-      ofs << "          \"stream_rows_total\": " << mb.stream_rows_total << ",\n";
-      ofs << "          \"batch_rows\": " << mb.batch_rows << ",\n";
-      ofs << "          \"snapshot_rows_total\": " << mb.snapshot_rows_total << ",\n";
-      ofs << "          \"recall\": " << mb.recall << ",\n";
-      ofs << "          \"recall_new\": " << mb.recall_new << ",\n";
-      ofs << "          \"recall_old\": " << mb.recall_old << ",\n";
-      ofs << "          \"gt_new_ratio\": " << mb.gt_new_ratio << ",\n";
-      ofs << "          \"gt_new_total\": " << mb.gt_new_total << ",\n";
-      ofs << "          \"gt_old_total\": " << mb.gt_old_total << ",\n";
-      ofs << "          \"hit_new_total\": " << mb.hit_new_total << ",\n";
-      ofs << "          \"hit_old_total\": " << mb.hit_old_total << ",\n";
-      ofs << "          \"latency_ms\": " << mb.latency_ms << ",\n";
-      ofs << "          \"end_to_end_overhead_ms\": " << mb.end_to_end_overhead_ms << ",\n";
-      ofs << "          \"avg_search_ms\": " << mb.avg_search_ms << ",\n";
-      ofs << "          \"avg_scanned\": " << mb.avg_scanned << ",\n";
-      ofs << "          \"query_qps\": " << mb.query_qps << ",\n";
-      ofs << "          \"update_ms\": " << mb.update_ms << ",\n";
-      ofs << "          \"update_whitening_ms\": " << mb.update_whitening_ms << ",\n";
-      ofs << "          \"update_insert_ms\": " << mb.update_insert_ms << ",\n";
-      ofs << "          \"update_record_build_ms\": " << mb.update_record_build_ms << ",\n";
-      ofs << "          \"update_insert_encode_ms\": " << mb.update_insert_encode_ms << ",\n";
-      ofs << "          \"update_insert_commit_ms\": " << mb.update_insert_commit_ms << ",\n";
-      ofs << "          \"update_onlinepq_maintenance_ms\": "
-          << mb.update_onlinepq_maintenance_ms << ",\n";
-      ofs << "          \"update_delete_ms\": " << mb.update_delete_ms << ",\n";
-      ofs << "          \"update_codebook_update_ms\": "
-          << mb.update_codebook_update_ms << ",\n";
-      ofs << "          \"update_reencode_ms\": " << mb.update_reencode_ms << ",\n";
-      ofs << "          \"update_throughput_vecps\": " << mb.update_throughput_vecps << ",\n";
-      ofs << "          \"query_eval_ms\": " << mb.query_eval_ms << ",\n";
-      ofs << "          \"nqe_batch\": " << mb.nqe_batch << ",\n";
-      ofs << "          \"qe_ratio\": " << mb.qe_ratio << ",\n";
-      ofs << "          \"codebook_drift\": " << mb.codebook_drift << ",\n";
-      ofs << "          \"pq_updated\": " << (mb.pq_updated ? "true" : "false") << ",\n";
-      ofs << "          \"in_warmup\": " << (mb.in_warmup ? "true" : "false") << ",\n";
-      ofs << "          \"warmup_batches_left\": " << mb.warmup_batches_left << ",\n";
-      ofs << "          \"gt_probed_rate\": " << mb.gt_probed_rate << ",\n";
-      ofs << "          \"recall_on_probed_gt\": " << mb.recall_on_probed_gt << ",\n";
-      ofs << "          \"exact_recall_on_probed_candidates\": "
-          << mb.exact_recall_on_probed_candidates << ",\n";
-      ofs << "          \"avg_pq_rank_loss\": " << mb.avg_pq_rank_loss << ",\n";
-      ofs << "          \"miss_not_probed\": " << mb.miss_not_probed << ",\n";
-      ofs << "          \"miss_probed_filtered_by_pq\": " << mb.miss_probed_filtered_by_pq << ",\n";
-      ofs << "          \"pq_rank_loss_count\": " << mb.pq_rank_loss_count << "\n";
-      ofs << "        }";
-      if (j + 1 < snap.minibatches.size()) {
-        ofs << ",";
-      }
-      ofs << "\n";
-    }
-    ofs << "      ]";
-    if (snap.latency_debug.has_value()) {
-      const auto& debug = snap.latency_debug.value();
-      ofs << ",\n";
-      ofs << "      \"latency_debug\": {\n";
-      ofs << "        \"route_count\": " << debug.route_count << ",\n";
-      ofs << "        \"active_window_ready\": " << (snap.active_window_ready ? "true" : "false")
-          << ",\n";
-      ofs << "        \"will_commit_merge\": " << (snap.will_commit_merge ? "true" : "false")
-          << ",\n";
-      ofs << "        \"merge_ms\": {\n";
-      ofs << "          \"avg\": " << debug.merge_ms.avg << ",\n";
-      ofs << "          \"p50\": " << debug.merge_ms.p50 << ",\n";
-      ofs << "          \"p90\": " << debug.merge_ms.p90 << ",\n";
-      ofs << "          \"p99\": " << debug.merge_ms.p99 << ",\n";
-      ofs << "          \"max\": " << debug.merge_ms.max << "\n";
-      ofs << "        },\n";
-      ofs << "        \"max_route_search_ms\": {\n";
-      ofs << "          \"avg\": " << debug.max_route_search_ms.avg << ",\n";
-      ofs << "          \"p50\": " << debug.max_route_search_ms.p50 << ",\n";
-      ofs << "          \"p90\": " << debug.max_route_search_ms.p90 << ",\n";
-      ofs << "          \"p99\": " << debug.max_route_search_ms.p99 << ",\n";
-      ofs << "          \"max\": " << debug.max_route_search_ms.max << "\n";
-      ofs << "        },\n";
-      ofs << "        \"routes\": [\n";
-      for (size_t ri = 0; ri < debug.routes.size(); ++ri) {
-        const auto& route = debug.routes[ri];
-        ofs << "          {\n";
-        ofs << "            \"name\": \"" << route.route_name << "\",\n";
-        ofs << "            \"from_new\": " << static_cast<uint32_t>(route.from_new) << ",\n";
-        ofs << "            \"search_ms\": {\n";
-        ofs << "              \"avg\": " << route.search_ms.avg << ",\n";
-        ofs << "              \"p50\": " << route.search_ms.p50 << ",\n";
-        ofs << "              \"p90\": " << route.search_ms.p90 << ",\n";
-        ofs << "              \"p99\": " << route.search_ms.p99 << ",\n";
-        ofs << "              \"max\": " << route.search_ms.max << "\n";
-        ofs << "            },\n";
-        ofs << "            \"scanned_candidates\": {\n";
-        ofs << "              \"avg\": " << route.scanned_candidates.avg << ",\n";
-        ofs << "              \"p50\": " << route.scanned_candidates.p50 << ",\n";
-        ofs << "              \"p90\": " << route.scanned_candidates.p90 << ",\n";
-        ofs << "              \"p99\": " << route.scanned_candidates.p99 << ",\n";
-        ofs << "              \"max\": " << route.scanned_candidates.max << "\n";
-        ofs << "            }\n";
-        ofs << "          }";
-        if (ri + 1 < debug.routes.size()) {
-          ofs << ",";
-        }
-        ofs << "\n";
-      }
-      ofs << "        ],\n";
-      ofs << "        \"slow_queries\": [\n";
-      for (size_t si = 0; si < debug.slow_queries.size(); ++si) {
-        const auto& slow = debug.slow_queries[si];
-        ofs << "          {\n";
-        ofs << "            \"query_id\": " << slow.query_id << ",\n";
-        ofs << "            \"total_search_ms\": " << slow.total_search_ms << ",\n";
-        ofs << "            \"merge_ms\": " << slow.merge_ms << ",\n";
-        ofs << "            \"max_route_search_ms\": " << slow.max_route_search_ms << ",\n";
-        ofs << "            \"merged_scanned\": " << slow.merged_scanned << ",\n";
-        ofs << "            \"route_search_ms\": [";
-        for (size_t rsi = 0; rsi < slow.route_search_ms.size(); ++rsi) {
-          ofs << slow.route_search_ms[rsi];
-          if (rsi + 1 < slow.route_search_ms.size()) {
-            ofs << ", ";
-          }
-        }
-        ofs << "],\n";
-        ofs << "            \"route_scanned_candidates\": [";
-        for (size_t rsi = 0; rsi < slow.route_scanned_candidates.size(); ++rsi) {
-          ofs << slow.route_scanned_candidates[rsi];
-          if (rsi + 1 < slow.route_scanned_candidates.size()) {
-            ofs << ", ";
-          }
-        }
-        ofs << "]\n";
-        ofs << "          }";
-        if (si + 1 < debug.slow_queries.size()) {
-          ofs << ",";
-        }
-        ofs << "\n";
-      }
-      ofs << "        ],\n";
-      ofs << "        \"partition_debug\": [\n";
-      for (size_t pi = 0; pi < snap.partition_debug.size(); ++pi) {
-        const auto& part = snap.partition_debug[pi];
-        ofs << "          {\n";
-        ofs << "            \"route\": \"" << part.route_name << "\",\n";
-        ofs << "            \"nlist\": " << part.nlist << ",\n";
-        ofs << "            \"non_empty_lists\": " << part.non_empty_lists << ",\n";
-        ofs << "            \"total_docs\": " << part.total_docs << ",\n";
-        ofs << "            \"list_size\": {\n";
-        ofs << "              \"avg\": " << part.list_size.avg << ",\n";
-        ofs << "              \"p50\": " << part.list_size.p50 << ",\n";
-        ofs << "              \"p90\": " << part.list_size.p90 << ",\n";
-        ofs << "              \"p99\": " << part.list_size.p99 << ",\n";
-        ofs << "              \"max\": " << part.list_size.max << "\n";
-        ofs << "            }\n";
-        ofs << "          }";
-        if (pi + 1 < snap.partition_debug.size()) {
-          ofs << ",";
-        }
-        ofs << "\n";
-      }
-      ofs << "        ]\n";
-      ofs << "      }\n";
-    } else {
-      ofs << "\n";
-    }
-    ofs << "    }";
-    if (i + 1 < snapshots.size()) {
-      ofs << ",";
-    }
-    ofs << "\n";
-  }
-  ofs << "  ]\n";
-  ofs << "}\n";
-
   Status memory_write_status = write_memory_trace();
   if (!memory_write_status.ok()) {
     std::cerr << memory_write_status.ToString() << std::endl;
     return 1;
   }
-  const Status curve_status = write_query_recall_curve();
+  const Status curve_status =
+      ann::eval::WriteQueryRecallCurve(result_path, query_recall_curve);
   if (!curve_status.ok()) {
     std::cerr << curve_status.ToString() << std::endl;
     return 1;

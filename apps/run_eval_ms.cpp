@@ -34,13 +34,17 @@
 #include "common/timer.h"
 #include "common/types.h"
 #include "eval_memory.h"
+#include "eval/eval_counter.h"
+#include "eval/eval_output.h"
 #include "eval/metrics.h"
+#include "eval/eval_type.h"
 #include "index/ivf.h"
 #include "index/merge.h"
 #include "search/hybrid_search.h"
 #include "whitening/whitening.h"
 
 using namespace ann;
+using namespace ann::eval::run_eval_ms;
 
 namespace {
 
@@ -75,81 +79,26 @@ void EnsureWhitenedCapacity(MatrixRM* matrix,
                              static_cast<Eigen::Index>(dim));
 }
 
-struct WorkloadOp {
-  uint32_t op_id{0};
-  std::string operation;
-  uint32_t start{0};
-  uint32_t end{0};
-  uint32_t active_rows{0};
-  int32_t round{-1};
-  int32_t cluster{-1};
-  uint32_t source_op_id{0};
-};
-
-struct Workload {
-  std::string path;
-  std::string dataset;
-  uint32_t num_vectors{0};
-  uint32_t dim{0};
-  std::vector<WorkloadOp> operations;
-};
-
-struct DistributionStatsLite {
-  double avg{0.0};
-  double p5{0.0};
-  double p50{0.0};
-  double p95{0.0};
-  double p99{0.0};
-  double min{0.0};
-  double max{0.0};
-};
-
-double PercentileValue(std::vector<double> values, double q) {
+double PercentileValueSorted(const std::vector<double>& values, double q) {
   if (values.empty()) return 0.0;
-  std::sort(values.begin(), values.end());
   const double idx = q * static_cast<double>(values.size() - 1);
-  size_t lo = static_cast<size_t>(std::floor(idx));
-  size_t hi = static_cast<size_t>(std::ceil(idx));
-  if (hi >= values.size()) hi = values.size() - 1;
-  const double frac = idx - static_cast<double>(lo);
-  return values[lo] + (values[hi] - values[lo]) * frac;
+  return values[static_cast<size_t>(idx)];
 }
 
 DistributionStatsLite SummarizeValues(const std::vector<double>& values) {
   DistributionStatsLite out;
   if (values.empty()) return out;
-  out.avg = std::accumulate(values.begin(), values.end(), 0.0) /
-            static_cast<double>(values.size());
-  out.p5 = PercentileValue(values, 0.05);
-  out.p50 = PercentileValue(values, 0.50);
-  out.p95 = PercentileValue(values, 0.95);
-  out.p99 = PercentileValue(values, 0.99);
-  out.min = *std::min_element(values.begin(), values.end());
-  out.max = *std::max_element(values.begin(), values.end());
+  std::vector<double> sorted = values;
+  std::sort(sorted.begin(), sorted.end());
+  out.avg = std::accumulate(sorted.begin(), sorted.end(), 0.0) /
+            static_cast<double>(sorted.size());
+  out.p5 = PercentileValueSorted(sorted, 0.05);
+  out.p50 = PercentileValueSorted(sorted, 0.50);
+  out.p95 = PercentileValueSorted(sorted, 0.95);
+  out.p99 = PercentileValueSorted(sorted, 0.99);
+  out.min = sorted.front();
+  out.max = sorted.back();
   return out;
-}
-
-uint64_t ReadProcStatusBytes(const std::string& key) {
-  std::ifstream ifs("/proc/self/status");
-  if (!ifs) return 0;
-  std::string line;
-  while (std::getline(ifs, line)) {
-    if (line.rfind(key, 0) != 0) continue;
-    std::istringstream iss(line.substr(key.size()));
-    uint64_t kb = 0;
-    std::string unit;
-    iss >> kb >> unit;
-    return kb * 1024ull;
-  }
-  return 0;
-}
-
-uint32_t RuntimeMaxThreads() {
-#ifdef _OPENMP
-  return static_cast<uint32_t>(std::max(1, omp_get_max_threads()));
-#else
-  return 1;
-#endif
 }
 
 float SquaredL2FromNormDot(float a_norm, float b_norm, float dot) {
@@ -192,49 +141,6 @@ Result<std::string> ResolveFileWithSuffix(const std::string& path_or_dir,
   return Status::InvalidArgument("Unsupported path type: " + path_or_dir);
 }
 
-std::filesystem::path BuildDefaultResultPath(const std::string& config_path,
-                                             const std::string& base_path) {
-  namespace fs = std::filesystem;
-  const std::string config_name = fs::path(config_path).stem().string();
-  std::string dataset_name = fs::path(base_path).parent_path().filename().string();
-  if (dataset_name.empty()) dataset_name = fs::path(base_path).stem().string();
-  std::string metric_name = "default";
-  fs::path p(base_path);
-  std::vector<std::string> parts;
-  for (const auto& part : p) parts.push_back(part.string());
-  for (size_t i = 0; i < parts.size(); ++i) {
-    if (parts[i] == "data" && i + 2 < parts.size()) {
-      dataset_name = parts[i + 1];
-      std::string metric;
-      for (size_t j = i + 2; j + 1 < parts.size(); ++j) {
-        if (!metric.empty()) metric += "_";
-        metric += parts[j];
-      }
-      if (!metric.empty()) metric_name = metric;
-      break;
-    }
-  }
-  fs::path dir = fs::path("result") / dataset_name / metric_name / config_name;
-  std::error_code ec;
-  fs::create_directories(dir, ec);
-  return dir / "online_eval.json";
-}
-
-struct DeltaShard {
-  std::shared_ptr<IVFIndex> ivf;
-  VersionSet versions{};
-  uint32_t rows{0};
-  uint32_t shard_id{0};
-};
-
-struct SearchRoute {
-  std::shared_ptr<IVFIndex> ivf;
-  VersionSet versions{};
-  uint8_t from_new{0};
-  std::string name;
-  uint32_t rows{0};
-};
-
 uint32_t ResolveRouteExactRerankCandidates(const Config& config,
                                            const SearchRoute& route) {
   uint32_t candidates = config.exact_rerank_candidates_per_route;
@@ -251,72 +157,6 @@ uint32_t ResolveRouteExactRerankCandidates(const Config& config,
 
   return std::max<uint32_t>(1u, candidates);
 }
-
-struct EvalMetricsLite {
-  double recall{0.0};
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-  double avg_query_ms{0.0};
-  double p50_query_ms{0.0};
-  double p99_query_ms{0.0};
-  double qps{0.0};
-  double avg_scanned{0.0};
-  double scan_ratio{0.0};
-  double scanned_per_topk{0.0};
-  uint32_t query_count{0};
-};
-
-struct SnapshotLite {
-  uint32_t search_id{0};
-  uint32_t op_id{0};
-  uint32_t active_rows{0};
-  uint32_t main_rows{0};
-  uint32_t active_delta_rows{0};
-  uint32_t frozen_delta_rows{0};
-  int32_t round{-1};
-  int32_t cluster{-1};
-  double recall{0.0};
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-  double avg_query_ms{0.0};
-  double p50_query_ms{0.0};
-  double p99_query_ms{0.0};
-  double qps{0.0};
-  double avg_scanned{0.0};
-  double scan_ratio{0.0};
-  double scanned_per_topk{0.0};
-  double imbalance_ratio{0.0};
-  double cumulative_update_ms{0.0};
-  double cumulative_merge_ms{0.0};
-  double cumulative_global_rebuild_ms{0.0};
-  double snapshot_rows{0.0};
-  double snapshot_maintenance_ms{0.0};
-  double maintenance_ms_per_vector{0.0};
-  double update_throughput_vecps{0.0};
-  double amortized_update_throughput_vecps{0.0};
-  bool skipped_warmup{false};
-};
-
-
-struct RecallAgeMetrics {
-  double recall_new{0.0};
-  double recall_old{0.0};
-  double gt_new_ratio{0.0};
-  uint64_t gt_new_total{0};
-  uint64_t gt_old_total{0};
-  uint64_t hit_new_total{0};
-  uint64_t hit_old_total{0};
-};
 
 RecallAgeMetrics ComputeRecallByRecentInsert(const std::vector<std::vector<DocId>>& gt,
                                              const std::vector<std::vector<DocId>>& pred,
@@ -365,11 +205,6 @@ RecallAgeMetrics ComputeRecallByRecentInsert(const std::vector<std::vector<DocId
                          : 0.0;
   return out;
 }
-
-struct ExactDocCandidate {
-  float dist{0.0f};
-  DocId doc_id{0};
-};
 
 bool ExactDocLess(const ExactDocCandidate& a, const ExactDocCandidate& b) {
   if (a.dist != b.dist) return a.dist < b.dist;
@@ -981,7 +816,13 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
   std::vector<std::vector<SearchResult>> route_results(
       static_cast<size_t>(nq), std::vector<SearchResult>(static_cast<size_t>(route_count)));
   std::vector<double> query_ms(static_cast<size_t>(nq), 0.0);
-  std::vector<uint64_t> scanned_counts(static_cast<size_t>(nq), 0);
+  std::vector<double> pq_lut_build_us(static_cast<size_t>(nq), 0.0);
+  std::vector<double> pq_adc_scan_us(static_cast<size_t>(nq), 0.0);
+  std::vector<double> scanned_counts(static_cast<size_t>(nq), 0.0);
+  std::vector<uint64_t> rerank_main_counts(
+      config.enable_rerank_source_diag ? static_cast<size_t>(nq) : 0, 0);
+  std::vector<uint64_t> rerank_delta_counts(
+      config.enable_rerank_source_diag ? static_cast<size_t>(nq) : 0, 0);
   double slowest_route_wall_ms = 0.0;
 
   for (uint32_t ri = 0; ri < route_count; ++ri) {
@@ -994,7 +835,7 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
         route_nprobes[static_cast<size_t>(ri)],
         route.versions,
         route.from_new,
-        false);
+        config.enable_miss_diag);
     const double route_elapsed = route_timer.ElapsedMillis();
     slowest_route_wall_ms = std::max(slowest_route_wall_ms, route_elapsed);
   
@@ -1007,6 +848,10 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
     }
   
     for (uint32_t qi = 0; qi < nq; ++qi) {
+      pq_lut_build_us[static_cast<size_t>(qi)] +=
+          batch[static_cast<size_t>(qi)].pq_lut_build_us;
+      pq_adc_scan_us[static_cast<size_t>(qi)] +=
+          batch[static_cast<size_t>(qi)].pq_adc_scan_us;
       route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)] =
           std::move(batch[static_cast<size_t>(qi)]);
     }
@@ -1023,9 +868,9 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
 #endif
   for (int64_t qi64 = 0; qi64 < static_cast<int64_t>(nq); ++qi64) {
     const uint32_t qi = static_cast<uint32_t>(qi64);
-    Timer query_timer;
     const Eigen::VectorXf query =
         queries_whitened.row(static_cast<Eigen::Index>(qi)).transpose();
+    Timer query_timer;
     SearchResult merged = MergeTopKPrefix(route_results[static_cast<size_t>(qi)],
                                           params.topk,
                                           enable_exact_rerank,
@@ -1034,15 +879,26 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
                                           base_whitened,
                                           base_norms,
                                           seen_rows);
+    const double query_merge_ms = query_timer.ElapsedMillis();
     std::vector<DocId> row;
     row.reserve(merged.topk.size());
     for (const auto& cand : merged.topk) {
       row.push_back(cand.doc_id);
     }
     pred[static_cast<size_t>(qi)] = std::move(row);
-    scanned_counts[static_cast<size_t>(qi)] = merged.scanned_candidates;
+    scanned_counts[static_cast<size_t>(qi)] =
+        static_cast<double>(merged.scanned_candidates);
     query_ms[static_cast<size_t>(qi)] =
-        per_query_search_ms + query_timer.ElapsedMillis();
+        per_query_search_ms + query_merge_ms;
+    if (config.enable_rerank_source_diag) {
+      for (const auto& candidate : merged.topk) {
+        if (candidate.from_new == 1) {
+          rerank_delta_counts[static_cast<size_t>(qi)]++;
+        } else {
+          rerank_main_counts[static_cast<size_t>(qi)]++;
+        }
+      }
+    }
   }
   const double merge_wall_ms = merge_wall_timer.ElapsedMillis();
   // Qw is transformed once when the whitening version is built/rebuilt, so
@@ -1050,16 +906,169 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
   const double whitening_wall_ms = 0.0;
   const double query_wall_ms =
       whitening_wall_ms + slowest_route_wall_ms + merge_wall_ms;
-  const uint64_t scanned_total =
-      std::accumulate(scanned_counts.begin(), scanned_counts.end(), uint64_t{0});
+  const double scanned_total =
+      std::accumulate(scanned_counts.begin(), scanned_counts.end(), 0.0);
 
   auto recall_res = RecallAtK(gt, pred, config.topk);
   if (!recall_res.ok()) return recall_res.status();
   const RecallAgeMetrics age_metrics =
       ComputeRecallByRecentInsert(gt, pred, new_begin, new_end, seen_rows);
   const DistributionStatsLite query_stats = SummarizeValues(query_ms);
+  const DistributionStatsLite scanned_stats = SummarizeValues(scanned_counts);
+  const double avg_search_ms = nq > 0
+      ? std::accumulate(query_ms.begin(), query_ms.end(), 0.0) / static_cast<double>(nq)
+      : 0.0;
+  const double avg_pq_lut_build_us = nq > 0
+      ? std::accumulate(pq_lut_build_us.begin(), pq_lut_build_us.end(), 0.0) /
+            static_cast<double>(nq)
+      : 0.0;
+  const double avg_pq_adc_scan_us = nq > 0
+      ? std::accumulate(pq_adc_scan_us.begin(), pq_adc_scan_us.end(), 0.0) /
+            static_cast<double>(nq)
+      : 0.0;
+  const double avg_rerank_main = nq > 0
+      ? static_cast<double>(std::accumulate(rerank_main_counts.begin(), rerank_main_counts.end(),
+                                           uint64_t{0})) / static_cast<double>(nq)
+      : 0.0;
+  const double avg_rerank_delta = nq > 0
+      ? static_cast<double>(std::accumulate(rerank_delta_counts.begin(), rerank_delta_counts.end(),
+                                           uint64_t{0})) / static_cast<double>(nq)
+      : 0.0;
+  const uint64_t rerank_main_total = std::accumulate(
+      rerank_main_counts.begin(), rerank_main_counts.end(), uint64_t{0});
+  const uint64_t rerank_delta_total = std::accumulate(
+      rerank_delta_counts.begin(), rerank_delta_counts.end(), uint64_t{0});
+  uint64_t gt_total = 0;
+  uint64_t gt_probed = 0;
+  uint64_t gt_hit_and_probed = 0;
+  uint64_t miss_not_probed = 0;
+  uint64_t miss_pq_filtered = 0;
+  uint64_t pq_rank_loss_count = 0;
+  double exact_recall_sum = 0.0;
+  double pq_rank_loss_sum = 0.0;
+  std::vector<std::pair<double, std::pair<uint32_t, uint32_t>>> worst_order;
+  std::vector<std::string> worst_queries;
+  if (config.enable_miss_diag) {
+    worst_order.reserve(nq);
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+      const auto& gt_row = gt[static_cast<size_t>(qi)];
+      if (gt_row.empty()) continue;
+      const auto& pred_row = pred[static_cast<size_t>(qi)];
+      std::unordered_set<DocId> pred_set(pred_row.begin(), pred_row.end());
+      size_t scanned_reserve = 0;
+      for (uint32_t ri = 0; ri < route_count; ++ri) {
+        scanned_reserve += route_results[static_cast<size_t>(qi)]
+                                       [static_cast<size_t>(ri)]
+                                           .scanned_doc_ids.size();
+      }
+      std::unordered_map<DocId, float> approx_by_doc;
+      approx_by_doc.reserve(scanned_reserve * 2 + 1);
+      for (uint32_t ri = 0; ri < route_count; ++ri) {
+        const auto& result = route_results[static_cast<size_t>(qi)][static_cast<size_t>(ri)];
+        const size_t count = std::min(result.scanned_doc_ids.size(),
+                                      result.scanned_approx_dists.size());
+        for (size_t i = 0; i < count; ++i) {
+          const DocId doc = result.scanned_doc_ids[i];
+          const float distance = result.scanned_approx_dists[i];
+          const auto it = approx_by_doc.find(doc);
+          if (it == approx_by_doc.end() || distance < it->second) {
+            approx_by_doc[doc] = distance;
+          }
+        }
+      }
+
+      std::vector<std::pair<float, DocId>> approx_ranked;
+      std::vector<std::pair<float, DocId>> exact_ranked;
+      approx_ranked.reserve(approx_by_doc.size());
+      exact_ranked.reserve(approx_by_doc.size());
+      const Eigen::VectorXf query =
+          queries_whitened.row(static_cast<Eigen::Index>(qi)).transpose();
+      const float query_norm = query.squaredNorm();
+      for (const auto& entry : approx_by_doc) {
+        approx_ranked.emplace_back(entry.second, entry.first);
+        const Eigen::Index doc = static_cast<Eigen::Index>(entry.first);
+        const float dot = base_whitened.row(doc).dot(query);
+        exact_ranked.emplace_back(
+            SquaredL2FromNormDot(query_norm, base_norms(doc), dot), entry.first);
+      }
+      const auto by_distance = [](const auto& left, const auto& right) {
+        return left.first < right.first;
+      };
+      std::sort(approx_ranked.begin(), approx_ranked.end(), by_distance);
+      std::sort(exact_ranked.begin(), exact_ranked.end(), by_distance);
+      std::unordered_map<DocId, uint32_t> approx_rank;
+      std::unordered_map<DocId, uint32_t> exact_rank;
+      approx_rank.reserve(approx_ranked.size() * 2 + 1);
+      exact_rank.reserve(exact_ranked.size() * 2 + 1);
+      for (size_t i = 0; i < approx_ranked.size(); ++i) {
+        approx_rank[approx_ranked[i].second] = static_cast<uint32_t>(i + 1);
+      }
+      for (size_t i = 0; i < exact_ranked.size(); ++i) {
+        exact_rank[exact_ranked[i].second] = static_cast<uint32_t>(i + 1);
+      }
+      std::unordered_set<DocId> exact_topk;
+      const size_t exact_count = std::min<size_t>(config.topk, exact_ranked.size());
+      exact_topk.reserve(exact_count * 2 + 1);
+      for (size_t i = 0; i < exact_count; ++i) exact_topk.insert(exact_ranked[i].second);
+      uint32_t exact_hits = 0;
+      uint32_t pred_hits = 0;
+      uint32_t query_misses = 0;
+      for (DocId doc : gt_row) {
+        if (exact_topk.find(doc) != exact_topk.end()) ++exact_hits;
+        const bool hit = pred_set.find(doc) != pred_set.end();
+        if (hit) ++pred_hits;
+        gt_total++;
+        const auto found = approx_rank.find(doc);
+        const bool probed = found != approx_rank.end();
+        if (probed) {
+          ++gt_probed;
+          if (hit) ++gt_hit_and_probed;
+        }
+        if (!hit) {
+          ++query_misses;
+          if (!probed) {
+            ++miss_not_probed;
+          } else {
+            ++miss_pq_filtered;
+            const auto exact_found = exact_rank.find(doc);
+            if (exact_found != exact_rank.end()) {
+              const uint32_t loss = found->second > exact_found->second
+                  ? found->second - exact_found->second
+                  : 0u;
+              pq_rank_loss_sum += static_cast<double>(loss);
+              ++pq_rank_loss_count;
+            }
+          }
+        }
+      }
+      exact_recall_sum += static_cast<double>(exact_hits) /
+                          static_cast<double>(gt_row.size());
+      const double query_recall = static_cast<double>(pred_hits) /
+                                  static_cast<double>(gt_row.size());
+      if (query_misses > 0) {
+        worst_order.push_back({query_recall, {query_misses, qi}});
+      }
+    }
+    std::sort(worst_order.begin(), worst_order.end(), [](const auto& left, const auto& right) {
+      if (left.first != right.first) return left.first < right.first;
+      return left.second.first > right.second.first;
+    });
+    const size_t worst_count = std::min<size_t>(10, worst_order.size());
+    worst_queries.reserve(worst_count);
+    for (size_t i = 0; i < worst_count; ++i) {
+      const auto& item = worst_order[i];
+      const uint32_t query_id = item.second.second;
+      const uint32_t misses = item.second.first;
+      const auto& gt_row = gt[static_cast<size_t>(query_id)];
+      worst_queries.push_back("qid=" + std::to_string(query_id) +
+                              ", recall=" + std::to_string(item.first) +
+                              ", misses=" + std::to_string(misses) +
+                              ", gt=" + std::to_string(gt_row.size()));
+    }
+  }
 
   EvalMetricsLite m;
+  m.recall_available = true;
   m.recall = recall_res.value();
   m.recall_new = age_metrics.recall_new;
   m.recall_old = age_metrics.recall_old;
@@ -1070,206 +1079,73 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
   m.hit_old_total = age_metrics.hit_old_total;
   m.query_count = nq;
   m.avg_query_ms =
-      nq > 0 ? query_wall_ms / static_cast<double>(nq) : 0.0;
-  m.p50_query_ms = query_stats.p50;
-  m.p99_query_ms = query_stats.p99;
+      nq > 0 ? slowest_route_wall_ms / static_cast<double>(nq) : 0.0;
+  m.avg_search_ms = avg_search_ms;
+  m.end_to_end_overhead_ms = avg_search_ms;
+  m.search_p50 = query_stats.p50;
+  m.search_p99 = query_stats.p99;
+  m.total_p50 = query_stats.p50;
+  m.total_p99 = query_stats.p99;
+  m.p50_query_ms = m.search_p50;
+  m.p99_query_ms = m.search_p99;
+  m.avg_pq_lut_build_us = avg_pq_lut_build_us;
+  m.avg_pq_adc_scan_us = avg_pq_adc_scan_us;
   m.qps =
       query_wall_ms > 0.0 ? (1000.0 * static_cast<double>(nq) / query_wall_ms) : 0.0;
   m.avg_scanned =
       nq > 0 ? static_cast<double>(scanned_total) / static_cast<double>(nq)
              : 0.0;
+  m.scanned_p50 = scanned_stats.p50;
+  m.scanned_p99 = scanned_stats.p99;
+  m.scanned_max = scanned_stats.max;
   m.scan_ratio =
       seen_rows > 0 ? m.avg_scanned / static_cast<double>(seen_rows) : 0.0;
   m.scanned_per_topk =
       config.topk > 0 ? m.avg_scanned / static_cast<double>(config.topk) : 0.0;
+  m.query_eval_ms = query_wall_ms;
+  m.main_route_queries = nq;
+  for (const auto& route : routes) {
+    if (route.name == "active_delta") m.active_delta_route_queries = nq;
+    if (route.name == "frozen_delta") m.frozen_delta_route_queries = nq;
+  }
+  if (config.enable_rerank_source_diag) {
+    m.rerank_topk_main_total = rerank_main_total;
+    m.rerank_topk_delta_total = rerank_delta_total;
+    const uint64_t rerank_total = rerank_main_total + rerank_delta_total;
+    if (rerank_total > 0) {
+      m.rerank_topk_main_ratio = static_cast<double>(rerank_main_total) /
+                                 static_cast<double>(rerank_total);
+      m.rerank_topk_delta_ratio = static_cast<double>(rerank_delta_total) /
+                                  static_cast<double>(rerank_total);
+    }
+    m.rerank_topk_main_avg = avg_rerank_main;
+    m.rerank_topk_delta_avg = avg_rerank_delta;
+  }
+  if (config.enable_miss_diag) {
+    m.gt_probed_rate = gt_total > 0
+        ? static_cast<double>(gt_probed) / static_cast<double>(gt_total)
+        : 0.0;
+    m.recall_on_probed_gt = gt_probed > 0
+        ? static_cast<double>(gt_hit_and_probed) / static_cast<double>(gt_probed)
+        : 0.0;
+    m.exact_recall_on_probed_candidates = nq > 0
+        ? exact_recall_sum / static_cast<double>(nq)
+        : 0.0;
+    m.avg_pq_rank_loss = pq_rank_loss_count > 0
+        ? pq_rank_loss_sum / static_cast<double>(pq_rank_loss_count)
+        : 0.0;
+    m.miss_not_probed = static_cast<uint32_t>(std::min<uint64_t>(
+        miss_not_probed, std::numeric_limits<uint32_t>::max()));
+    m.miss_probed_filtered_by_pq = static_cast<uint32_t>(std::min<uint64_t>(
+        miss_pq_filtered, std::numeric_limits<uint32_t>::max()));
+    m.pq_rank_loss_count = static_cast<uint32_t>(std::min<uint64_t>(
+        pq_rank_loss_count, std::numeric_limits<uint32_t>::max()));
+    m.worst_queries = std::move(worst_queries);
+  }
 
   return m;
 }
 
-void WriteSummaryJson(const std::string& path,
-                      const Config& config,
-                      const Workload& workload,
-                      const std::vector<SnapshotLite>& snapshots,
-                      double init_ms,
-                      double update_ms,
-                      double merge_ms,
-                      double global_rebuild_ms,
-                      uint32_t merge_count,
-                      uint32_t global_rebuild_count,
-                      const std::vector<uint32_t>& merge_nodes,
-                      const std::vector<uint32_t>& global_rebuild_nodes,
-                      uint32_t final_seen_rows) {
-  std::ofstream ofs(path);
-
-  if (!ofs) {
-    std::cerr << "[WARN] Cannot write summary JSON: " << path << std::endl;
-    return;
-  }
-
-  std::vector<double> recall_values;
-  std::vector<double> qps_values;
-  std::vector<double> latency_values;
-  std::vector<double> scanned_values;
-  std::vector<double> throughput_values;
-  double final_imbalance_ratio = 0.0;
-  double final_scan_ratio = 0.0;
-  double final_scanned_per_topk = 0.0;
-  uint64_t maintenance_rows = 0;
-  uint64_t summary_gt_new_total = 0;
-  uint64_t summary_gt_old_total = 0;
-  uint64_t summary_hit_new_total = 0;
-  uint64_t summary_hit_old_total = 0;
-  for (const auto& s : snapshots) {
-    if (s.skipped_warmup) continue;
-    summary_gt_new_total += s.gt_new_total;
-    summary_gt_old_total += s.gt_old_total;
-    summary_hit_new_total += s.hit_new_total;
-    summary_hit_old_total += s.hit_old_total;
-    recall_values.push_back(s.recall);
-    qps_values.push_back(s.qps);
-    latency_values.push_back(s.avg_query_ms);
-    scanned_values.push_back(s.avg_scanned);
-    final_imbalance_ratio = s.imbalance_ratio;
-    final_scan_ratio = s.scan_ratio;
-    final_scanned_per_topk = s.scanned_per_topk;
-    maintenance_rows += static_cast<uint64_t>(s.snapshot_rows);
-    if (s.update_throughput_vecps > 0.0) {
-      throughput_values.push_back(s.update_throughput_vecps);
-    }
-  }
-  const double final_recall = recall_values.empty() ? 0.0 : recall_values.back();
-  const auto recall_stats = SummarizeValues(recall_values);
-  const auto qps_stats = SummarizeValues(qps_values);
-  const auto latency_stats = SummarizeValues(latency_values);
-  const auto scanned_stats = SummarizeValues(scanned_values);
-  const auto update_thr_stats = SummarizeValues(throughput_values);
-  const double total_maintenance_ms = update_ms + merge_ms + global_rebuild_ms;
-  const uint32_t initial_rows = snapshots.empty() ? 0u : snapshots.front().active_rows;
-  const uint32_t streamed_rows = final_seen_rows > initial_rows ? final_seen_rows - initial_rows : 0;
-  const double amortized_update_throughput =
-      streamed_rows > 0 && total_maintenance_ms > 0.0
-          ? 1000.0 * static_cast<double>(streamed_rows) / total_maintenance_ms
-          : 0.0;
-  const double maintenance_ms_per_vector =
-      maintenance_rows > 0
-          ? total_maintenance_ms / static_cast<double>(maintenance_rows)
-          : 0.0;
-  const uint64_t summary_gt_total = summary_gt_new_total + summary_gt_old_total;
-  const double summary_recall_new = summary_gt_new_total > 0
-      ? static_cast<double>(summary_hit_new_total) / static_cast<double>(summary_gt_new_total)
-      : 0.0;
-  const double summary_recall_old = summary_gt_old_total > 0
-      ? static_cast<double>(summary_hit_old_total) / static_cast<double>(summary_gt_old_total)
-      : 0.0;
-  const double summary_gt_new_ratio = summary_gt_total > 0
-      ? static_cast<double>(summary_gt_new_total) / static_cast<double>(summary_gt_total)
-      : 0.0;
-
-  ofs << "{\n";
-  ofs << "  \"workload\": \"" << workload.path << "\",\n";
-  ofs << "  \"dataset\": \"" << workload.dataset << "\",\n";
-  ofs << "  \"final_seen_rows\": " << final_seen_rows << ",\n";
-  ofs << "  \"topk\": " << config.topk << ",\n";
-  ofs << "  \"nprobe\": " << config.nprobe << ",\n";
-  ofs << "  \"use_whitening\": " << (config.use_whitening ? "true" : "false") << ",\n";
-  ofs << "  \"use_cosine\": " << (config.use_cosine ? "true" : "false") << ",\n";
-  ofs << "  \"omp_max_threads\": " << RuntimeMaxThreads() << ",\n";
-  ofs << "  \"final_recall\": " << final_recall << ",\n";
-  ofs << "  \"init_ms\": " << init_ms << ",\n";
-  ofs << "  \"update_ms\": " << update_ms << ",\n";
-  ofs << "  \"merge_ms\": " << merge_ms << ",\n";
-  ofs << "  \"global_rebuild_ms\": " << global_rebuild_ms << ",\n";
-  ofs << "  \"merge_count\": " << merge_count << ",\n";
-  ofs << "  \"global_rebuild_count\": " << global_rebuild_count << ",\n";
-  ofs << "  \"merge_nodes\": [";
-  for (size_t ni = 0; ni < merge_nodes.size(); ++ni) {
-    ofs << merge_nodes[ni];
-    if (ni + 1 < merge_nodes.size()) ofs << ", ";
-  }
-  ofs << "],\n";
-  ofs << "  \"global_rebuild_nodes\": [";
-  for (size_t ni = 0; ni < global_rebuild_nodes.size(); ++ni) {
-    ofs << global_rebuild_nodes[ni];
-    if (ni + 1 < global_rebuild_nodes.size()) ofs << ", ";
-  }
-  ofs << "],\n";
-  ofs << "  \"total_maintenance_ms\": " << total_maintenance_ms << ",\n";
-  ofs << "  \"maintenance_ms_per_vector\": " << maintenance_ms_per_vector << ",\n";
-  ofs << "  \"imbalance_ratio\": " << final_imbalance_ratio << ",\n";
-  ofs << "  \"scan_ratio\": " << final_scan_ratio << ",\n";
-  ofs << "  \"scanned_per_topk\": " << final_scanned_per_topk << ",\n";
-  ofs << "  \"amortized_update_throughput_vecps\": "
-      << amortized_update_throughput << ",\n";
-  ofs << "  \"gt_scope\": \"current_prefix\",\n";
-  ofs << "  \"summary\": {\n";
-  ofs << "    \"recall_avg\": " << recall_stats.avg << ",\n";
-  ofs << "    \"recall_p5\": " << recall_stats.p5 << ",\n";
-  ofs << "    \"recall_min\": " << recall_stats.min << ",\n";
-  ofs << "    \"recall_final\": " << final_recall << ",\n";
-  ofs << "    \"recall_new\": " << summary_recall_new << ",\n";
-  ofs << "    \"recall_old\": " << summary_recall_old << ",\n";
-  ofs << "    \"gt_new_ratio\": " << summary_gt_new_ratio << ",\n";
-  ofs << "    \"gt_new_total\": " << summary_gt_new_total << ",\n";
-  ofs << "    \"gt_old_total\": " << summary_gt_old_total << ",\n";
-  ofs << "    \"hit_new_total\": " << summary_hit_new_total << ",\n";
-  ofs << "    \"hit_old_total\": " << summary_hit_old_total << ",\n";
-  ofs << "    \"qps_avg\": " << qps_stats.avg << ",\n";
-  ofs << "    \"qps_p5\": " << qps_stats.p5 << ",\n";
-  ofs << "    \"latency_avg_ms\": " << latency_stats.avg << ",\n";
-  ofs << "    \"latency_p95_ms\": " << latency_stats.p95 << ",\n";
-  ofs << "    \"latency_p99_ms\": " << latency_stats.p99 << ",\n";
-  ofs << "    \"scanned_avg\": " << scanned_stats.avg << ",\n";
-  ofs << "    \"update_throughput_avg_vecps\": " << update_thr_stats.avg << ",\n";
-  ofs << "    \"process_rss_bytes\": " << ReadProcStatusBytes("VmRSS:") << ",\n";
-  ofs << "    \"process_peak_rss_bytes\": " << ReadProcStatusBytes("VmHWM:") << "\n";
-  ofs << "  },\n";
-  ofs << "  \"snapshots\": [\n";
-
-  for (size_t i = 0; i < snapshots.size(); ++i) {
-    const auto& s = snapshots[i];
-
-    ofs << "    {\"search_id\": " << s.search_id
-        << ", \"op_id\": " << s.op_id
-        << ", \"active_rows\": " << s.active_rows
-        << ", \"main_rows\": " << s.main_rows
-        << ", \"active_delta_rows\": " << s.active_delta_rows
-        << ", \"frozen_delta_rows\": " << s.frozen_delta_rows
-        << ", \"round\": " << s.round
-        << ", \"cluster\": " << s.cluster
-        << ", \"recall\": " << s.recall
-        << ", \"recall_new\": " << s.recall_new
-        << ", \"recall_old\": " << s.recall_old
-        << ", \"gt_new_ratio\": " << s.gt_new_ratio
-        << ", \"gt_new_total\": " << s.gt_new_total
-        << ", \"gt_old_total\": " << s.gt_old_total
-        << ", \"hit_new_total\": " << s.hit_new_total
-        << ", \"hit_old_total\": " << s.hit_old_total
-        << ", \"avg_query_ms\": " << s.avg_query_ms
-        << ", \"p50_query_ms\": " << s.p50_query_ms
-        << ", \"p99_query_ms\": " << s.p99_query_ms
-        << ", \"qps\": " << s.qps
-        << ", \"avg_scanned\": " << s.avg_scanned
-        << ", \"scan_ratio\": " << s.scan_ratio
-        << ", \"scanned_per_topk\": " << s.scanned_per_topk
-        << ", \"imbalance_ratio\": " << s.imbalance_ratio
-        << ", \"cumulative_update_ms\": " << s.cumulative_update_ms
-        << ", \"cumulative_merge_ms\": " << s.cumulative_merge_ms
-        << ", \"cumulative_global_rebuild_ms\": " << s.cumulative_global_rebuild_ms
-        << ", \"snapshot_rows\": " << s.snapshot_rows
-        << ", \"snapshot_maintenance_ms\": " << s.snapshot_maintenance_ms
-        << ", \"maintenance_ms_per_vector\": " << s.maintenance_ms_per_vector
-        << ", \"update_throughput_vecps\": " << s.update_throughput_vecps
-        << ", \"amortized_update_throughput_vecps\": " << s.amortized_update_throughput_vecps
-        << ", \"skipped_warmup\": "
-        << (s.skipped_warmup ? "true" : "false") << "}";
-
-    if (i + 1 < snapshots.size()) ofs << ",";
-    ofs << "\n";
-  }
-
-  ofs << "  ]\n";
-  ofs << "}\n";
-}
 
 }  // namespace
 
@@ -1355,7 +1231,7 @@ int main(int argc, char** argv) {
 
   const std::string base_path = base_resolved.value();
   if (summary_path.empty()) {
-    summary_path = BuildDefaultResultPath(config_path, base_path).string();
+    summary_path = ann::eval::BuildDefaultResultPath(config_path, base_path).string();
   }
   std::error_code summary_dir_ec;
   std::filesystem::create_directories(
@@ -1599,19 +1475,33 @@ int main(int argc, char** argv) {
       config.merge_assignment_hard_cap_ratio;
   merge_options.assignment_lambda = config.merge_assignment_lambda;
 
-  double init_ms = 0.0;
-  double total_update_ms = 0.0;
-  double total_delta_ingest_assignment_us = 0.0;
-  uint64_t total_delta_ingest_assignment_records = 0;
-  double total_merge_ms = 0.0;
-  double total_global_rebuild_ms = 0.0;
-
-  double pending_update_ms = 0.0;
-  double pending_merge_ms = 0.0;
-  double pending_global_rebuild_ms = 0.0;
-
-  uint32_t merge_count = 0;
-  uint32_t global_rebuild_count = 0;
+  ann::eval::RunEvalMsCounters counters;
+  const auto& counter_values = counters.Values();
+  const auto& init_ms = counter_values.init_ms;
+  const auto& total_update_ms = counter_values.total_update_ms;
+  const auto& total_update_whitening_ms = counter_values.total_update_whitening_ms;
+  const auto& total_update_insert_ms = counter_values.total_update_insert_ms;
+  const auto& total_update_record_build_ms = counter_values.total_update_record_build_ms;
+  const auto& total_update_insert_encode_ms = counter_values.total_update_insert_encode_ms;
+  const auto& total_update_insert_commit_ms = counter_values.total_update_insert_commit_ms;
+  const auto& total_update_onlinepq_maintenance_ms =
+      counter_values.total_update_onlinepq_maintenance_ms;
+  const auto& total_update_delete_ms = counter_values.total_update_delete_ms;
+  const auto& total_update_codebook_update_ms = counter_values.total_update_codebook_update_ms;
+  const auto& total_update_reencode_ms = counter_values.total_update_reencode_ms;
+  const auto& total_delta_ingest_assignment_us =
+      counter_values.total_delta_ingest_assignment_us;
+  const auto& total_delta_ingest_assignment_records =
+      counter_values.total_delta_ingest_assignment_records;
+  const auto& total_merge_ms = counter_values.total_merge_ms;
+  const auto& total_merge_compute_ms = counter_values.total_merge_compute_ms;
+  const auto& total_global_rebuild_ms = counter_values.total_global_rebuild_ms;
+  const auto& pending_update_ms = counter_values.pending_update_ms;
+  const auto& pending_merge_compute_ms = counter_values.pending_merge_compute_ms;
+  const auto& pending_global_rebuild_ms = counter_values.pending_global_rebuild_ms;
+  const auto& merge_count = counter_values.merge_count;
+  const auto& global_rebuild_count = counter_values.global_rebuild_count;
+  const auto& search_id = counter_values.search_id;
   std::vector<uint32_t> merge_nodes;
   std::vector<uint32_t> global_rebuild_nodes;
   uint32_t last_global_rebuild_rows = 0;
@@ -1717,8 +1607,7 @@ int main(int argc, char** argv) {
     }
     whitened_rows_materialized = required_rows;
     const double transform_ms = transform_timer.ElapsedMillis();
-    total_update_ms += transform_ms;
-    pending_update_ms += transform_ms;
+    counters.AddWhiteningUpdate(transform_ms);
     record_memory(stage,
                   seen_rows,
                   2ull * ann::eval_memory::MatrixActiveBytes(
@@ -1785,9 +1674,7 @@ int main(int argc, char** argv) {
 
     const double elapsed = mt.ElapsedMillis();
 
-    total_merge_ms += elapsed;
-    pending_merge_ms += elapsed;
-    merge_count++;
+    counters.AddMerge(elapsed, res.value().merge_compute_ms);
     merge_nodes.push_back(seen_rows);
 
     main_rows_current += res.value().frozen_records;
@@ -1812,67 +1699,7 @@ int main(int argc, char** argv) {
               << ", codebook_rebuild_ms=" << res.value().codebook_rebuild_ms
               << ", merge_ms=" << elapsed
               << std::endl;
-    const auto& profile = res.value().profiling;
-    std::cout << "[MERGE_PROFILE] effective_nlist=" << profile.effective_nlist
-              << ", frozen_records=" << profile.frozen_records
-              << ", assignment_descriptor_records="
-              << profile.assignment_descriptor_records
-              << ", assignment_full_vector_copy_bytes="
-              << profile.assignment_full_vector_copy_bytes
-              << ", frozen_payload_records_moved="
-              << profile.frozen_payload_records_moved
-              << ", vector_accessor_materialize_calls="
-              << profile.vector_accessor_materialize_calls
-              << ", vector_accessor_materialized_rows="
-              << profile.vector_accessor_materialized_rows
-              << ", vector_accessor_materialized_bytes="
-              << profile.vector_accessor_materialized_bytes
-              << ", vector_accessor_max_materialize_rows="
-              << profile.vector_accessor_max_materialize_rows
-              << ", seed_partitions=" << profile.seed_partitions
-              << ", neighborhoods=" << profile.neighborhoods
-              << ", main_records_loaded=" << profile.main_records_loaded
-              << ", pooled_records=" << profile.pooled_records
-              << ", repartitioned_records=" << profile.repartitioned_records
-              << ", patch_records=" << profile.patch_records
-              << ", patch_dense_vector_bytes=" << profile.patch_dense_vector_bytes
-              << ", patch_retained_vector_bytes="
-              << profile.patch_retained_vector_bytes
-              << ", patch_elided_vector_bytes=" << profile.patch_elided_vector_bytes
-              << ", patch_final_pq_code_bytes="
-              << profile.patch_final_pq_code_bytes
-              << ", pq_codes_reused=" << profile.pq_codes_reused
-              << ", pq_codes_reencoded=" << profile.pq_codes_reencoded
-              << ", prepare_pq_codes_reused="
-              << profile.prepare_pq_codes_reused
-              << ", prepare_pq_codes_reencoded="
-              << profile.prepare_pq_codes_reencoded
-              << ", merge_delta_to_main_assignment_us="
-              << profile.merge_delta_to_main_assignment_us
-              << ", merge_assignment_distance_us="
-              << profile.merge_assignment_distance_us
-              << ", merge_assignment_top_r_us="
-              << profile.merge_assignment_top_r_us
-              << ", merge_assignment_balance_us="
-              << profile.merge_assignment_balance_us
-              << ", merge_assignment_materialize_us="
-              << profile.merge_assignment_materialize_us
-              << ", stats_us=" << profile.stats_us
-              << ", scoring_us=" << profile.scoring_us
-              << ", top_r_neighbor_us=" << profile.top_r_neighbor_us
-              << ", fetch_main_records_us=" << profile.fetch_main_records_us
-              << ", repartition_pool_us=" << profile.repartition_pool_us
-              << ", repartition_distance_us=" << profile.repartition_distance_us
-              << ", repartition_candidate_selection_us="
-              << profile.repartition_candidate_selection_us
-              << ", repartition_sort_us=" << profile.repartition_sort_us
-              << ", patch_prepare_us=" << profile.patch_prepare_us
-              << ", prepare_pq_encode_us=" << profile.prepare_pq_encode_us
-              << ", commit_us=" << profile.commit_us
-              << ", pq_code_assignment_us=" << profile.pq_code_assignment_us
-              << ", pq_code_copy_or_reuse_us=" << profile.pq_code_copy_or_reuse_us
-              << ", pq_list_flatten_us=" << profile.pq_list_flatten_us
-              << std::endl;
+    ann::eval::PrintMergeProfile(res.value().profiling);
 
     frozen_delta.reset();
     TrimAllocatorRetainedMemory("merge_commit_done");
@@ -2198,9 +2025,7 @@ int main(int argc, char** argv) {
 
     const double total_ms = total_timer.ElapsedMillis();
 
-    total_global_rebuild_ms += total_ms;
-    pending_global_rebuild_ms += total_ms;
-    global_rebuild_count++;
+    counters.AddGlobalRebuild(total_ms);
     global_rebuild_nodes.push_back(rebuild_seen);
     last_global_rebuild_rows = rebuild_seen;
     last_global_rebuild_main_rows = main_rows_current;
@@ -2372,7 +2197,7 @@ int main(int argc, char** argv) {
       delta_seed_ms = delta_timer.ElapsedMillis();
     }
 
-    init_ms += total_timer.ElapsedMillis();
+    counters.AddInitializationMs(total_timer.ElapsedMillis());
     record_memory("bootstrap_done", seen_rows);
 
     std::cout << "[BOOTSTRAP] done active_rows=" << seen_rows
@@ -2433,11 +2258,12 @@ int main(int argc, char** argv) {
 
       const double add_ms = t.ElapsedMillis();
 
-      total_update_ms += add_ms;
-      pending_update_ms += add_ms;
+      counters.AddInsertElapsed(add_ms);
       last_pq_stats = add.value();
-      total_delta_ingest_assignment_us += last_pq_stats.insert_assignment_us;
-      total_delta_ingest_assignment_records += last_pq_stats.processed_vectors;
+      counters.AddInsertStats(last_pq_stats);
+      counters.AddPendingInsertElapsed(add_ms);
+      counters.AddDeltaIngestAssignment(last_pq_stats.insert_assignment_us,
+                                        last_pq_stats.processed_vectors);
       std::cout << "[STREAM_PROFILE] begin=" << cur
                 << ", end=" << chunk_end
                 << ", delta_ingest_assignment_us="
@@ -2461,7 +2287,6 @@ int main(int argc, char** argv) {
   };
 
   std::vector<SnapshotLite> snapshots;
-  uint32_t search_id = 0;
   uint32_t last_insert_begin = 0;
   uint32_t last_insert_end = 0;
 
@@ -2506,7 +2331,7 @@ int main(int argc, char** argv) {
                 << ", main_built=" << (main_built ? "true" : "false")
                 << std::endl;
     } else if (op.operation == "search") {
-      search_id++;
+      counters.NextSearchId();
 
       SnapshotLite snap;
       snap.search_id = search_id;
@@ -2520,7 +2345,7 @@ int main(int argc, char** argv) {
       snap.round = op.round;
       snap.cluster = op.cluster;
       snap.cumulative_update_ms = total_update_ms;
-      snap.cumulative_merge_ms = total_merge_ms;
+      snap.cumulative_merge_ms = total_merge_compute_ms;
       snap.cumulative_global_rebuild_ms = total_global_rebuild_ms;
 
       if (!main_built || seen_rows == 0) {
@@ -2562,21 +2387,47 @@ int main(int argc, char** argv) {
       snap.hit_new_total = ev.value().hit_new_total;
       snap.hit_old_total = ev.value().hit_old_total;
       snap.avg_query_ms = ev.value().avg_query_ms;
+      snap.avg_search_ms = ev.value().avg_search_ms;
+      snap.end_to_end_overhead_ms = ev.value().end_to_end_overhead_ms;
+      snap.avg_pq_lut_build_us = ev.value().avg_pq_lut_build_us;
+      snap.avg_pq_adc_scan_us = ev.value().avg_pq_adc_scan_us;
+      snap.search_p50 = ev.value().search_p50;
+      snap.search_p99 = ev.value().search_p99;
+      snap.total_p50 = ev.value().total_p50;
+      snap.total_p99 = ev.value().total_p99;
       snap.p50_query_ms = ev.value().p50_query_ms;
       snap.p99_query_ms = ev.value().p99_query_ms;
       snap.qps = ev.value().qps;
       snap.avg_scanned = ev.value().avg_scanned;
+      snap.scanned_p50 = ev.value().scanned_p50;
+      snap.scanned_p99 = ev.value().scanned_p99;
+      snap.scanned_max = ev.value().scanned_max;
       snap.scan_ratio = ev.value().scan_ratio;
       snap.scanned_per_topk = ev.value().scanned_per_topk;
+      snap.query_eval_ms = ev.value().query_eval_ms;
+      snap.query_count = ev.value().query_count;
+      snap.main_route_queries = ev.value().main_route_queries;
+      snap.active_delta_route_queries = ev.value().active_delta_route_queries;
+      snap.frozen_delta_route_queries = ev.value().frozen_delta_route_queries;
+      snap.gt_probed_rate = ev.value().gt_probed_rate;
+      snap.recall_on_probed_gt = ev.value().recall_on_probed_gt;
+      snap.exact_recall_on_probed_candidates =
+          ev.value().exact_recall_on_probed_candidates;
+      snap.avg_pq_rank_loss = ev.value().avg_pq_rank_loss;
+      snap.miss_not_probed = ev.value().miss_not_probed;
+      snap.miss_probed_filtered_by_pq = ev.value().miss_probed_filtered_by_pq;
+      snap.pq_rank_loss_count = ev.value().pq_rank_loss_count;
+      snap.rerank_topk_main_total = ev.value().rerank_topk_main_total;
+      snap.rerank_topk_delta_total = ev.value().rerank_topk_delta_total;
+      snap.rerank_topk_main_ratio = ev.value().rerank_topk_main_ratio;
+      snap.rerank_topk_delta_ratio = ev.value().rerank_topk_delta_ratio;
+      snap.rerank_topk_main_avg = ev.value().rerank_topk_main_avg;
+      snap.rerank_topk_delta_avg = ev.value().rerank_topk_delta_avg;
+      snap.worst_queries = ev.value().worst_queries;
       snap.imbalance_ratio = current_imbalance_ratio();
 
-      std::cout << "[EVAL] #" << search_id
-                << " stage=ms_workload"
-                << ", base_rows=" << seen_rows
-                << ", recall@" << config.topk << "=" << snap.recall
-                << ", latency_ms=" << snap.avg_query_ms
-                << ", qps=" << snap.qps
-                << std::endl;
+      ann::eval::PrintMsEval(search_id, seen_rows, config.topk, snap);
+      ann::eval::PrintMsDiagnostics(config, snap);
 
       const uint32_t snapshot_rows =
           seen_rows >= last_snapshot_active_rows
@@ -2585,7 +2436,7 @@ int main(int argc, char** argv) {
 
       const double snapshot_maintenance_ms =
           pending_update_ms +
-          pending_merge_ms +
+          pending_merge_compute_ms +
           pending_global_rebuild_ms;
 
       const double throughput =
@@ -2607,7 +2458,7 @@ int main(int argc, char** argv) {
               : 0;
 
       const double cumulative_maintenance_ms =
-          total_update_ms + total_merge_ms + total_global_rebuild_ms;
+          total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
 
       const double amortized =
           streamed_rows > 0 && cumulative_maintenance_ms > 0.0
@@ -2619,20 +2470,16 @@ int main(int argc, char** argv) {
       record_memory("search_snapshot", seen_rows);
       snapshots.push_back(snap);
 
-      std::cout << "[SNAPSHOT] base_rows=" << seen_rows
-                << ", snapshot_rows=" << snapshot_rows
-                << ", recall@" << config.topk << "=" << snap.recall
-                << ", latency_ms=" << snap.avg_query_ms
-                << ", qps=" << snap.qps
-                << ", throughput=" << throughput
-                << ", maintenance_ms=" << snapshot_maintenance_ms
-                << ", amortized_update_throughput=" << amortized
-                << std::endl;
+      ann::eval::PrintMsSnapshot(config.topk,
+                                 seen_rows,
+                                 snapshot_rows,
+                                 throughput,
+                                 snapshot_maintenance_ms,
+                                 amortized,
+                                 snap);
 
       last_snapshot_active_rows = seen_rows;
-      pending_update_ms = 0.0;
-      pending_merge_ms = 0.0;
-      pending_global_rebuild_ms = 0.0;
+      counters.ResetPending();
     }
   }
 
@@ -2670,22 +2517,53 @@ int main(int argc, char** argv) {
       snap.hit_new_total = ev.value().hit_new_total;
       snap.hit_old_total = ev.value().hit_old_total;
       snap.avg_query_ms = ev.value().avg_query_ms;
+      snap.avg_search_ms = ev.value().avg_search_ms;
+      snap.end_to_end_overhead_ms = ev.value().end_to_end_overhead_ms;
+      snap.avg_pq_lut_build_us = ev.value().avg_pq_lut_build_us;
+      snap.avg_pq_adc_scan_us = ev.value().avg_pq_adc_scan_us;
+      snap.search_p50 = ev.value().search_p50;
+      snap.search_p99 = ev.value().search_p99;
+      snap.total_p50 = ev.value().total_p50;
+      snap.total_p99 = ev.value().total_p99;
       snap.p50_query_ms = ev.value().p50_query_ms;
       snap.p99_query_ms = ev.value().p99_query_ms;
       snap.qps = ev.value().qps;
       snap.avg_scanned = ev.value().avg_scanned;
+      snap.scanned_p50 = ev.value().scanned_p50;
+      snap.scanned_p99 = ev.value().scanned_p99;
+      snap.scanned_max = ev.value().scanned_max;
       snap.scan_ratio = ev.value().scan_ratio;
       snap.scanned_per_topk = ev.value().scanned_per_topk;
+      snap.gt_probed_rate = ev.value().gt_probed_rate;
+      snap.recall_on_probed_gt = ev.value().recall_on_probed_gt;
+      snap.exact_recall_on_probed_candidates =
+          ev.value().exact_recall_on_probed_candidates;
+      snap.avg_pq_rank_loss = ev.value().avg_pq_rank_loss;
+      snap.miss_not_probed = ev.value().miss_not_probed;
+      snap.miss_probed_filtered_by_pq = ev.value().miss_probed_filtered_by_pq;
+      snap.pq_rank_loss_count = ev.value().pq_rank_loss_count;
+      snap.rerank_topk_main_total = ev.value().rerank_topk_main_total;
+      snap.rerank_topk_delta_total = ev.value().rerank_topk_delta_total;
+      snap.rerank_topk_main_ratio = ev.value().rerank_topk_main_ratio;
+      snap.rerank_topk_delta_ratio = ev.value().rerank_topk_delta_ratio;
+      snap.rerank_topk_main_avg = ev.value().rerank_topk_main_avg;
+      snap.rerank_topk_delta_avg = ev.value().rerank_topk_delta_avg;
+      snap.worst_queries = ev.value().worst_queries;
       snap.imbalance_ratio = current_imbalance_ratio();
       snap.cumulative_update_ms = total_update_ms;
-      snap.cumulative_merge_ms = total_merge_ms;
+      snap.cumulative_merge_ms = total_merge_compute_ms;
       snap.cumulative_global_rebuild_ms = total_global_rebuild_ms;
+      snap.query_eval_ms = ev.value().query_eval_ms;
+      snap.query_count = ev.value().query_count;
+      snap.main_route_queries = ev.value().main_route_queries;
+      snap.active_delta_route_queries = ev.value().active_delta_route_queries;
+      snap.frozen_delta_route_queries = ev.value().frozen_delta_route_queries;
       const uint32_t snapshot_rows =
           seen_rows >= last_snapshot_active_rows
               ? seen_rows - last_snapshot_active_rows
               : 0;
       const double snapshot_maintenance_ms =
-          pending_update_ms + pending_merge_ms + pending_global_rebuild_ms;
+          pending_update_ms + pending_merge_compute_ms + pending_global_rebuild_ms;
       snap.snapshot_rows = static_cast<double>(snapshot_rows);
       snap.snapshot_maintenance_ms = snapshot_maintenance_ms;
       snap.maintenance_ms_per_vector =
@@ -2699,7 +2577,7 @@ int main(int argc, char** argv) {
       const uint32_t streamed_rows =
           seen_rows > main_bootstrap_rows ? seen_rows - main_bootstrap_rows : 0;
       const double cumulative_maintenance_ms =
-          total_update_ms + total_merge_ms + total_global_rebuild_ms;
+          total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
       snap.amortized_update_throughput_vecps =
           streamed_rows > 0 && cumulative_maintenance_ms > 0.0
               ? 1000.0 * static_cast<double>(streamed_rows) / cumulative_maintenance_ms
@@ -2719,32 +2597,138 @@ int main(int argc, char** argv) {
       {"query_dim", static_cast<uint64_t>(Q.cols())},
       {"memory_block_rows", kAddBlockRows},
       {"raw_base_is_resident", base_source.UsesResidentMatrix() ? 1ull : 0ull}};
-  Status memory_write_status =
-      memory_trace.WriteJson(memory_trace_path.string(), memory_metadata);
+  Status memory_write_status = ann::eval::WriteMemoryTraceJson(
+      memory_trace, memory_trace_path.string(), memory_metadata);
   if (!memory_write_status.ok()) {
     std::cerr << memory_write_status.ToString() << std::endl;
     return 1;
   }
 
-  WriteSummaryJson(summary_path,
+  std::vector<double> summary_recalls;
+  std::vector<double> summary_qps;
+  std::vector<double> summary_latencies;
+  std::vector<double> summary_scanned;
+  std::vector<double> summary_update_throughput;
+  ann::eval::run_eval_ms::SummaryOutput output_summary;
+  uint64_t maintenance_rows = 0;
+  for (const auto& snapshot : snapshots) {
+    if (snapshot.skipped_warmup) continue;
+    output_summary.summary_gt_new_total += snapshot.gt_new_total;
+    output_summary.summary_gt_old_total += snapshot.gt_old_total;
+    output_summary.summary_hit_new_total += snapshot.hit_new_total;
+    output_summary.summary_hit_old_total += snapshot.hit_old_total;
+    summary_recalls.push_back(snapshot.recall);
+    summary_qps.push_back(snapshot.qps);
+    summary_latencies.push_back(snapshot.avg_query_ms);
+    summary_scanned.push_back(snapshot.avg_scanned);
+    output_summary.final_imbalance_ratio = snapshot.imbalance_ratio;
+    output_summary.final_scan_ratio = snapshot.scan_ratio;
+    output_summary.final_scanned_per_topk = snapshot.scanned_per_topk;
+    maintenance_rows += static_cast<uint64_t>(snapshot.snapshot_rows);
+    if (snapshot.update_throughput_vecps > 0.0) {
+      summary_update_throughput.push_back(snapshot.update_throughput_vecps);
+    }
+  }
+  output_summary.recall_stats = SummarizeValues(summary_recalls);
+  output_summary.qps_stats = SummarizeValues(summary_qps);
+  output_summary.latency_stats = SummarizeValues(summary_latencies);
+  output_summary.scanned_stats = SummarizeValues(summary_scanned);
+  output_summary.update_throughput_stats = SummarizeValues(summary_update_throughput);
+  output_summary.recall_available = !summary_recalls.empty();
+  output_summary.final_recall = summary_recalls.empty() ? 0.0 : summary_recalls.back();
+  output_summary.total_maintenance_ms =
+      total_update_ms + total_merge_compute_ms + total_global_rebuild_ms;
+  output_summary.build_rebuild_ms = init_ms + total_global_rebuild_ms;
+  const uint32_t initial_rows = snapshots.empty() ? 0u : snapshots.front().active_rows;
+  const uint32_t streamed_rows = seen_rows > initial_rows ? seen_rows - initial_rows : 0;
+  output_summary.amortized_update_throughput =
+      streamed_rows > 0 && output_summary.total_maintenance_ms > 0.0
+          ? 1000.0 * static_cast<double>(streamed_rows) / output_summary.total_maintenance_ms
+          : 0.0;
+  output_summary.maintenance_ms_per_vector =
+      maintenance_rows > 0
+          ? output_summary.total_maintenance_ms / static_cast<double>(maintenance_rows)
+          : 0.0;
+  for (auto it = snapshots.rbegin(); it != snapshots.rend(); ++it) {
+    if (!it->skipped_warmup) {
+      output_summary.final_snapshot = &*it;
+      break;
+    }
+  }
+  const uint64_t summary_gt_total = output_summary.summary_gt_new_total +
+                                    output_summary.summary_gt_old_total;
+  output_summary.summary_recall_new = output_summary.summary_gt_new_total > 0
+      ? static_cast<double>(output_summary.summary_hit_new_total) /
+            static_cast<double>(output_summary.summary_gt_new_total)
+      : 0.0;
+  output_summary.summary_recall_old = output_summary.summary_gt_old_total > 0
+      ? static_cast<double>(output_summary.summary_hit_old_total) /
+            static_cast<double>(output_summary.summary_gt_old_total)
+      : 0.0;
+  output_summary.summary_gt_new_ratio = summary_gt_total > 0
+      ? static_cast<double>(output_summary.summary_gt_new_total) /
+            static_cast<double>(summary_gt_total)
+      : 0.0;
+  const uint32_t updated_rows = seen_rows > initial_rows ? seen_rows - initial_rows : 0;
+  output_summary.update_per_vector_ms = updated_rows > 0
+      ? output_summary.total_maintenance_ms / static_cast<double>(updated_rows)
+      : 0.0;
+  output_summary.update_throughput_vecps = output_summary.total_maintenance_ms > 0.0
+      ? 1000.0 * static_cast<double>(updated_rows) / output_summary.total_maintenance_ms
+      : 0.0;
+
+  ann::eval::WriteSummaryJson(summary_path,
                    config,
                    workload,
                    snapshots,
                    init_ms,
                    total_update_ms,
+                   total_update_whitening_ms,
+                   total_update_insert_ms,
+                   total_update_record_build_ms,
+                   total_update_insert_encode_ms,
+                   total_update_insert_commit_ms,
+                   total_update_onlinepq_maintenance_ms,
+                   total_update_delete_ms,
+                   total_update_codebook_update_ms,
+                   total_update_reencode_ms,
+                   total_delta_ingest_assignment_us,
+                   total_delta_ingest_assignment_records,
                    total_merge_ms,
+                   total_merge_compute_ms,
                    total_global_rebuild_ms,
                    merge_count,
                    global_rebuild_count,
                    merge_nodes,
                    global_rebuild_nodes,
-                   seen_rows);
+                   seen_rows,
+                   full_run_timer.ElapsedMillis(),
+                   output_summary);
 
   std::cout << "[DONE] seen_rows=" << seen_rows
             << ", main_built=" << (main_built ? "true" : "false")
             << ", snapshots=" << snapshots.size()
             << ", final_recall="
             << (snapshots.empty() ? 0.0 : snapshots.back().recall)
+            << ", avg_query_ms="
+            << (snapshots.empty() ? 0.0 : snapshots.back().avg_query_ms)
+            << ", query_qps=" << (snapshots.empty() ? 0.0 : snapshots.back().qps)
+            << ", search_p50_ms="
+            << (snapshots.empty() ? 0.0 : snapshots.back().search_p50)
+            << ", search_p99_ms="
+            << (snapshots.empty() ? 0.0 : snapshots.back().search_p99)
+            << ", total_p50_ms="
+            << (snapshots.empty() ? 0.0 : snapshots.back().total_p50)
+            << ", total_p99_ms="
+            << (snapshots.empty() ? 0.0 : snapshots.back().total_p99)
+            << ", scanned_avg="
+            << (snapshots.empty() ? 0.0 : snapshots.back().avg_scanned)
+            << ", scanned_p50="
+            << (snapshots.empty() ? 0.0 : snapshots.back().scanned_p50)
+            << ", scanned_p99="
+            << (snapshots.empty() ? 0.0 : snapshots.back().scanned_p99)
+            << ", scanned_max="
+            << (snapshots.empty() ? 0.0 : snapshots.back().scanned_max)
             << ", update_ms=" << total_update_ms
             << ", merge_ms=" << total_merge_ms
             << ", delta_ingest_assignment_us="
