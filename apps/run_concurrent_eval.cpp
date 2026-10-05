@@ -531,7 +531,8 @@ int main(int argc, char** argv) {
           if (!snapshot.ok()) report_failure(snapshot.status().ToString());
           else {
             auto merged = merge_frozen_delta_into_main(main_index, main_versions,
-                                                        snapshot.value(), merge_options);
+                                                        snapshot.value(), index_data,
+                                                        merge_options);
             if (!merged.ok()) report_failure(merged.status().ToString());
             else {
               ++merge_count;
