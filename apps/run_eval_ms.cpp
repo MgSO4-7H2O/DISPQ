@@ -1150,6 +1150,7 @@ Result<EvalMetricsLite> EvaluateStatePrefix(
 }  // namespace
 
 int main(int argc, char** argv) {
+  Timer full_run_timer;
   if (argc < 3) {
     std::cerr << "Usage:\n"
               << "  " << argv[0]
@@ -1958,7 +1959,7 @@ int main(int argc, char** argv) {
         new_main->Build(rebuild_main_train, ids, ivf_params, 0, &routing_assignments);
     if (!ver.ok()) return ver.status();
 
-    VersionSet new_main_versions{new_wv.value(), ver.value()};
+    VersionSet new_main_versions{new_whiten_version, ver.value()};
 
     const double main_build_ms = build_timer.ElapsedMillis();
 
@@ -1991,7 +1992,7 @@ int main(int argc, char** argv) {
 
       auto d = BuildDeltaShard(rebuild_delta_train,
                                dp,
-                               new_wv.value(),
+                               new_whiten_version,
                                next_delta_shard_id++);
       if (!d.ok()) return d.status();
 
