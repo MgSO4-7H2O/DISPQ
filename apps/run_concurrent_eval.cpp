@@ -527,7 +527,7 @@ int main(int argc, char** argv) {
         if (frozen) {
           const auto begin = Clock::now();
           std::shared_lock<std::shared_mutex> access(workload_mutex);
-          auto snapshot = freeze_delta(frozen->index, frozen->versions);
+          auto snapshot = freeze_delta(frozen->index, frozen->versions, index_data);
           if (!snapshot.ok()) report_failure(snapshot.status().ToString());
           else {
             auto merged = merge_frozen_delta_into_main(main_index, main_versions,
