@@ -12,6 +12,8 @@
 .codegraph
 /logs
 *.sh
+!/run_concurrent_sift10m_node0.sh
+!/run_concurrent_sift_drift_node0.sh
 !/experiments/sift1m_layout_ablation/
 /experiments/sift1m_layout_ablation/*
 !/experiments/sift1m_layout_ablation/README.md

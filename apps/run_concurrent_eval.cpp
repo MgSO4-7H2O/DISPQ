@@ -28,7 +28,6 @@
 #include "eval_memory.h"
 #include "index/ivf.h"
 #include "index/merge.h"
-#include "search/exact_search.h"
 #include "search/rerank.h"
 #include "whitening/whitening.h"
 
@@ -68,6 +67,44 @@ double Percentile(std::vector<double> values, double quantile) {
   const size_t lo = static_cast<size_t>(pos);
   const size_t hi = std::min(lo + 1, values.size() - 1);
   return values[lo] + (values[hi] - values[lo]) * (pos - lo);
+}
+
+std::vector<std::vector<DocId>> ExactSearchPrefix(const MatrixRM& queries,
+                                                   const MatrixRM& database,
+                                                   uint32_t rows,
+                                                   uint32_t topk) {
+  std::vector<float> norms(rows);
+  for (uint32_t row = 0; row < rows; ++row)
+    norms[row] = database.row(row).squaredNorm();
+  std::vector<std::vector<DocId>> ids(static_cast<size_t>(queries.rows()));
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<std::pair<float, DocId>> distances(rows);
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+    for (int64_t qi = 0; qi < queries.rows(); ++qi) {
+      const Eigen::VectorXf query = queries.row(qi).transpose();
+      const float query_norm = query.squaredNorm();
+      for (uint32_t row = 0; row < rows; ++row) {
+        const float dot = database.row(row).dot(query);
+        distances[row] = {query_norm + norms[row] - 2.0f * dot, row};
+      }
+      const size_t limit = std::min<size_t>(topk, rows);
+      if (rows > limit) {
+        std::nth_element(distances.begin(), distances.begin() + limit, distances.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+      }
+      std::sort(distances.begin(), distances.begin() + limit,
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+      auto& query_ids = ids[static_cast<size_t>(qi)];
+      query_ids.resize(limit);
+      for (size_t i = 0; i < limit; ++i) query_ids[i] = distances[i].second;
+    }
+  }
+  return ids;
 }
 
 Result<std::shared_ptr<IVFIndex>> BuildIndex(const MatrixRM& data,
@@ -222,9 +259,8 @@ Status SaveGroundTruth(const std::string& path,
   WriteValue(out, version_count);
   for (uint32_t frontier : frontiers) {
     WriteValue(out, frontier);
-    auto exact = ExactSearchBatch(queries, database.topRows(frontier), topk);
-    if (!exact.ok()) return exact.status();
-    for (const auto& row : exact.value()) {
+    auto exact = ExactSearchPrefix(queries, database, frontier, topk);
+    for (const auto& row : exact) {
       std::vector<DocId> ids = row;
       ids.resize(topk, 0);
       out.write(reinterpret_cast<const char*>(ids.data()), topk * sizeof(DocId));
