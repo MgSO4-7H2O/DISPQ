@@ -150,7 +150,15 @@ std::string Config::ToString() const {
       << "online_pq_alpha=" << online_pq_alpha << ", "
       << "online_pq_partial_top_lambda=" << std::boolalpha << online_pq_partial_top_lambda << ", "
       << "online_pq_lambda=" << online_pq_lambda << ", "
-      << "online_pq_reencode_batch=" << std::boolalpha << online_pq_reencode_batch << "}";
+      << "online_pq_reencode_batch=" << std::boolalpha << online_pq_reencode_batch << ", "
+      << "concurrent_workload_enable=" << std::boolalpha << concurrent_workload_enable << ", "
+      << "concurrent_query_workers=" << concurrent_query_workers << ", "
+      << "concurrent_query_threads_per_request=" << concurrent_query_threads_per_request << ", "
+      << "concurrent_insert_threads=" << concurrent_insert_threads << ", "
+      << "concurrent_maintenance_threads=" << concurrent_maintenance_threads << ", "
+      << "concurrent_target_insert_vecps=" << concurrent_target_insert_vecps << ", "
+      << "concurrent_gt_mode=" << concurrent_gt_mode << ", "
+      << "concurrent_gt_path=" << concurrent_gt_path << "}";
   return oss.str();
 }
 
@@ -241,6 +249,16 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractBool(text, "online_pq_partial_top_lambda", &cfg.online_pq_partial_top_lambda);
   ExtractDouble(text, "online_pq_lambda", &cfg.online_pq_lambda);
   ExtractBool(text, "online_pq_reencode_batch", &cfg.online_pq_reencode_batch);
+  ExtractBool(text, "concurrent_workload_enable", &cfg.concurrent_workload_enable);
+  ExtractUint(text, "concurrent_query_workers", &cfg.concurrent_query_workers);
+  ExtractUint(text,
+              "concurrent_query_threads_per_request",
+              &cfg.concurrent_query_threads_per_request);
+  ExtractUint(text, "concurrent_insert_threads", &cfg.concurrent_insert_threads);
+  ExtractUint(text, "concurrent_maintenance_threads", &cfg.concurrent_maintenance_threads);
+  ExtractDouble(text, "concurrent_target_insert_vecps", &cfg.concurrent_target_insert_vecps);
+  ExtractString(text, "concurrent_gt_mode", &cfg.concurrent_gt_mode);
+  ExtractString(text, "concurrent_gt_path", &cfg.concurrent_gt_path);
 
   if (cfg.streaming_mode != "streaming" && cfg.streaming_mode != "batch") {
     return Status::InvalidArgument(
@@ -248,6 +266,18 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   }
   if (cfg.stream_batch_size == 0) {
     return Status::InvalidArgument("stream_batch_size must be > 0");
+  }
+  if (cfg.concurrent_gt_mode != "off" && cfg.concurrent_gt_mode != "prepare" &&
+      cfg.concurrent_gt_mode != "load") {
+    return Status::InvalidArgument("concurrent_gt_mode must be off, prepare, or load");
+  }
+  if (cfg.concurrent_target_insert_vecps < 0.0) {
+    return Status::InvalidArgument("concurrent_target_insert_vecps must be >= 0");
+  }
+  if (cfg.concurrent_workload_enable &&
+      (cfg.concurrent_query_workers == 0 || cfg.concurrent_query_threads_per_request == 0 ||
+       cfg.concurrent_insert_threads == 0 || cfg.concurrent_maintenance_threads == 0)) {
+    return Status::InvalidArgument("concurrent workload thread counts must be > 0");
   }
   if (cfg.exact_rerank_enable && cfg.exact_rerank_candidates_per_route == 0) {
     return Status::InvalidArgument(

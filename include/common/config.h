@@ -124,6 +124,15 @@ struct Config {
   double online_pq_lambda{1.0};
   bool online_pq_reencode_batch{true};
 
+  bool concurrent_workload_enable{false};
+  uint32_t concurrent_query_workers{1};
+  uint32_t concurrent_query_threads_per_request{1};
+  uint32_t concurrent_insert_threads{1};
+  uint32_t concurrent_maintenance_threads{1};
+  double concurrent_target_insert_vecps{0.0};
+  std::string concurrent_gt_mode{"off"};
+  std::string concurrent_gt_path;
+
   std::string ToString() const;
 };
 

@@ -1386,18 +1386,20 @@ SearchResult SearchSingleQuery(const IndexData& data,
   std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
                     [](const auto& a, const auto& b) { return a.first < b.first; });
 
-  std::vector<Candidate> heap;
-  heap.reserve(topk);
-  uint64_t scanned = 0;
-  std::vector<DocId> scanned_doc_ids;
-  std::vector<float> scanned_approx_dists;
+  struct ProbeResult {
+    std::vector<Candidate> heap;
+    uint64_t scanned{0};
+    double lut_us{0.0};
+    double scan_us{0.0};
+    std::vector<DocId> scanned_doc_ids;
+    std::vector<float> scanned_approx_dists;
+  };
+  std::vector<ProbeResult> probe_results(probes);
   const float qnorm = use_pq ? 0.0f : qw_norm;
-  std::vector<float> distance_table;
   std::vector<float> query_term3_table;
   double pq_lut_build_us = 0.0;
   Timer query_lut_timer;
   if (use_pq) {
-    distance_table.resize(static_cast<size_t>(data.M) * data.Ks);
     if (use_precomputed_table) {
       query_term3_table.resize(static_cast<size_t>(data.M) * data.Ks, 0.0f);
       for (uint32_t m = 0; m < data.M; ++m) {
@@ -1424,9 +1426,20 @@ SearchResult SearchSingleQuery(const IndexData& data,
   if (use_pq) {
     pq_lut_build_us += query_lut_timer.ElapsedMicros();
   }
-  std::vector<float> soa_scan_dists;
   double pq_adc_scan_us = 0.0;
-  for (uint32_t pi = 0; pi < probes; ++pi) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int64_t probe_index = 0; probe_index < static_cast<int64_t>(probes); ++probe_index) {
+    const uint32_t pi = static_cast<uint32_t>(probe_index);
+    ProbeResult& probe_result = probe_results[static_cast<size_t>(pi)];
+    auto& heap = probe_result.heap;
+    heap.reserve(topk);
+    std::vector<float> distance_table(use_pq ? static_cast<size_t>(data.M) * data.Ks : 0);
+    std::vector<float> soa_scan_dists;
+    std::vector<DocId> scanned_doc_ids;
+    std::vector<float> scanned_approx_dists;
+    double local_lut_us = 0.0;
     const uint32_t list_id = centroid_dists[static_cast<size_t>(pi)].second;
     const float coarse_dist = centroid_dists[static_cast<size_t>(pi)].first;
     if (use_pq) {
@@ -1463,7 +1476,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
           }
         }
       }
-      pq_lut_build_us += lut_timer.ElapsedMicros();
+      local_lut_us += lut_timer.ElapsedMicros();
     }
     const auto& list = data.lists[static_cast<size_t>(list_id)];
     const bool use_compact_pq_scan = use_pq && HasCompactPQListForSearch(data, list_id);
@@ -1489,7 +1502,7 @@ SearchResult SearchSingleQuery(const IndexData& data,
                                soa_scan_dists.data());
     }
     for (size_t li = 0; li < list_size; ++li) {
-      ++scanned;
+      ++probe_result.scanned;
       DocId doc_id = 0;
       float approx_dist = 0.0f;
       if (use_pq) {
@@ -1549,8 +1562,39 @@ SearchResult SearchSingleQuery(const IndexData& data,
         std::push_heap(heap.begin(), heap.end(), heap_cmp);
       }
     }
-    if (use_pq) {
-      pq_adc_scan_us += scan_timer.ElapsedMicros();
+    probe_result.lut_us = local_lut_us;
+    if (use_pq) probe_result.scan_us = scan_timer.ElapsedMicros();
+    probe_result.scanned_doc_ids = std::move(scanned_doc_ids);
+    probe_result.scanned_approx_dists = std::move(scanned_approx_dists);
+  }
+
+  std::vector<Candidate> heap;
+  heap.reserve(topk);
+  uint64_t scanned = 0;
+  std::vector<DocId> scanned_doc_ids;
+  std::vector<float> scanned_approx_dists;
+  for (ProbeResult& probe_result : probe_results) {
+    scanned += probe_result.scanned;
+    pq_lut_build_us += probe_result.lut_us;
+    pq_adc_scan_us += probe_result.scan_us;
+    if (collect_scan_trace) {
+      scanned_doc_ids.insert(scanned_doc_ids.end(), probe_result.scanned_doc_ids.begin(),
+                             probe_result.scanned_doc_ids.end());
+      scanned_approx_dists.insert(scanned_approx_dists.end(),
+                                  probe_result.scanned_approx_dists.begin(),
+                                  probe_result.scanned_approx_dists.end());
+    }
+    for (Candidate& candidate : probe_result.heap) {
+      if (heap.size() < topk || candidate.approx_dist < heap.front().approx_dist) {
+        if (heap.size() == topk) {
+          std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+          heap.back() = std::move(candidate);
+          std::push_heap(heap.begin(), heap.end(), heap_cmp);
+        } else {
+          heap.push_back(std::move(candidate));
+          std::push_heap(heap.begin(), heap.end(), heap_cmp);
+        }
+      }
     }
   }
 

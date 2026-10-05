@@ -87,3 +87,7 @@ ann_set_warnings(build_index)
 add_executable(run_eval_ms apps/run_eval_ms.cpp apps/eval_counter.cpp apps/eval_output.cpp)
 target_link_libraries(run_eval_ms PRIVATE ann)
 ann_set_warnings(run_eval_ms)
+
+add_executable(run_concurrent_eval apps/run_concurrent_eval.cpp)
+target_link_libraries(run_concurrent_eval PRIVATE ann)
+ann_set_warnings(run_concurrent_eval)
