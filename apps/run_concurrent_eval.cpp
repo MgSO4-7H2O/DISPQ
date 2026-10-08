@@ -1008,19 +1008,10 @@ int main(int argc, char** argv) {
         if (failed.load()) break;
         access = std::shared_lock<std::shared_mutex>(workload_mutex);
       }
-      std::lock_guard<std::mutex> commit_lock(version_mutex);
-      std::shared_ptr<IVFIndex> active_index;
-      VersionSet active_versions;
       bool create_active;
-      std::optional<Route> new_active;
-      std::vector<DocId> delete_ids;
       {
         std::lock_guard<std::mutex> lock(state_mutex);
         create_active = !state.active;
-        if (!create_active) {
-          active_index = state.active->index;
-          active_versions = state.active->versions;
-        }
       }
       if (create_active) {
         IVFParams params = ivf_params;
@@ -1029,8 +1020,45 @@ int main(int argc, char** argv) {
         VersionSet versions{whiten_version, 0};
         auto built = BuildIndex(index_data, next_row, end, params, &versions);
         if (!built.ok()) { report_failure(built.status().ToString()); break; }
-        new_active = Route{built.value(), versions, end - next_row, next_shard_id++};
+
+        Route new_active{built.value(), versions, end - next_row, next_shard_id};
+        std::deque<DocId> new_active_window_ids;
+        for (uint32_t row = next_row; row < end; ++row)
+          new_active_window_ids.push_back(row);
+
+        bool active_already_published = false;
+        {
+          std::lock_guard<std::mutex> commit_lock(version_mutex);
+          std::lock_guard<std::mutex> state_lock(state_mutex);
+          active_already_published = state.active.has_value();
+          if (!active_already_published) {
+            state.active = std::move(new_active);
+            active_window_ids.swap(new_active_window_ids);
+            state.committed_rows = end;
+            ++state.version;
+            current_committed.store(end, std::memory_order_release);
+            current_version.store(state.version, std::memory_order_release);
+            ++next_shard_id;
+          }
+        }
+        if (active_already_published) {
+          report_failure("Active shard appeared while preparing a new Active index");
+          break;
+        }
       } else {
+        std::lock_guard<std::mutex> commit_lock(version_mutex);
+        std::shared_ptr<IVFIndex> active_index;
+        VersionSet active_versions;
+        std::vector<DocId> delete_ids;
+        {
+          std::lock_guard<std::mutex> lock(state_mutex);
+          if (!state.active) {
+            report_failure("Active shard disappeared before AddOnline");
+            break;
+          }
+          active_index = state.active->index;
+          active_versions = state.active->versions;
+        }
         const bool sliding_window = config.online_pq_update_scheme == "sliding_window";
         if (sliding_window && state.active->rows + end - next_row >
                                   config.online_pq_sliding_window_size) {
@@ -1047,20 +1075,15 @@ int main(int argc, char** argv) {
         if (!inserted.ok()) { report_failure(inserted.ToString()); break; }
         for (size_t i = 0; i < delete_ids.size(); ++i) active_window_ids.pop_front();
         for (uint32_t row = next_row; row < end; ++row) active_window_ids.push_back(row);
-      }
-      {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        if (new_active) {
-          state.active = std::move(new_active);
-          active_window_ids.clear();
-          for (uint32_t row = next_row; row < end; ++row) active_window_ids.push_back(row);
+        {
+          std::lock_guard<std::mutex> lock(state_mutex);
+          if (state.active)
+            state.active->rows += end - next_row - static_cast<uint32_t>(delete_ids.size());
+          state.committed_rows = end;
+          ++state.version;
+          current_committed.store(end, std::memory_order_release);
+          current_version.store(state.version, std::memory_order_release);
         }
-        else if (state.active)
-          state.active->rows += end - next_row - static_cast<uint32_t>(delete_ids.size());
-        state.committed_rows = end;
-        ++state.version;
-        current_committed.store(end, std::memory_order_release);
-        current_version.store(state.version, std::memory_order_release);
       }
     }
     const double insert_ms = std::chrono::duration<double, std::milli>(Clock::now() - insert_start).count();
