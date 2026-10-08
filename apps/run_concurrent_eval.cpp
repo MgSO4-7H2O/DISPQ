@@ -69,42 +69,58 @@ double Percentile(std::vector<double> values, double quantile) {
   return values[lo] + (values[hi] - values[lo]) * (pos - lo);
 }
 
-std::vector<std::vector<DocId>> ExactSearchPrefix(const MatrixRM& queries,
-                                                   const MatrixRM& database,
-                                                   uint32_t rows,
-                                                   uint32_t topk) {
-  std::vector<float> norms(rows);
-  for (uint32_t row = 0; row < rows; ++row)
-    norms[row] = database.row(row).squaredNorm();
-  std::vector<std::vector<DocId>> ids(static_cast<size_t>(queries.rows()));
+std::vector<std::vector<std::vector<DocId>>> ComputeIncrementalPrefixGroundTruth(
+    const MatrixRM& queries,
+    const MatrixRM& database,
+    uint32_t topk,
+    const std::vector<uint32_t>& frontiers) {
+  const size_t query_count = static_cast<size_t>(queries.rows());
+  std::vector<std::vector<std::vector<DocId>>> gt(
+      frontiers.size(), std::vector<std::vector<DocId>>(query_count));
+  const uint32_t final_frontier = frontiers.empty() ? 0 : frontiers.back();
+  std::vector<float> database_norms(final_frontier);
+  for (uint32_t row = 0; row < final_frontier; ++row)
+    database_norms[row] = database.row(row).squaredNorm();
+
 #ifdef _OPENMP
-#pragma omp parallel
+#pragma omp parallel for schedule(dynamic)
 #endif
-  {
-    std::vector<std::pair<float, DocId>> distances(rows);
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic)
-#endif
-    for (int64_t qi = 0; qi < queries.rows(); ++qi) {
-      const Eigen::VectorXf query = queries.row(qi).transpose();
-      const float query_norm = query.squaredNorm();
-      for (uint32_t row = 0; row < rows; ++row) {
+  for (int64_t qi = 0; qi < queries.rows(); ++qi) {
+    const Eigen::VectorXf query = queries.row(qi).transpose();
+    const float query_norm = query.squaredNorm();
+    const size_t heap_capacity = std::min<size_t>(topk, final_frontier);
+    std::vector<std::pair<float, DocId>> heap;
+    std::vector<std::pair<float, DocId>> ordered;
+    heap.reserve(heap_capacity);
+    ordered.reserve(heap_capacity);
+    uint32_t scanned_rows = 0;
+
+    for (size_t version = 0; version < frontiers.size(); ++version) {
+      const uint32_t frontier = frontiers[version];
+      for (uint32_t row = scanned_rows; row < frontier; ++row) {
         const float dot = database.row(row).dot(query);
-        distances[row] = {query_norm + norms[row] - 2.0f * dot, row};
+        const std::pair<float, DocId> candidate{
+            query_norm + database_norms[row] - 2.0f * dot, row};
+        if (heap.size() < topk) {
+          heap.push_back(candidate);
+          std::push_heap(heap.begin(), heap.end());
+        } else if (!heap.empty() && candidate < heap.front()) {
+          std::pop_heap(heap.begin(), heap.end());
+          heap.back() = candidate;
+          std::push_heap(heap.begin(), heap.end());
+        }
       }
-      const size_t limit = std::min<size_t>(topk, rows);
-      if (rows > limit) {
-        std::nth_element(distances.begin(), distances.begin() + limit, distances.end(),
-                         [](const auto& a, const auto& b) { return a.first < b.first; });
-      }
-      std::sort(distances.begin(), distances.begin() + limit,
-                [](const auto& a, const auto& b) { return a.first < b.first; });
-      auto& query_ids = ids[static_cast<size_t>(qi)];
-      query_ids.resize(limit);
-      for (size_t i = 0; i < limit; ++i) query_ids[i] = distances[i].second;
+      scanned_rows = frontier;
+
+      ordered.assign(heap.begin(), heap.end());
+      std::sort(ordered.begin(), ordered.end());
+      auto& query_ids = gt[version][static_cast<size_t>(qi)];
+      query_ids.resize(topk, 0);
+      for (size_t i = 0; i < ordered.size(); ++i)
+        query_ids[i] = ordered[i].second;
     }
   }
-  return ids;
+  return gt;
 }
 
 Result<std::shared_ptr<IVFIndex>> BuildIndex(const MatrixRM& data,
@@ -245,6 +261,7 @@ Status SaveGroundTruth(const std::string& path,
                        const std::vector<uint32_t>& frontiers,
                        const MatrixRM& queries,
                        const MatrixRM& database) {
+  const auto gt = ComputeIncrementalPrefixGroundTruth(queries, database, topk, frontiers);
   std::ofstream out(path, std::ios::binary);
   if (!out) return Status::IOError("Unable to write GT artifact: " + path);
   out.write("DISPGT01", 8);
@@ -257,14 +274,10 @@ Status SaveGroundTruth(const std::string& path,
   WriteValue(out, initial_rows);
   WriteValue(out, batch_size);
   WriteValue(out, version_count);
-  for (uint32_t frontier : frontiers) {
-    WriteValue(out, frontier);
-    auto exact = ExactSearchPrefix(queries, database, frontier, topk);
-    for (const auto& row : exact) {
-      std::vector<DocId> ids = row;
-      ids.resize(topk, 0);
+  for (size_t version = 0; version < frontiers.size(); ++version) {
+    WriteValue(out, frontiers[version]);
+    for (const auto& ids : gt[version])
       out.write(reinterpret_cast<const char*>(ids.data()), topk * sizeof(DocId));
-    }
   }
   return out ? Status::OK() : Status::IOError("Failed writing GT artifact");
 }
