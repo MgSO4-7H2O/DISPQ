@@ -7,6 +7,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <numeric>
@@ -36,6 +37,7 @@ namespace {
 using namespace ann;
 using Clock = std::chrono::steady_clock;
 constexpr uint32_t kConcurrentTransformBlockRows = 65536;
+constexpr double kTimelineBucketMs = 200.0;
 
 struct Route {
   std::shared_ptr<IVFIndex> index;
@@ -48,7 +50,32 @@ struct QueryRecord {
   uint32_t query_id{0};
   uint64_t version{0};
   double latency_ms{0.0};
+  double completion_ms{0.0};
   std::vector<DocId> returned_topk;
+};
+
+struct InsertTimelineRecord {
+  uint64_t batch{0};
+  uint64_t version{0};
+  uint32_t begin_row{0};
+  uint32_t end_row{0};
+  double start_ms{0.0};
+  double end_ms{0.0};
+  double transform_ms{0.0};
+  double insert_ms{0.0};
+  double batch_ms{0.0};
+};
+
+enum class TimelineEventType { kMerge, kRebuild };
+
+struct TimelineEvent {
+  TimelineEventType type{TimelineEventType::kMerge};
+  uint64_t id{0};
+  double request_ms{0.0};
+  double start_ms{0.0};
+  double end_ms{0.0};
+  uint32_t rows{0};
+  uint32_t main_rows{0};
 };
 
 struct RuntimeState {
@@ -523,6 +550,8 @@ int main(int argc, char** argv) {
   std::atomic<bool> start_workers{false};
   std::atomic<uint64_t> next_query{0};
   std::vector<QueryRecord> query_records;
+  std::vector<InsertTimelineRecord> insert_timeline_records;
+  std::vector<TimelineEvent> timeline_events;
   std::vector<double> insert_batch_ms;
   std::atomic<uint64_t> inserted_vectors{0}, committed_batches{0}, merge_count{0}, rebuild_count{0};
   double merge_total_ms = 0.0, merge_compute_ms = 0.0, merge_commit_ms = 0.0;
@@ -634,6 +663,7 @@ int main(int argc, char** argv) {
         const uint64_t rebuild_id = rebuild_count.load() + 1;
         uint32_t rebuild_rows = 0;
         uint32_t rebuild_main_rows = 0;
+        Clock::time_point rebuild_requested;
         {
           std::lock_guard<std::mutex> state_lock(state_mutex);
           rebuild_rows = state.committed_rows;
@@ -642,14 +672,16 @@ int main(int argc, char** argv) {
         {
           std::lock_guard<std::mutex> entry_lock(workload_entry_mutex);
           rebuild_pending = true;
+          rebuild_requested = Clock::now();
         }
         std::cout << "[REBUILD] requested id=" << rebuild_id
                   << " committed_rows=" << rebuild_rows
                   << " main_rows=" << rebuild_main_rows << std::endl;
         const auto barrier_wait_start = Clock::now();
         std::unique_lock<std::shared_mutex> barrier(workload_mutex);
+        const auto barrier_acquired = Clock::now();
         const double barrier_wait_ms = std::chrono::duration<double, std::milli>(
-                                           Clock::now() - barrier_wait_start).count();
+                                           barrier_acquired - barrier_wait_start).count();
 #ifdef _OPENMP
         omp_set_num_threads(runtime_max_threads);
 #endif
@@ -678,6 +710,15 @@ int main(int argc, char** argv) {
           ++rebuild_count;
           last_global_rebuild_rows = rebuild_rows;
           last_global_rebuild_main_rows = rebuild_rows;
+        }
+        const auto rebuild_end = Clock::now();
+        if (replacement.ok()) {
+          timeline_events.push_back({
+              TimelineEventType::kRebuild, rebuild_id,
+              std::chrono::duration<double, std::milli>(rebuild_requested - measurement_start).count(),
+              std::chrono::duration<double, std::milli>(barrier_acquired - measurement_start).count(),
+              std::chrono::duration<double, std::milli>(rebuild_end - measurement_start).count(),
+              rebuild_rows, rebuild_main_rows});
         }
 #ifdef _OPENMP
         omp_set_num_threads(std::max(1u, config.concurrent_maintenance_threads));
@@ -710,6 +751,7 @@ int main(int argc, char** argv) {
         }
         if (frozen) {
           const auto begin = Clock::now();
+          const double merge_start_ms = std::chrono::duration<double, std::milli>(begin - measurement_start).count();
           std::cout << "[MERGE] start id=" << frozen->id
                     << " frozen_rows=" << frozen->rows
                     << " main_rows=" << main_rows_for_merge
@@ -747,9 +789,14 @@ int main(int argc, char** argv) {
               }
             }
           }
-          const double merge_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+          const auto merge_end = Clock::now();
+          const double merge_ms = std::chrono::duration<double, std::milli>(merge_end - begin).count();
           merge_total_ms += merge_ms;
           if (merge_succeeded) {
+            timeline_events.push_back({
+                TimelineEventType::kMerge, frozen->id, merge_start_ms, merge_start_ms,
+                std::chrono::duration<double, std::milli>(merge_end - measurement_start).count(),
+                frozen->rows, main_rows_for_merge});
             uint32_t merged_main_rows = 0;
             {
               std::lock_guard<std::mutex> lock(state_mutex);
@@ -869,7 +916,9 @@ int main(int argc, char** argv) {
             std::lock_guard<std::mutex> commit_lock(version_mutex);
             record.version = current_version.load(std::memory_order_acquire);
           }
-          record.latency_ms = std::chrono::duration<double, std::milli>(Clock::now() - dispatch).count();
+          const auto completion = Clock::now();
+          record.latency_ms = std::chrono::duration<double, std::milli>(completion - dispatch).count();
+          record.completion_ms = std::chrono::duration<double, std::milli>(completion - measurement_start).count();
           for (const Candidate& candidate : unique) record.returned_topk.push_back(candidate.doc_id);
           std::lock_guard<std::mutex> lock(records_mutex);
           query_records.push_back(std::move(record));
@@ -986,7 +1035,13 @@ int main(int argc, char** argv) {
       }
     }
     const double insert_ms = std::chrono::duration<double, std::milli>(Clock::now() - insert_start).count();
-    const double batch_ms = std::chrono::duration<double, std::milli>(Clock::now() - batch_start).count();
+    const auto batch_end = Clock::now();
+    const double batch_ms = std::chrono::duration<double, std::milli>(batch_end - batch_start).count();
+    insert_timeline_records.push_back({
+        batch_number, current_version.load(std::memory_order_acquire), batch_begin, end,
+        std::chrono::duration<double, std::milli>(batch_start - measurement_start).count(),
+        std::chrono::duration<double, std::milli>(batch_end - measurement_start).count(),
+        transform_ms, insert_ms, batch_ms});
     insert_batch_ms.push_back(batch_ms);
     inserted_vectors += end - next_row;
     ++committed_batches;
@@ -1202,6 +1257,103 @@ int main(int argc, char** argv) {
           << "  \"active_rows_over_trigger\": " << active_rows_over_trigger << ",\n"
           << "  \"global_rebuild_count\": " << rebuild_count << ",\n"
           << "  \"global_rebuild_total_ms\": " << rebuild_total_ms << "\n}\n";
+  if (!summary) {
+    std::cerr << "Failed writing summary file: " << summary_path << '\n';
+    return 1;
+  }
+
+  const std::filesystem::path summary_file(summary_path);
+  const std::string summary_stem = summary_file.stem().string();
+  const auto timeline_path = [&](const std::string& suffix) {
+    return summary_file.parent_path() / (summary_stem + suffix);
+  };
+  const auto timeseries_path = timeline_path("_timeseries.csv");
+  const auto insert_path = timeline_path("_insert.csv");
+  const auto events_path = timeline_path("_events.csv");
+
+  struct QueryBucket {
+    std::vector<double> latencies;
+  };
+  const size_t bucket_count = measurement_wall_ms > 0.0
+      ? static_cast<size_t>(std::ceil(measurement_wall_ms / kTimelineBucketMs)) : 0;
+  std::vector<QueryBucket> query_buckets(bucket_count);
+  for (const QueryRecord& record : query_records) {
+    if (bucket_count == 0) break;
+    const size_t bucket = std::min(
+        static_cast<size_t>(record.completion_ms / kTimelineBucketMs), bucket_count - 1);
+    query_buckets[bucket].latencies.push_back(record.latency_ms);
+  }
+
+  std::ofstream timeseries(timeseries_path);
+  if (!timeseries) {
+    std::cerr << "Failed to open timeline CSV: " << timeseries_path << '\n';
+    return 1;
+  }
+  timeseries << std::setprecision(12)
+             << "window_start_ms,window_end_ms,query_count,query_qps,"
+                "query_latency_mean_ms,query_latency_p50_ms,query_latency_p95_ms,"
+                "query_latency_p99_ms,query_latency_max_ms\n";
+  for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
+    const double window_start_ms = bucket * kTimelineBucketMs;
+    // The final bucket uses the measured remainder of the workload duration.
+    const double window_end_ms = std::min(measurement_wall_ms,
+                                          window_start_ms + kTimelineBucketMs);
+    const double window_seconds = (window_end_ms - window_start_ms) / 1000.0;
+    const auto& bucket_latencies = query_buckets[bucket].latencies;
+    const double latency_mean = bucket_latencies.empty() ? 0.0
+        : std::accumulate(bucket_latencies.begin(), bucket_latencies.end(), 0.0) /
+              bucket_latencies.size();
+    const double latency_max = bucket_latencies.empty() ? 0.0
+        : *std::max_element(bucket_latencies.begin(), bucket_latencies.end());
+    timeseries << window_start_ms << ',' << window_end_ms << ','
+               << bucket_latencies.size() << ','
+               << (window_seconds > 0.0 ? bucket_latencies.size() / window_seconds : 0.0) << ','
+               << latency_mean << ',' << Percentile(bucket_latencies, .50) << ','
+               << Percentile(bucket_latencies, .95) << ','
+               << Percentile(bucket_latencies, .99) << ',' << latency_max << '\n';
+  }
+  timeseries.close();
+  if (!timeseries) {
+    std::cerr << "Failed writing timeline CSV: " << timeseries_path << '\n';
+    return 1;
+  }
+
+  std::ofstream inserts(insert_path);
+  if (!inserts) {
+    std::cerr << "Failed to open insert timeline CSV: " << insert_path << '\n';
+    return 1;
+  }
+  inserts << std::setprecision(12)
+          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms\n";
+  for (const InsertTimelineRecord& record : insert_timeline_records) {
+    inserts << record.batch << ',' << record.version << ','
+            << record.begin_row << ',' << record.end_row << ','
+            << record.start_ms << ',' << record.end_ms << ','
+            << record.transform_ms << ',' << record.insert_ms << ','
+            << record.batch_ms << '\n';
+  }
+  inserts.close();
+  if (!inserts) {
+    std::cerr << "Failed writing insert timeline CSV: " << insert_path << '\n';
+    return 1;
+  }
+
+  std::ofstream events(events_path);
+  if (!events) {
+    std::cerr << "Failed to open event timeline CSV: " << events_path << '\n';
+    return 1;
+  }
+  events << std::setprecision(12) << "type,id,request_ms,start_ms,end_ms,rows,main_rows\n";
+  for (const TimelineEvent& event : timeline_events) {
+    events << (event.type == TimelineEventType::kMerge ? "merge" : "rebuild")
+           << ',' << event.id << ',' << event.request_ms << ',' << event.start_ms << ','
+           << event.end_ms << ',' << event.rows << ',' << event.main_rows << '\n';
+  }
+  events.close();
+  if (!events) {
+    std::cerr << "Failed writing event timeline CSV: " << events_path << '\n';
+    return 1;
+  }
   std::cout << "[CONCURRENT] summary=" << summary_path << ", completed_queries="
             << query_records.size() << ", qps="
             << (measurement_wall_ms > 0 ? query_records.size() * 1000.0 / measurement_wall_ms : 0.0)
