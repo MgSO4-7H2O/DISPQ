@@ -1492,7 +1492,6 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
   profiling.compute_done_at = ProfilingClock::now();
   Timer commit_timer;
-  profiling.commit_wait_start_at = ProfilingClock::now();
   Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value());
   if (!commit.ok()) {
     return commit;
@@ -1511,6 +1510,11 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
     return patch_profile_res.status();
   }
   const PatchProfiling& patch_profile = patch_profile_res.value();
+  profiling.prepare_publish_us = patch_profile.prepare_publish_us;
+  profiling.commit_validation_us = patch_profile.commit_validation_us;
+  profiling.commit_docmap_us = patch_profile.commit_docmap_us;
+  profiling.commit_partition_swap_us = patch_profile.commit_partition_swap_us;
+  profiling.commit_wait_start_at = patch_profile.commit_wait_start_at;
   profiling.commit_lock_acquired_at = patch_profile.commit_lock_acquired_at;
   profiling.commit_done_at = patch_profile.commit_done_at;
   profiling.pq_codes_reused = patch_profile.pq_codes_reused;

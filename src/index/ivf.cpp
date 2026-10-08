@@ -2913,210 +2913,321 @@ class KMeansIVFIndex : public IVFIndex {
           "CommitPartitionPatch: partition_ids size mismatch with replacement_records");
     }
 
-    std::unique_lock lock(mu_);
-    const auto commit_lock_acquired = std::chrono::steady_clock::now();
-    auto it = data_map_.find(route_versions.index_version);
-    if (it == data_map_.end()) {
-      return Status::NotFound("Index version not built");
-    }
-    IndexData& data = *it->second;
+    struct PreparedPartitionReplacement {
+      uint32_t partition_id{0};
+      AlignedVector<ListEntry> entries;
+      std::vector<DocId> old_doc_ids;
+      std::vector<DocId> doc_ids;
+      std::vector<uint8_t> pq_codes;
+      ListPQCodesSoA pq_codes_soa;
+    };
+
+    const auto prepare_start = std::chrono::steady_clock::now();
     const bool has_prepared_pq = patch.prepared_pq.has_value();
-    if (data.use_pq) {
-      Status encoding_state = ValidatePQEncodingState(data);
-      if (!encoding_state.ok()) {
-        return encoding_state;
-      }
-    }
-    if (has_prepared_pq) {
-      const PreparedPQPayload& prepared = *patch.prepared_pq;
-      if (!data.use_pq || !MatchesPQEncodingContext(data, prepared.context)) {
-        return Status::InvalidArgument(
-            "CommitPartitionPatch: prepared PQ encoding context expired");
-      }
-      if (prepared.partition_codes.size() != patch.partition_ids.size()) {
-        return Status::InvalidArgument(
-            "CommitPartitionPatch: prepared PQ partition shape mismatch");
-      }
-    }
-
-    std::vector<uint8_t> patch_partitions(data.nlist, 0);
-    for (uint32_t partition_id : patch.partition_ids) {
-      if (partition_id >= data.nlist) {
-        return Status::InvalidArgument("CommitPartitionPatch: partition_id out of range");
-      }
-      if (patch_partitions[static_cast<size_t>(partition_id)] != 0) {
-        return Status::InvalidArgument("CommitPartitionPatch: duplicate partition_id");
-      }
-      patch_partitions[static_cast<size_t>(partition_id)] = 1;
-    }
-
-    std::unordered_set<DocId> patch_doc_ids;
-    size_t patch_record_count = 0;
-    for (const auto& records : patch.replacement_records) {
-      patch_record_count += records.size();
-    }
-    patch_doc_ids.reserve(patch_record_count);
-    for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
-      const auto& records = patch.replacement_records[i];
-      if (has_prepared_pq) {
-        const PreparedPartitionPQCodes& prepared_partition =
-            patch.prepared_pq->partition_codes[i];
-        if (prepared_partition.record_count != static_cast<uint64_t>(records.size()) ||
-            prepared_partition.code_size != data.M ||
-            records.size() > std::numeric_limits<size_t>::max() /
-                                 static_cast<size_t>(data.M) ||
-            prepared_partition.final_codes.size() !=
-                records.size() * static_cast<size_t>(data.M)) {
-          return Status::InvalidArgument(
-              "CommitPartitionPatch: prepared PQ record shape mismatch");
-        }
-      }
-      for (const auto& rec : records) {
-        const bool dense_vector_required = !has_prepared_pq;
-        if ((dense_vector_required && static_cast<uint32_t>(rec.x.size()) != data.dim) ||
-            (has_prepared_pq &&
-             (rec.dim != data.dim || rec.ivf_id != patch.partition_ids[i]))) {
-          return Status::InvalidArgument(
-              "CommitPartitionPatch: record shape or target mismatch");
-        }
-        if (!patch_doc_ids.insert(rec.doc_id).second) {
-          return Status::AlreadyExists("CommitPartitionPatch: duplicate doc_id in patch");
-        }
-        uint32_t existing_list = 0;
-        if (data.doc_to_list.Get(rec.doc_id, &existing_list) &&
-            patch_partitions[static_cast<size_t>(existing_list)] == 0) {
-          return Status::AlreadyExists(
-              "CommitPartitionPatch: doc_id collides with unaffected partitions");
-        }
-      }
-    }
-    if (has_prepared_pq &&
-        patch.prepared_pq->codes_reused + patch.prepared_pq->codes_reencoded !=
-            patch_record_count) {
-      return Status::InvalidArgument(
-          "CommitPartitionPatch: prepared PQ profiling count mismatch");
-    }
-
-    // All fallible validation of the prepared representation is complete.
-    // No persistent list has been changed above this point.
-    data.last_patch_pq_reencode_ms = 0.0;
-    data.last_patch_profiling = PatchProfiling{};
-    data.last_patch_profiling.patch_records =
-        static_cast<uint64_t>(patch_record_count);
-
+    std::vector<PreparedPartitionReplacement> prepared_partitions;
+    DenseDocListMap prepared_doc_map;
+    uint64_t snapshot_mutation_generation = 0;
+    PQEncodingContext snapshot_context;
+    uint64_t old_record_count = 0;
+    uint64_t patch_record_count = 0;
+    uint64_t prepared_ntotal = 0;
     double pq_code_assignment_us = 0.0;
     double pq_code_copy_or_reuse_us = 0.0;
     double pq_list_flatten_us = 0.0;
     uint64_t pq_codes_reused = 0;
     uint64_t pq_codes_reencoded = 0;
-    bool mutation_started = false;
-    if (has_prepared_pq) {
-      pq_code_assignment_us = patch.prepared_pq->encode_us;
-      pq_code_copy_or_reuse_us = patch.prepared_pq->copy_or_reuse_us;
-      pq_codes_reused = patch.prepared_pq->codes_reused;
-      pq_codes_reencoded = patch.prepared_pq->codes_reencoded;
-    }
-    for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
-      const uint32_t partition_id = patch.partition_ids[i];
-      const auto& records = patch.replacement_records[i];
-      auto& dst = data.lists[static_cast<size_t>(partition_id)];
-      std::unordered_map<DocId, const ListEntry*> old_by_doc;
-      std::vector<const ListEntry*> reusable;
-      if (data.use_pq && !has_prepared_pq) {
-        reusable.assign(records.size(), nullptr);
-      }
-      if (data.use_pq && !has_prepared_pq && data.pq_code_reuse_safe) {
-        Timer pq_reuse_timer;
-        old_by_doc.reserve(dst.size());
-        for (const auto& old_entry : dst) {
-          old_by_doc.emplace(old_entry.doc_id, &old_entry);
-        }
-        for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
-          auto old_it = old_by_doc.find(records[record_pos].doc_id);
-          if (old_it != old_by_doc.end() && old_it->second->pq_code.size() == data.M) {
-            reusable[record_pos] = old_it->second;
-          }
-        }
-        pq_code_copy_or_reuse_us += pq_reuse_timer.ElapsedMicros();
-      }
-      std::vector<uint8_t> prepared_codes;
-      const std::vector<uint8_t>* final_codes = nullptr;
-      if (has_prepared_pq) {
-        final_codes = &patch.prepared_pq->partition_codes[i].final_codes;
-      } else if (data.use_pq) {
-        prepared_codes.resize(records.size() * static_cast<size_t>(data.M));
-        Timer pq_reencode_timer;
-        for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
-          if (reusable[record_pos] != nullptr) {
-            continue;
-          }
-          uint8_t* code_out =
-              prepared_codes.data() + record_pos * static_cast<size_t>(data.M);
-          EncodePQForTargetPartition(
-              data, partition_id, records[record_pos].x, code_out);
-          ++pq_codes_reencoded;
-        }
-        pq_code_assignment_us += pq_reencode_timer.ElapsedMicros();
 
-        Timer pq_copy_timer;
-        for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
-          const ListEntry* old_entry = reusable[record_pos];
-          if (old_entry == nullptr) {
-            continue;
-          }
-          std::copy(old_entry->pq_code.begin(),
-                    old_entry->pq_code.end(),
-                    prepared_codes.begin() +
-                        static_cast<std::ptrdiff_t>(record_pos * static_cast<size_t>(data.M)));
-          ++pq_codes_reused;
-        }
-        pq_code_copy_or_reuse_us += pq_copy_timer.ElapsedMicros();
-        final_codes = &prepared_codes;
+    {
+      std::shared_lock prepare_lock(mu_);
+      auto it = data_map_.find(route_versions.index_version);
+      if (it == data_map_.end()) {
+        return Status::NotFound("Index version not built");
       }
-
-      // Legacy encoding and reuse copying also finish before the first list
-      // mutation, so every explicit failure path remains preflight-only.
-      if (!mutation_started) {
-        data.mutation_generation = next_mutation_generation_++;
-        mutation_started = true;
-      }
-      dst.clear();
-      dst.reserve(records.size());
-      Timer prepared_copy_timer;
-      for (size_t record_pos = 0; record_pos < records.size(); ++record_pos) {
-        const auto& rec = records[record_pos];
-        ListEntry entry;
-        entry.doc_id = rec.doc_id;
-        entry.versions = rec.versions;
-        entry.versions.index_version = data.version;
-        if (data.use_pq) {
-          const uint8_t* code_begin =
-              final_codes->data() + record_pos * static_cast<size_t>(data.M);
-          entry.pq_code.assign(code_begin, code_begin + data.M);
-        } else {
-          entry.vector = rec.x;
-          entry.norm = entry.vector.squaredNorm();
-        }
-        dst.push_back(std::move(entry));
-      }
-      if (has_prepared_pq) {
-        pq_code_copy_or_reuse_us += prepared_copy_timer.ElapsedMicros();
-      }
+      const IndexData& data = *it->second;
+      snapshot_mutation_generation = data.mutation_generation;
+      snapshot_context = MakePQEncodingContext(data);
       if (data.use_pq) {
-        Timer pq_list_flatten_timer;
-        RebuildListPQCodes(&data, partition_id);
-        pq_list_flatten_us += pq_list_flatten_timer.ElapsedMicros();
+        Status encoding_state = ValidatePQEncodingState(data);
+        if (!encoding_state.ok()) return encoding_state;
+        if (data.M == 0 || data.doc_ids_by_list.size() != data.lists.size() ||
+            data.pq_codes_by_list.size() != data.lists.size() ||
+            (data.pq_codes_subquantizer_major &&
+             data.pq_codes_soa_by_list.size() != data.lists.size())) {
+          return Status::InvalidArgument("CommitPartitionPatch: PQ cache shape mismatch");
+        }
       }
+      if (has_prepared_pq) {
+        const PreparedPQPayload& prepared = *patch.prepared_pq;
+        if (!data.use_pq || !MatchesPQEncodingContext(data, prepared.context)) {
+          return Status::InvalidArgument(
+              "CommitPartitionPatch: prepared PQ encoding context expired");
+        }
+        if (prepared.partition_codes.size() != patch.partition_ids.size()) {
+          return Status::InvalidArgument(
+              "CommitPartitionPatch: prepared PQ partition shape mismatch");
+        }
+      }
+
+      std::vector<uint8_t> patch_partitions(data.nlist, 0);
+      for (uint32_t partition_id : patch.partition_ids) {
+        if (partition_id >= data.nlist) {
+          return Status::InvalidArgument("CommitPartitionPatch: partition_id out of range");
+        }
+        if (patch_partitions[static_cast<size_t>(partition_id)] != 0) {
+          return Status::InvalidArgument("CommitPartitionPatch: duplicate partition_id");
+        }
+        patch_partitions[static_cast<size_t>(partition_id)] = 1;
+      }
+
+      std::unordered_set<DocId> patch_doc_ids;
+      for (const auto& records : patch.replacement_records) {
+        patch_record_count += records.size();
+      }
+      patch_doc_ids.reserve(static_cast<size_t>(patch_record_count));
+      for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
+        const auto& records = patch.replacement_records[i];
+        if (has_prepared_pq) {
+          const PreparedPartitionPQCodes& prepared =
+              patch.prepared_pq->partition_codes[i];
+          if (prepared.record_count != records.size() || prepared.code_size != data.M ||
+              records.size() > std::numeric_limits<size_t>::max() / data.M ||
+              prepared.final_codes.size() != records.size() * data.M) {
+            return Status::InvalidArgument(
+                "CommitPartitionPatch: prepared PQ record shape mismatch");
+          }
+        }
+        if (data.use_pq && records.size() > std::numeric_limits<size_t>::max() / data.M) {
+          return Status::InvalidArgument("CommitPartitionPatch: PQ code buffer is too large");
+        }
+        for (const auto& rec : records) {
+          if ((!has_prepared_pq && static_cast<uint32_t>(rec.x.size()) != data.dim) ||
+              (has_prepared_pq &&
+               (rec.dim != data.dim || rec.ivf_id != patch.partition_ids[i]))) {
+            return Status::InvalidArgument(
+                "CommitPartitionPatch: record shape or target mismatch");
+          }
+          if (!patch_doc_ids.insert(rec.doc_id).second) {
+            return Status::AlreadyExists("CommitPartitionPatch: duplicate doc_id in patch");
+          }
+          uint32_t existing_list = 0;
+          if (data.doc_to_list.Get(rec.doc_id, &existing_list) &&
+              (existing_list >= data.nlist ||
+               patch_partitions[static_cast<size_t>(existing_list)] == 0)) {
+            return Status::AlreadyExists(
+                "CommitPartitionPatch: doc_id collides with unaffected partitions");
+          }
+        }
+      }
+      if (has_prepared_pq &&
+          patch.prepared_pq->codes_reused + patch.prepared_pq->codes_reencoded !=
+              patch_record_count) {
+        return Status::InvalidArgument(
+            "CommitPartitionPatch: prepared PQ profiling count mismatch");
+      }
+
+      prepared_doc_map = data.doc_to_list;
+      prepared_partitions.reserve(patch.partition_ids.size());
+      if (has_prepared_pq) {
+        pq_code_assignment_us = patch.prepared_pq->encode_us;
+        pq_code_copy_or_reuse_us = patch.prepared_pq->copy_or_reuse_us;
+        pq_codes_reused = patch.prepared_pq->codes_reused;
+        pq_codes_reencoded = patch.prepared_pq->codes_reencoded;
+      }
+
+      DocId min_new_doc_id = std::numeric_limits<DocId>::max();
+      DocId max_new_doc_id = 0;
+      for (size_t i = 0; i < patch.partition_ids.size(); ++i) {
+        const uint32_t partition_id = patch.partition_ids[i];
+        const auto& records = patch.replacement_records[i];
+        const auto& old_entries = data.lists[static_cast<size_t>(partition_id)];
+        PreparedPartitionReplacement replacement;
+        replacement.partition_id = partition_id;
+        replacement.old_doc_ids.reserve(old_entries.size());
+        for (const auto& entry : old_entries) {
+          replacement.old_doc_ids.push_back(entry.doc_id);
+          prepared_doc_map.Erase(entry.doc_id);
+        }
+        old_record_count += old_entries.size();
+
+        std::vector<uint8_t> fallback_codes;
+        const std::vector<uint8_t>* final_codes = nullptr;
+        if (has_prepared_pq) {
+          final_codes = &patch.prepared_pq->partition_codes[i].final_codes;
+        } else if (data.use_pq) {
+          std::vector<const ListEntry*> reusable(records.size(), nullptr);
+          if (data.pq_code_reuse_safe) {
+            Timer reuse_timer;
+            std::unordered_map<DocId, const ListEntry*> old_by_doc;
+            old_by_doc.reserve(old_entries.size());
+            for (const auto& entry : old_entries) old_by_doc.emplace(entry.doc_id, &entry);
+            for (size_t row = 0; row < records.size(); ++row) {
+              auto found = old_by_doc.find(records[row].doc_id);
+              if (found != old_by_doc.end() && found->second->pq_code.size() == data.M) {
+                reusable[row] = found->second;
+              }
+            }
+            pq_code_copy_or_reuse_us += reuse_timer.ElapsedMicros();
+          }
+          fallback_codes.resize(records.size() * data.M);
+          Timer encode_timer;
+          for (size_t row = 0; row < records.size(); ++row) {
+            if (reusable[row] == nullptr) {
+              EncodePQForTargetPartition(
+                  data, partition_id, records[row].x,
+                  fallback_codes.data() + row * data.M);
+              ++pq_codes_reencoded;
+            }
+          }
+          pq_code_assignment_us += encode_timer.ElapsedMicros();
+          Timer reuse_copy_timer;
+          for (size_t row = 0; row < records.size(); ++row) {
+            if (reusable[row] != nullptr) {
+              std::copy(reusable[row]->pq_code.begin(), reusable[row]->pq_code.end(),
+                        fallback_codes.begin() + row * data.M);
+              ++pq_codes_reused;
+            }
+          }
+          pq_code_copy_or_reuse_us += reuse_copy_timer.ElapsedMicros();
+          final_codes = &fallback_codes;
+        }
+
+        replacement.entries.reserve(records.size());
+        replacement.doc_ids.reserve(records.size());
+        if (data.use_pq) {
+          if (data.pq_codes_subquantizer_major) {
+            replacement.pq_codes_soa.rows = records.size();
+            replacement.pq_codes_soa.stride = records.size();
+            replacement.pq_codes_soa.codes.resize(records.size() * data.M);
+          }
+        }
+        for (size_t row = 0; row < records.size(); ++row) {
+          const auto& rec = records[row];
+          ListEntry entry;
+          entry.doc_id = rec.doc_id;
+          entry.versions = rec.versions;
+          entry.versions.index_version = data.version;
+          replacement.doc_ids.push_back(rec.doc_id);
+          if (data.use_pq) {
+            const uint8_t* code = final_codes->data() + row * data.M;
+            entry.pq_code.assign(code, code + data.M);
+          } else {
+            entry.vector = rec.x;
+            entry.norm = entry.vector.squaredNorm();
+          }
+          replacement.entries.push_back(std::move(entry));
+          min_new_doc_id = std::min(min_new_doc_id, rec.doc_id);
+          max_new_doc_id = std::max(max_new_doc_id, rec.doc_id);
+        }
+        if (data.use_pq) {
+          Timer cache_timer;
+          replacement.pq_codes.reserve(records.size() * data.M);
+          for (size_t row = 0; row < replacement.entries.size(); ++row) {
+            const auto& code = replacement.entries[row].pq_code;
+            replacement.pq_codes.insert(replacement.pq_codes.end(), code.begin(), code.end());
+            if (data.pq_codes_subquantizer_major) {
+              for (uint32_t m = 0; m < data.M; ++m) {
+                replacement.pq_codes_soa.codes[static_cast<size_t>(m) * records.size() + row] =
+                    code[m];
+              }
+            }
+          }
+          pq_list_flatten_us += cache_timer.ElapsedMicros();
+        }
+        prepared_partitions.push_back(std::move(replacement));
+      }
+
+      if (!patch_doc_ids.empty()) {
+        prepared_doc_map.EnsureRange(min_new_doc_id, max_new_doc_id);
+        for (const auto& replacement : prepared_partitions) {
+          for (DocId doc_id : replacement.doc_ids) {
+            prepared_doc_map.Set(doc_id, replacement.partition_id);
+          }
+        }
+      }
+      prepared_doc_map.MaybeCompact();
+      if (old_record_count > data.ntotal) {
+        return Status::InvalidArgument("CommitPartitionPatch: old record count exceeds ntotal");
+      }
+      prepared_ntotal = data.ntotal - old_record_count + patch_record_count;
     }
 
-    RebuildDocMapLocked(&data);
+    const double prepare_publish_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - prepare_start).count();
+    const auto commit_wait_start = std::chrono::steady_clock::now();
+    std::unique_lock lock(mu_);
+    const auto commit_lock_acquired = std::chrono::steady_clock::now();
+    const auto validation_start = commit_lock_acquired;
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    IndexData& data = *it->second;
+    if (data.mutation_generation != snapshot_mutation_generation ||
+        !MatchesPQEncodingContext(data, snapshot_context)) {
+      return Status::InvalidArgument("CommitPartitionPatch: prepared patch context expired");
+    }
+    if (prepared_partitions.size() != patch.partition_ids.size() ||
+        data.lists.size() != data.nlist ||
+        (data.use_pq && (data.doc_ids_by_list.size() != data.lists.size() ||
+                         data.pq_codes_by_list.size() != data.lists.size() ||
+                         (data.pq_codes_subquantizer_major &&
+                          data.pq_codes_soa_by_list.size() != data.lists.size())))) {
+      return Status::InvalidArgument("CommitPartitionPatch: prepared partition shape mismatch");
+    }
+    for (size_t i = 0; i < prepared_partitions.size(); ++i) {
+      const auto& replacement = prepared_partitions[i];
+      if (replacement.partition_id >= data.nlist ||
+          replacement.partition_id != patch.partition_ids[i] ||
+          replacement.entries.size() != patch.replacement_records[i].size() ||
+          (data.use_pq && (replacement.doc_ids.size() != replacement.entries.size() ||
+                           replacement.pq_codes.size() != replacement.entries.size() * data.M ||
+                           (data.pq_codes_subquantizer_major &&
+                            (replacement.pq_codes_soa.rows != replacement.entries.size() ||
+                             replacement.pq_codes_soa.stride != replacement.entries.size() ||
+                             replacement.pq_codes_soa.codes.size() != replacement.entries.size() * data.M))))) {
+        return Status::InvalidArgument("CommitPartitionPatch: prepared partition shape mismatch");
+      }
+    }
+    const double commit_validation_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - validation_start).count();
+
+    const auto docmap_start = std::chrono::steady_clock::now();
+    std::swap(data.doc_to_list, prepared_doc_map);
+    data.ntotal = prepared_ntotal;
+    const double commit_docmap_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - docmap_start).count();
+
+    const auto swap_start = std::chrono::steady_clock::now();
+    for (auto& replacement : prepared_partitions) {
+      const size_t partition_id = static_cast<size_t>(replacement.partition_id);
+      data.lists[partition_id].swap(replacement.entries);
+      if (data.use_pq) {
+        data.doc_ids_by_list[partition_id].swap(replacement.doc_ids);
+        data.pq_codes_by_list[partition_id].swap(replacement.pq_codes);
+        if (data.pq_codes_subquantizer_major) {
+          std::swap(data.pq_codes_soa_by_list[partition_id], replacement.pq_codes_soa);
+        }
+      }
+    }
+    if (!prepared_partitions.empty()) data.mutation_generation = next_mutation_generation_++;
+    const double commit_partition_swap_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - swap_start).count();
+
+    PatchProfiling profiling;
+    profiling.pq_code_assignment_us = pq_code_assignment_us;
+    profiling.pq_code_copy_or_reuse_us = pq_code_copy_or_reuse_us;
+    profiling.pq_list_flatten_us = pq_list_flatten_us;
+    profiling.prepare_publish_us = prepare_publish_us;
+    profiling.commit_validation_us = commit_validation_us;
+    profiling.commit_docmap_us = commit_docmap_us;
+    profiling.commit_partition_swap_us = commit_partition_swap_us;
+    profiling.patch_records = patch_record_count;
+    profiling.pq_codes_reused = pq_codes_reused;
+    profiling.pq_codes_reencoded = pq_codes_reencoded;
+    profiling.commit_wait_start_at = commit_wait_start;
+    profiling.commit_lock_acquired_at = commit_lock_acquired;
     data.last_patch_pq_reencode_ms = pq_code_assignment_us / 1000.0;
-    data.last_patch_profiling.pq_code_assignment_us = pq_code_assignment_us;
-    data.last_patch_profiling.pq_code_copy_or_reuse_us = pq_code_copy_or_reuse_us;
-    data.last_patch_profiling.pq_list_flatten_us = pq_list_flatten_us;
-    data.last_patch_profiling.pq_codes_reused = pq_codes_reused;
-    data.last_patch_profiling.pq_codes_reencoded = pq_codes_reencoded;
-    data.last_patch_profiling.commit_lock_acquired_at = commit_lock_acquired;
+    data.last_patch_profiling = profiling;
     data.last_patch_profiling.commit_done_at = std::chrono::steady_clock::now();
     return Status::OK();
   }

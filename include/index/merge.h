@@ -107,6 +107,10 @@ struct MergeProfiling {
   double patch_prepare_us{0.0};
   double prepare_pq_encode_us{0.0};
   double commit_us{0.0};
+  double prepare_publish_us{0.0};
+  double commit_validation_us{0.0};
+  double commit_docmap_us{0.0};
+  double commit_partition_swap_us{0.0};
   std::chrono::steady_clock::time_point compute_done_at{};
   std::chrono::steady_clock::time_point commit_wait_start_at{};
   std::chrono::steady_clock::time_point commit_lock_acquired_at{};

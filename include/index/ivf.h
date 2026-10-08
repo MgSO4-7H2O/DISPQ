@@ -196,6 +196,11 @@ struct PatchProfiling {
   double pq_code_assignment_us{0.0};
   double pq_code_copy_or_reuse_us{0.0};
   double pq_list_flatten_us{0.0};
+  double prepare_publish_us{0.0};
+  double commit_validation_us{0.0};
+  double commit_docmap_us{0.0};
+  double commit_partition_swap_us{0.0};
+  std::chrono::steady_clock::time_point commit_wait_start_at{};
   std::chrono::steady_clock::time_point commit_lock_acquired_at{};
   std::chrono::steady_clock::time_point commit_done_at{};
   uint64_t patch_records{0};

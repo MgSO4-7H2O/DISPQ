@@ -80,6 +80,10 @@ struct TimelineEvent {
   double end_ms{0.0};
   uint32_t rows{0};
   uint32_t main_rows{0};
+  double prepare_publish_us{0.0};
+  double commit_validation_us{0.0};
+  double commit_docmap_us{0.0};
+  double commit_partition_swap_us{0.0};
 };
 
 struct RuntimeState {
@@ -817,6 +821,10 @@ int main(int argc, char** argv) {
             event.end_ms = timeline_ms(merge_end);
             event.rows = frozen->rows;
             event.main_rows = main_rows_for_merge;
+            event.prepare_publish_us = event_profiling.prepare_publish_us;
+            event.commit_validation_us = event_profiling.commit_validation_us;
+            event.commit_docmap_us = event_profiling.commit_docmap_us;
+            event.commit_partition_swap_us = event_profiling.commit_partition_swap_us;
             timeline_events.push_back(event);
             uint32_t merged_main_rows = 0;
             {
@@ -1366,13 +1374,16 @@ int main(int argc, char** argv) {
   }
   events << std::setprecision(12)
          << "type,id,request_ms,start_ms,compute_done_ms,commit_wait_start_ms,"
-            "commit_lock_acquired_ms,commit_done_ms,end_ms,rows,main_rows\n";
+            "commit_lock_acquired_ms,commit_done_ms,end_ms,rows,main_rows,"
+            "prepare_publish_us,commit_validation_us,commit_docmap_us,commit_partition_swap_us\n";
   for (const TimelineEvent& event : timeline_events) {
     events << (event.type == TimelineEventType::kMerge ? "merge" : "rebuild")
            << ',' << event.id << ',' << event.request_ms << ',' << event.start_ms << ','
            << event.compute_done_ms << ',' << event.commit_wait_start_ms << ','
            << event.commit_lock_acquired_ms << ',' << event.commit_done_ms << ','
-           << event.end_ms << ',' << event.rows << ',' << event.main_rows << '\n';
+           << event.end_ms << ',' << event.rows << ',' << event.main_rows << ','
+           << event.prepare_publish_us << ',' << event.commit_validation_us << ','
+           << event.commit_docmap_us << ',' << event.commit_partition_swap_us << '\n';
   }
   events.close();
   if (!events) {
