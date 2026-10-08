@@ -35,6 +35,7 @@ namespace {
 
 using namespace ann;
 using Clock = std::chrono::steady_clock;
+constexpr uint32_t kConcurrentTransformBlockRows = 65536;
 
 struct Route {
   std::shared_ptr<IVFIndex> index;
@@ -68,6 +69,28 @@ double Percentile(std::vector<double> values, double quantile) {
   const size_t lo = static_cast<size_t>(pos);
   const size_t hi = std::min(lo + 1, values.size() - 1);
   return values[lo] + (values[hi] - values[lo]) * (pos - lo);
+}
+
+Status TransformBaseRangeToIndexData(
+    const ann::eval_memory::BaseVectorSource& source,
+    uint32_t begin,
+    uint32_t end,
+    bool use_whitening,
+    VersionId version,
+    const std::shared_ptr<WhiteningModel>& whitening,
+    bool use_cosine,
+    MatrixRM* index_data) {
+  for (uint32_t block_begin = begin; block_begin < end;) {
+    const uint32_t rows = std::min<uint32_t>(kConcurrentTransformBlockRows,
+                                             end - block_begin);
+    auto block = ann::eval_memory::TransformSourceRangeToIndexSpace(
+        source, block_begin, rows, use_whitening, version, whitening, use_cosine);
+    if (!block.ok()) return block.status();
+    index_data->middleRows(static_cast<Eigen::Index>(block_begin),
+                           static_cast<Eigen::Index>(rows)) = block.value();
+    block_begin += rows;
+  }
+  return Status::OK();
 }
 
 std::vector<std::vector<std::vector<DocId>>> ComputeIncrementalPrefixGroundTruth(
@@ -315,25 +338,25 @@ int main(int argc, char** argv) {
   }
   auto source_result = ann::eval_memory::MakeFvecsBaseSource(base_path);
   if (!source_result.ok()) { std::cerr << source_result.status().ToString() << '\n'; return 1; }
-  auto raw_result = LoadFvecs(base_path);
+  auto base_source = std::move(source_result.value());
   auto query_result = LoadFvecs(query_path);
-  if (!raw_result.ok() || !query_result.ok()) {
-    std::cerr << (!raw_result.ok() ? raw_result.status().ToString() : query_result.status().ToString()) << '\n';
+  if (!query_result.ok()) {
+    std::cerr << query_result.status().ToString() << '\n';
     return 1;
   }
-  MatrixRM raw = std::move(raw_result.value());
   MatrixRM queries = std::move(query_result.value());
-  if (raw.rows() == 0) { std::cerr << "Base dataset contains no vectors\n"; return 1; }
+  if (base_source.rows == 0) { std::cerr << "Base dataset contains no vectors\n"; return 1; }
   if (config.max_queries > 0 && queries.rows() > config.max_queries)
     queries.conservativeResize(config.max_queries, Eigen::NoChange);
-  const uint32_t nx = static_cast<uint32_t>(raw.rows());
+  const uint32_t nx = base_source.rows;
   const uint32_t nq = static_cast<uint32_t>(queries.rows());
-  if (nq == 0 || raw.cols() != queries.cols()) {
+  if (nq == 0 || static_cast<Eigen::Index>(base_source.dim) != queries.cols()) {
     std::cerr << "Empty queries or base/query dimension mismatch\n";
     return 1;
   }
 
-  MatrixRM index_data = raw;
+  MatrixRM index_data(static_cast<Eigen::Index>(nx),
+                      static_cast<Eigen::Index>(base_source.dim));
   MatrixRM query_data = queries;
   auto whitening = CreateWhiteningModel();
   VersionId whiten_version = 0;
@@ -350,24 +373,40 @@ int main(int argc, char** argv) {
   }
   const uint32_t initial_rows = main_rows + delta_rows;
   const uint32_t batch_size = insert_step;
+  const auto whitening_fit_start = Clock::now();
   if (config.use_whitening) {
-    auto fit = whitening->Fit(index_data.topRows(main_rows));
+    auto fit_rows = base_source.LoadRange(0, main_rows);
+    if (!fit_rows.ok()) { std::cerr << fit_rows.status().ToString() << '\n'; return 1; }
+    auto fit = whitening->Fit(fit_rows.value());
     if (!fit.ok()) { std::cerr << fit.status().ToString() << '\n'; return 1; }
     whiten_version = fit.value();
-    auto transformed = whitening->TransformBatch(index_data, whiten_version);
+  }
+  std::cout << "[INIT] whitening fit done, elapsed_ms="
+            << std::chrono::duration<double, std::milli>(Clock::now() - whitening_fit_start).count()
+            << std::endl;
+
+  const auto initial_transform_start = Clock::now();
+  const Status initial_transform = TransformBaseRangeToIndexData(
+      base_source, 0, initial_rows, config.use_whitening, whiten_version,
+      whitening, config.use_cosine, &index_data);
+  if (!initial_transform.ok()) {
+    std::cerr << initial_transform.ToString() << '\n';
+    return 1;
+  }
+  std::cout << "[INIT] initial base transform done, rows=" << initial_rows
+            << ", elapsed_ms="
+            << std::chrono::duration<double, std::milli>(Clock::now() - initial_transform_start).count()
+            << std::endl;
+
+  if (config.use_whitening) {
     auto transformed_queries = whitening->TransformBatch(query_data, whiten_version);
-    if (!transformed.ok() || !transformed_queries.ok()) {
-      std::cerr << (!transformed.ok() ? transformed.status().ToString() : transformed_queries.status().ToString()) << '\n';
+    if (!transformed_queries.ok()) {
+      std::cerr << transformed_queries.status().ToString() << '\n';
       return 1;
     }
-    index_data = std::move(transformed.value());
     query_data = std::move(transformed_queries.value());
   }
   if (config.use_cosine) {
-    for (Eigen::Index i = 0; i < index_data.rows(); ++i) {
-      const float norm = index_data.row(i).norm();
-      if (norm > 0.0f) index_data.row(i) /= norm;
-    }
     for (Eigen::Index i = 0; i < query_data.rows(); ++i) {
       const float norm = query_data.row(i).norm();
       if (norm > 0.0f) query_data.row(i) /= norm;
@@ -384,6 +423,13 @@ int main(int argc, char** argv) {
                                   ? std::string(argv[1]) + ".concurrent.gt"
                                   : config.concurrent_gt_path;
   if (config.concurrent_gt_mode == "prepare") {
+    const Status remaining_transform = TransformBaseRangeToIndexData(
+        base_source, initial_rows, nx, config.use_whitening, whiten_version,
+        whitening, config.use_cosine, &index_data);
+    if (!remaining_transform.ok()) {
+      std::cerr << remaining_transform.ToString() << '\n';
+      return 1;
+    }
     const Status status = SaveGroundTruth(gt_path, base_identity, query_identity, config.topk,
                                           initial_rows, batch_size, frontiers, query_data, index_data);
     if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
@@ -391,10 +437,14 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (config.concurrent_gt_mode == "load") {
+    const auto gt_load_start = Clock::now();
     auto result = LoadGroundTruth(gt_path, base_identity, query_identity, nq, config.topk,
                                   initial_rows, batch_size, frontiers);
     if (!result.ok()) { std::cerr << result.status().ToString() << '\n'; return 1; }
     gt = std::move(result.value());
+    std::cout << "[INIT] GT loaded, elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - gt_load_start).count()
+              << std::endl;
   }
 
   IVFParams ivf_params;
@@ -411,10 +461,15 @@ int main(int argc, char** argv) {
   state.committed_rows = initial_rows;
   state.main_rows = main_rows;
   state.main_versions.whiten_version = whiten_version;
+  const auto main_build_start = Clock::now();
   auto main = BuildIndex(index_data, 0, main_rows, ivf_params, &state.main_versions);
   if (!main.ok()) { std::cerr << main.status().ToString() << '\n'; return 1; }
   state.main = main.value();
+  std::cout << "[INIT] main index built, rows=" << main_rows << ", elapsed_ms="
+            << std::chrono::duration<double, std::milli>(Clock::now() - main_build_start).count()
+            << std::endl;
   const uint32_t delta_nlist = config.delta_ivf_nlist ? config.delta_ivf_nlist : config.ivf_nlist;
+  const auto active_build_start = Clock::now();
   if (delta_rows > 0) {
     IVFParams delta_params = ivf_params;
     delta_params.nlist = delta_nlist;
@@ -424,6 +479,9 @@ int main(int argc, char** argv) {
     if (!delta.ok()) { std::cerr << delta.status().ToString() << '\n'; return 1; }
     state.active = Route{delta.value(), versions, delta_rows, 1};
   }
+  std::cout << "[INIT] initial active built, rows=" << delta_rows << ", elapsed_ms="
+            << std::chrono::duration<double, std::milli>(Clock::now() - active_build_start).count()
+            << std::endl;
   std::deque<DocId> active_window_ids;
   if (config.online_pq_update_scheme == "sliding_window") {
     for (uint32_t row = main_rows; row < initial_rows; ++row) active_window_ids.push_back(row);
@@ -726,6 +784,7 @@ int main(int argc, char** argv) {
   }
 
   const auto measurement_start = Clock::now();
+  std::cout << "[WORKLOAD] concurrent workload start" << std::endl;
   start_workers.store(true, std::memory_order_release);
   const double period_ms = config.concurrent_target_insert_vecps > 0.0
                                ? 1000.0 * batch_size / config.concurrent_target_insert_vecps : 0.0;
@@ -750,6 +809,13 @@ int main(int argc, char** argv) {
 
     const uint32_t end = std::min(nx, next_row + batch_size);
     const auto batch_start = Clock::now();
+    const Status batch_transform = TransformBaseRangeToIndexData(
+        base_source, next_row, end, config.use_whitening, whiten_version,
+        whitening, config.use_cosine, &index_data);
+    if (!batch_transform.ok()) {
+      report_failure(batch_transform.ToString());
+      break;
+    }
     OnlinePQUpdateStats update_stats;
     {
       std::shared_lock<std::shared_mutex> access(workload_mutex);
