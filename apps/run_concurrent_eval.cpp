@@ -552,6 +552,7 @@ int main(int argc, char** argv) {
   const uint32_t trigger_rows = config.merge_trigger_rows ? config.merge_trigger_rows : delta_rows;
   uint32_t last_global_rebuild_rows = initial_rows;
   uint32_t last_global_rebuild_main_rows = main_rows;
+  Clock::time_point measurement_start;
   auto request_maintenance = [&](bool merge, bool rebuild) {
     if (!merge && !rebuild) return;
     {
@@ -576,6 +577,10 @@ int main(int argc, char** argv) {
       if (state.active_freeze_pending && state.frozen && !failed.load()) {
         was_backpressured = true;
         ++insert_backpressure_events;
+        const uint64_t batch = committed_batches.load() + 1;
+        std::cout << "[BACKPRESSURE] begin batch=" << batch
+                  << " active_rows=" << (state.active ? state.active->rows : 0)
+                  << " frozen_rows=" << state.frozen->rows << std::endl;
         const auto wait_start = Clock::now();
         state_cv.wait(state_lock, [&] {
           return failed.load() || !state.active_freeze_pending || !state.frozen;
@@ -584,6 +589,8 @@ int main(int argc, char** argv) {
                                    Clock::now() - wait_start).count();
         insert_backpressure_total_ms += wait_ms;
         insert_backpressure_max_ms = std::max(insert_backpressure_max_ms, wait_ms);
+        std::cout << "[BACKPRESSURE] end batch=" << batch
+                  << " wait_ms=" << wait_ms << std::endl;
       }
       if (failed.load()) return false;
       if (state.active_freeze_pending && !state.frozen && state.active) {
@@ -615,12 +622,21 @@ int main(int argc, char** argv) {
       wait_lock.unlock();
       if (rebuild) {
         const auto begin = Clock::now();
+        const uint64_t rebuild_id = rebuild_count.load() + 1;
         std::unique_lock<std::shared_mutex> barrier(workload_mutex);
         uint32_t rebuild_rows = 0;
+        uint32_t rebuild_main_rows = 0;
         {
           std::lock_guard<std::mutex> state_lock(state_mutex);
           rebuild_rows = state.committed_rows;
+          rebuild_main_rows = state.main_rows;
         }
+        std::cout << "[REBUILD] start id=" << rebuild_id
+                  << " committed_rows=" << rebuild_rows
+                  << " main_rows=" << rebuild_main_rows
+                  << " elapsed_ms="
+                  << std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count()
+                  << std::endl;
         VersionSet versions{whiten_version, 0};
         auto replacement = BuildIndex(index_data, 0, rebuild_rows, ivf_params, &versions);
         if (!replacement.ok()) {
@@ -637,21 +653,38 @@ int main(int argc, char** argv) {
           last_global_rebuild_rows = rebuild_rows;
           last_global_rebuild_main_rows = rebuild_rows;
         }
-        rebuild_total_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        const double rebuild_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        rebuild_total_ms += rebuild_ms;
+        if (replacement.ok()) {
+          std::cout << "[REBUILD] done id=" << rebuild_id
+                    << " rows=" << rebuild_rows << " total_ms=" << rebuild_ms << std::endl;
+        }
       } else {
         std::optional<Route> frozen;
         std::shared_ptr<IVFIndex> main_index;
         VersionSet main_versions;
+        uint32_t main_rows_for_merge = 0;
         {
           std::lock_guard<std::mutex> lock(state_mutex);
           frozen = state.frozen;
           main_index = state.main;
           main_versions = state.main_versions;
+          main_rows_for_merge = state.main_rows;
         }
         if (frozen) {
           const auto begin = Clock::now();
+          std::cout << "[MERGE] start id=" << frozen->id
+                    << " frozen_rows=" << frozen->rows
+                    << " main_rows=" << main_rows_for_merge
+                    << " elapsed_ms="
+                    << std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count()
+                    << std::endl;
           std::shared_lock<std::shared_mutex> access(workload_mutex);
           auto snapshot = freeze_delta(frozen->index, frozen->versions, index_data);
+          bool merge_succeeded = false;
+          double event_merge_compute_ms = 0.0;
+          double event_codebook_rebuild_ms = 0.0;
+          double event_merge_commit_ms = 0.0;
           if (!snapshot.ok()) report_failure(snapshot.status().ToString());
           else {
             auto merged = merge_frozen_delta_into_main(main_index, main_versions,
@@ -659,10 +692,14 @@ int main(int argc, char** argv) {
                                                         merge_options);
             if (!merged.ok()) report_failure(merged.status().ToString());
             else {
+              merge_succeeded = true;
+              event_merge_compute_ms = merged.value().merge_compute_ms;
+              event_codebook_rebuild_ms = merged.value().codebook_rebuild_ms;
+              event_merge_commit_ms = merged.value().profiling.commit_us / 1000.0;
               ++merge_count;
-              merge_compute_ms += merged.value().merge_compute_ms;
-              merge_codebook_rebuild_ms += merged.value().codebook_rebuild_ms;
-              merge_commit_ms += merged.value().profiling.commit_us / 1000.0;
+              merge_compute_ms += event_merge_compute_ms;
+              merge_codebook_rebuild_ms += event_codebook_rebuild_ms;
+              merge_commit_ms += event_merge_commit_ms;
               merge_patch_partitions += merged.value().patch_partitions;
               merge_append_partitions += merged.value().append_partitions;
               merge_recluster_partitions += merged.value().recluster_partitions;
@@ -673,7 +710,22 @@ int main(int argc, char** argv) {
               }
             }
           }
-          merge_total_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+          const double merge_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+          merge_total_ms += merge_ms;
+          if (merge_succeeded) {
+            uint32_t merged_main_rows = 0;
+            {
+              std::lock_guard<std::mutex> lock(state_mutex);
+              merged_main_rows = state.main_rows;
+            }
+            std::cout << "[MERGE] done id=" << frozen->id
+                      << " frozen_rows=" << frozen->rows
+                      << " total_ms=" << merge_ms
+                      << " compute_ms=" << event_merge_compute_ms
+                      << " codebook_ms=" << event_codebook_rebuild_ms
+                      << " commit_ms=" << event_merge_commit_ms
+                      << " main_rows=" << merged_main_rows << std::endl;
+          }
         }
       }
       state_cv.notify_all();
@@ -783,7 +835,7 @@ int main(int argc, char** argv) {
     });
   }
 
-  const auto measurement_start = Clock::now();
+  measurement_start = Clock::now();
   std::cout << "[WORKLOAD] concurrent workload start" << std::endl;
   start_workers.store(true, std::memory_order_release);
   const double period_ms = config.concurrent_target_insert_vecps > 0.0
@@ -808,7 +860,10 @@ int main(int argc, char** argv) {
     if (failed.load()) break;
 
     const uint32_t end = std::min(nx, next_row + batch_size);
+    const uint32_t batch_begin = next_row;
+    const uint64_t batch_number = committed_batches.load() + 1;
     const auto batch_start = Clock::now();
+    const auto transform_start = Clock::now();
     const Status batch_transform = TransformBaseRangeToIndexData(
         base_source, next_row, end, config.use_whitening, whiten_version,
         whitening, config.use_cosine, &index_data);
@@ -816,6 +871,8 @@ int main(int argc, char** argv) {
       report_failure(batch_transform.ToString());
       break;
     }
+    const double transform_ms = std::chrono::duration<double, std::milli>(Clock::now() - transform_start).count();
+    const auto insert_start = Clock::now();
     OnlinePQUpdateStats update_stats;
     {
       std::shared_lock<std::shared_mutex> access(workload_mutex);
@@ -874,26 +931,38 @@ int main(int argc, char** argv) {
         current_version.store(state.version, std::memory_order_release);
       }
     }
+    const double insert_ms = std::chrono::duration<double, std::milli>(Clock::now() - insert_start).count();
     const double batch_ms = std::chrono::duration<double, std::milli>(Clock::now() - batch_start).count();
     insert_batch_ms.push_back(batch_ms);
     inserted_vectors += end - next_row;
     ++committed_batches;
     next_row = end;
     bool trigger = false;
+    bool rows_trigger = false;
+    bool qe_trigger = false;
+    bool drift_trigger = false;
+    bool ratio_trigger = false;
+    bool imbalance_trigger = false;
     bool request_merge = false;
     bool request_rebuild = false;
+    uint32_t log_active_rows = 0;
+    uint32_t trigger_active_rows = 0;
+    uint32_t log_frozen_rows = 0;
+    uint64_t log_version = 0;
+    bool log_pending = false;
+    bool log_frozen = false;
     {
       std::lock_guard<std::mutex> lock(state_mutex);
       if (state.active) {
-        const bool rows_trigger = trigger_rows > 0 && state.active->rows >= trigger_rows;
-        const bool qe_trigger = config.merge_trigger_qe_ratio > 0.0 &&
+        trigger_active_rows = state.active->rows;
+        rows_trigger = trigger_rows > 0 && state.active->rows >= trigger_rows;
+        qe_trigger = config.merge_trigger_qe_ratio > 0.0 &&
                                 update_stats.qe_ratio >= config.merge_trigger_qe_ratio;
-        const bool drift_trigger = config.merge_trigger_drift > 0.0 &&
+        drift_trigger = config.merge_trigger_drift > 0.0 &&
                                    update_stats.codebook_drift_l2 >= config.merge_trigger_drift;
-        const bool ratio_trigger = config.merge_trigger_delta_main_ratio > 0.0 &&
+        ratio_trigger = config.merge_trigger_delta_main_ratio > 0.0 &&
             static_cast<double>(state.active->rows) / std::max(1u, state.main_rows) >=
                 config.merge_trigger_delta_main_ratio;
-        bool imbalance_trigger = false;
         if (config.merge_trigger_imbalance_ratio > 0.0) {
           auto sizes = state.active->index->GetPartitionSizes(state.active->versions);
           if (sizes.ok() && !sizes.value().empty()) {
@@ -930,6 +999,11 @@ int main(int argc, char** argv) {
           }
         }
       }
+      log_active_rows = state.active ? state.active->rows : 0;
+      log_frozen_rows = state.frozen ? state.frozen->rows : 0;
+      log_pending = state.active_freeze_pending;
+      log_frozen = state.frozen.has_value();
+      log_version = state.version;
       bool global_trigger = config.enable_global_rebuild &&
                             config.global_rebuild_max_count > rebuild_count.load();
       if (global_trigger && config.global_rebuild_force_main_rows > 0 &&
@@ -961,6 +1035,28 @@ int main(int argc, char** argv) {
         request_rebuild = true;
       }
     }
+    if (trigger) {
+      std::cout << "[TRIGGER] batch=" << batch_number
+                << " version=" << log_version
+                << " active_rows=" << trigger_active_rows
+                << " rows=" << (rows_trigger ? "true" : "false")
+                << " qe=" << (qe_trigger ? "true" : "false")
+                << " drift=" << (drift_trigger ? "true" : "false")
+                << " ratio=" << (ratio_trigger ? "true" : "false")
+                << " imbalance=" << (imbalance_trigger ? "true" : "false")
+                << " frozen=" << (log_frozen ? "true" : "false") << std::endl;
+    }
+    std::cout << "[INSERT] batch=" << batch_number
+              << " version=" << log_version
+              << " rows=[" << batch_begin << "," << end << ")"
+              << " active_rows=" << log_active_rows
+              << " frozen_rows=" << log_frozen_rows
+              << " transform_ms=" << transform_ms
+              << " insert_ms=" << insert_ms
+              << " batch_ms=" << batch_ms
+              << " elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count()
+              << " pending=" << (log_pending ? "true" : "false") << std::endl;
     request_maintenance(request_merge, request_rebuild);
   }
   if (!failed.load()) insert_admission_gate();
