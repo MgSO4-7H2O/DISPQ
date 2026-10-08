@@ -3,6 +3,7 @@
 /build
 /index
 /result*
+/artifacts
 /test
 .vscode
 *.pdf
