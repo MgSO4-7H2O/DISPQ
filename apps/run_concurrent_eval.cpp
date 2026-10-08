@@ -73,6 +73,10 @@ struct TimelineEvent {
   uint64_t id{0};
   double request_ms{0.0};
   double start_ms{0.0};
+  double compute_done_ms{0.0};
+  double commit_wait_start_ms{0.0};
+  double commit_lock_acquired_ms{0.0};
+  double commit_done_ms{0.0};
   double end_ms{0.0};
   uint32_t rows{0};
   uint32_t main_rows{0};
@@ -591,6 +595,9 @@ int main(int argc, char** argv) {
   uint32_t last_global_rebuild_rows = initial_rows;
   uint32_t last_global_rebuild_main_rows = main_rows;
   Clock::time_point measurement_start;
+  auto timeline_ms = [&](Clock::time_point time) {
+    return std::chrono::duration<double, std::milli>(time - measurement_start).count();
+  };
   auto request_maintenance = [&](bool merge, bool rebuild) {
     if (!merge && !rebuild) return;
     {
@@ -713,12 +720,15 @@ int main(int argc, char** argv) {
         }
         const auto rebuild_end = Clock::now();
         if (replacement.ok()) {
-          timeline_events.push_back({
-              TimelineEventType::kRebuild, rebuild_id,
-              std::chrono::duration<double, std::milli>(rebuild_requested - measurement_start).count(),
-              std::chrono::duration<double, std::milli>(barrier_acquired - measurement_start).count(),
-              std::chrono::duration<double, std::milli>(rebuild_end - measurement_start).count(),
-              rebuild_rows, rebuild_main_rows});
+          TimelineEvent event;
+          event.type = TimelineEventType::kRebuild;
+          event.id = rebuild_id;
+          event.request_ms = timeline_ms(rebuild_requested);
+          event.start_ms = timeline_ms(barrier_acquired);
+          event.end_ms = timeline_ms(rebuild_end);
+          event.rows = rebuild_rows;
+          event.main_rows = rebuild_main_rows;
+          timeline_events.push_back(event);
         }
 #ifdef _OPENMP
         omp_set_num_threads(std::max(1u, config.concurrent_maintenance_threads));
@@ -764,6 +774,7 @@ int main(int argc, char** argv) {
           double event_merge_compute_ms = 0.0;
           double event_codebook_rebuild_ms = 0.0;
           double event_merge_commit_ms = 0.0;
+          MergeProfiling event_profiling;
           if (!snapshot.ok()) report_failure(snapshot.status().ToString());
           else {
             auto merged = merge_frozen_delta_into_main(main_index, main_versions,
@@ -775,6 +786,7 @@ int main(int argc, char** argv) {
               event_merge_compute_ms = merged.value().merge_compute_ms;
               event_codebook_rebuild_ms = merged.value().codebook_rebuild_ms;
               event_merge_commit_ms = merged.value().profiling.commit_us / 1000.0;
+              event_profiling = merged.value().profiling;
               ++merge_count;
               merge_compute_ms += event_merge_compute_ms;
               merge_codebook_rebuild_ms += event_codebook_rebuild_ms;
@@ -793,10 +805,19 @@ int main(int argc, char** argv) {
           const double merge_ms = std::chrono::duration<double, std::milli>(merge_end - begin).count();
           merge_total_ms += merge_ms;
           if (merge_succeeded) {
-            timeline_events.push_back({
-                TimelineEventType::kMerge, frozen->id, merge_start_ms, merge_start_ms,
-                std::chrono::duration<double, std::milli>(merge_end - measurement_start).count(),
-                frozen->rows, main_rows_for_merge});
+            TimelineEvent event;
+            event.type = TimelineEventType::kMerge;
+            event.id = frozen->id;
+            event.request_ms = merge_start_ms;
+            event.start_ms = merge_start_ms;
+            event.compute_done_ms = timeline_ms(event_profiling.compute_done_at);
+            event.commit_wait_start_ms = timeline_ms(event_profiling.commit_wait_start_at);
+            event.commit_lock_acquired_ms = timeline_ms(event_profiling.commit_lock_acquired_at);
+            event.commit_done_ms = timeline_ms(event_profiling.commit_done_at);
+            event.end_ms = timeline_ms(merge_end);
+            event.rows = frozen->rows;
+            event.main_rows = main_rows_for_merge;
+            timeline_events.push_back(event);
             uint32_t merged_main_rows = 0;
             {
               std::lock_guard<std::mutex> lock(state_mutex);
@@ -1343,10 +1364,14 @@ int main(int argc, char** argv) {
     std::cerr << "Failed to open event timeline CSV: " << events_path << '\n';
     return 1;
   }
-  events << std::setprecision(12) << "type,id,request_ms,start_ms,end_ms,rows,main_rows\n";
+  events << std::setprecision(12)
+         << "type,id,request_ms,start_ms,compute_done_ms,commit_wait_start_ms,"
+            "commit_lock_acquired_ms,commit_done_ms,end_ms,rows,main_rows\n";
   for (const TimelineEvent& event : timeline_events) {
     events << (event.type == TimelineEventType::kMerge ? "merge" : "rebuild")
            << ',' << event.id << ',' << event.request_ms << ',' << event.start_ms << ','
+           << event.compute_done_ms << ',' << event.commit_wait_start_ms << ','
+           << event.commit_lock_acquired_ms << ',' << event.commit_done_ms << ','
            << event.end_ms << ',' << event.rows << ',' << event.main_rows << '\n';
   }
   events.close();

@@ -2914,6 +2914,7 @@ class KMeansIVFIndex : public IVFIndex {
     }
 
     std::unique_lock lock(mu_);
+    const auto commit_lock_acquired = std::chrono::steady_clock::now();
     auto it = data_map_.find(route_versions.index_version);
     if (it == data_map_.end()) {
       return Status::NotFound("Index version not built");
@@ -3115,6 +3116,8 @@ class KMeansIVFIndex : public IVFIndex {
     data.last_patch_profiling.pq_list_flatten_us = pq_list_flatten_us;
     data.last_patch_profiling.pq_codes_reused = pq_codes_reused;
     data.last_patch_profiling.pq_codes_reencoded = pq_codes_reencoded;
+    data.last_patch_profiling.commit_lock_acquired_at = commit_lock_acquired;
+    data.last_patch_profiling.commit_done_at = std::chrono::steady_clock::now();
     return Status::OK();
   }
 

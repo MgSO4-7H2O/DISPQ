@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -195,6 +196,8 @@ struct PatchProfiling {
   double pq_code_assignment_us{0.0};
   double pq_code_copy_or_reuse_us{0.0};
   double pq_list_flatten_us{0.0};
+  std::chrono::steady_clock::time_point commit_lock_acquired_at{};
+  std::chrono::steady_clock::time_point commit_done_at{};
   uint64_t patch_records{0};
   uint64_t pq_codes_reused{0};
   uint64_t pq_codes_reencoded{0};

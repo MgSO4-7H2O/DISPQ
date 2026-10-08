@@ -65,6 +65,8 @@ def main():
 
     event_colors = {"merge": "tab:green", "rebuild": "tab:red"}
     has_rebuild_wait = False
+    has_merge_commit = False
+    has_commit_wait = False
     if not events.empty:
         for event in events.itertuples(index=False):
             event_type = str(event.type)
@@ -73,7 +75,19 @@ def main():
             end_s = float(event.end_ms) / 1000.0
             for axis in axes:
                 if end_s > start_s:
-                    axis.axvspan(start_s, end_s, color=color, alpha=0.16)
+                    axis.axvspan(start_s, end_s, color=color,
+                                 alpha=0.12 if event_type == "merge" else 0.16)
+                if (event_type == "merge" and
+                        event.commit_done_ms > event.commit_lock_acquired_ms):
+                    axis.axvspan(float(event.commit_lock_acquired_ms) / 1000.0,
+                                 float(event.commit_done_ms) / 1000.0,
+                                 color="darkgreen", alpha=0.30)
+                    has_merge_commit = True
+                if (event_type == "merge" and
+                        event.commit_wait_start_ms > event.start_ms):
+                    axis.axvline(float(event.commit_wait_start_ms) / 1000.0,
+                                 color="darkgreen", linestyle="--", alpha=0.7)
+                    has_commit_wait = True
                 if event_type == "rebuild" and event.request_ms < event.start_ms:
                     axis.axvline(float(event.request_ms) / 1000.0,
                                  color=color, linestyle=":", alpha=0.65)
@@ -87,6 +101,12 @@ def main():
         Patch(facecolor=event_colors["merge"], alpha=0.25, label="Merge"),
         Patch(facecolor=event_colors["rebuild"], alpha=0.25, label="Global Rebuild"),
     ]
+    if has_merge_commit:
+        event_handles.append(Patch(facecolor="darkgreen", alpha=0.4,
+                                   label="Merge commit critical section"))
+    if has_commit_wait:
+        event_handles.append(Line2D([0], [0], color="darkgreen", linestyle="--",
+                                    label="Commit lock wait start"))
     if has_rebuild_wait:
         event_handles.append(Line2D([0], [0], color=event_colors["rebuild"],
                                     linestyle=":", label="Rebuild requested"))
