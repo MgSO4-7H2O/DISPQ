@@ -310,6 +310,11 @@ Status SaveGroundTruth(const std::string& path,
 
 int main(int argc, char** argv) {
   using namespace ann;
+#ifdef _OPENMP
+  const int runtime_max_threads = std::max(1, omp_get_max_threads());
+#else
+  const int runtime_max_threads = 1;
+#endif
   if (argc < 3 || argc > 5) {
     std::cerr << "Usage: run_concurrent_eval <config.json> <dataset_dir_or_base_file> "
                  "[query_or_dir] [summary.json]\n";
@@ -645,8 +650,12 @@ int main(int argc, char** argv) {
         std::unique_lock<std::shared_mutex> barrier(workload_mutex);
         const double barrier_wait_ms = std::chrono::duration<double, std::milli>(
                                            Clock::now() - barrier_wait_start).count();
+#ifdef _OPENMP
+        omp_set_num_threads(runtime_max_threads);
+#endif
         std::cout << "[REBUILD] barrier_acquired id=" << rebuild_id
-                  << " wait_ms=" << barrier_wait_ms << std::endl;
+                  << " wait_ms=" << barrier_wait_ms
+                  << " threads=" << runtime_max_threads << std::endl;
         {
           std::lock_guard<std::mutex> state_lock(state_mutex);
           rebuild_rows = state.committed_rows;
@@ -670,6 +679,9 @@ int main(int argc, char** argv) {
           last_global_rebuild_rows = rebuild_rows;
           last_global_rebuild_main_rows = rebuild_rows;
         }
+#ifdef _OPENMP
+        omp_set_num_threads(std::max(1u, config.concurrent_maintenance_threads));
+#endif
         barrier.unlock();
         {
           std::lock_guard<std::mutex> entry_lock(workload_entry_mutex);
