@@ -58,6 +58,7 @@ struct RuntimeState {
   uint64_t version{0};
   uint32_t committed_rows{0};
   uint32_t main_rows{0};
+  bool active_freeze_pending{false};
 };
 
 double Percentile(std::vector<double> values, double quantile) {
@@ -448,6 +449,7 @@ int main(int argc, char** argv) {
   std::mutex version_mutex;
   std::mutex maintenance_mutex;
   std::condition_variable maintenance_cv;
+  std::condition_variable state_cv;
   bool maintenance_stop = false;
   bool merge_requested = false;
   bool rebuild_requested = false;
@@ -462,6 +464,8 @@ int main(int argc, char** argv) {
   uint64_t merge_patch_partitions = 0, merge_append_partitions = 0;
   uint64_t merge_recluster_partitions = 0;
   double max_insert_lag_ms = 0.0, active_rows_over_trigger = 0.0;
+  uint64_t insert_backpressure_events = 0;
+  double insert_backpressure_total_ms = 0.0, insert_backpressure_max_ms = 0.0;
   std::atomic<uint64_t> main_queries{0}, frozen_queries{0}, active_queries{0};
   std::atomic<uint32_t> current_committed{initial_rows};
   std::atomic<uint64_t> current_version{0};
@@ -470,8 +474,12 @@ int main(int argc, char** argv) {
   std::mutex failure_mutex;
   auto report_failure = [&](const std::string& message) {
     if (!failed.exchange(true)) {
-      std::lock_guard<std::mutex> lock(failure_mutex);
-      failure = message;
+      {
+        std::lock_guard<std::mutex> lock(failure_mutex);
+        failure = message;
+      }
+      state_cv.notify_all();
+      maintenance_cv.notify_all();
     }
   };
   MergeOptions merge_options;
@@ -486,6 +494,48 @@ int main(int argc, char** argv) {
   const uint32_t trigger_rows = config.merge_trigger_rows ? config.merge_trigger_rows : delta_rows;
   uint32_t last_global_rebuild_rows = initial_rows;
   uint32_t last_global_rebuild_main_rows = main_rows;
+  auto request_maintenance = [&](bool merge, bool rebuild) {
+    if (!merge && !rebuild) return;
+    {
+      std::lock_guard<std::mutex> lock(maintenance_mutex);
+      merge_requested = merge_requested || merge;
+      rebuild_requested = rebuild_requested || rebuild;
+    }
+    maintenance_cv.notify_one();
+  };
+  auto promote_active_to_frozen = [&] {
+    state.frozen = std::move(state.active);
+    state.active.reset();
+    state.active_freeze_pending = false;
+    active_window_ids.clear();
+  };
+  bool was_backpressured = false;
+  auto insert_admission_gate = [&] {
+    was_backpressured = false;
+    bool promoted = false;
+    {
+      std::unique_lock<std::mutex> state_lock(state_mutex);
+      if (state.active_freeze_pending && state.frozen && !failed.load()) {
+        was_backpressured = true;
+        ++insert_backpressure_events;
+        const auto wait_start = Clock::now();
+        state_cv.wait(state_lock, [&] {
+          return failed.load() || !state.active_freeze_pending || !state.frozen;
+        });
+        const double wait_ms = std::chrono::duration<double, std::milli>(
+                                   Clock::now() - wait_start).count();
+        insert_backpressure_total_ms += wait_ms;
+        insert_backpressure_max_ms = std::max(insert_backpressure_max_ms, wait_ms);
+      }
+      if (failed.load()) return false;
+      if (state.active_freeze_pending && !state.frozen && state.active) {
+        promote_active_to_frozen();
+        promoted = true;
+      }
+    }
+    if (promoted) request_maintenance(true, false);
+    return !failed.load();
+  };
 
 #ifdef _OPENMP
   omp_set_dynamic(0);
@@ -497,8 +547,10 @@ int main(int argc, char** argv) {
 #endif
     for (;;) {
       std::unique_lock<std::mutex> wait_lock(maintenance_mutex);
-      maintenance_cv.wait(wait_lock, [&] { return merge_requested || rebuild_requested || maintenance_stop; });
-      if (maintenance_stop && !merge_requested && !rebuild_requested) return;
+      maintenance_cv.wait(wait_lock, [&] {
+        return merge_requested || rebuild_requested || maintenance_stop || failed.load();
+      });
+      if ((maintenance_stop || failed.load()) && !merge_requested && !rebuild_requested) return;
       const bool rebuild = rebuild_requested;
       rebuild_requested = false;
       merge_requested = false;
@@ -522,6 +574,7 @@ int main(int argc, char** argv) {
           state.main_rows = rebuild_rows;
           state.active.reset();
           state.frozen.reset();
+          state.active_freeze_pending = false;
           ++rebuild_count;
           last_global_rebuild_rows = rebuild_rows;
           last_global_rebuild_main_rows = rebuild_rows;
@@ -565,6 +618,7 @@ int main(int argc, char** argv) {
           merge_total_ms += std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
         }
       }
+      state_cv.notify_all();
       maintenance_cv.notify_all();
     }
   });
@@ -676,11 +730,24 @@ int main(int argc, char** argv) {
   const double period_ms = config.concurrent_target_insert_vecps > 0.0
                                ? 1000.0 * batch_size / config.concurrent_target_insert_vecps : 0.0;
   auto next_deadline = measurement_start;
+  bool first_batch = true;
   uint32_t next_row = initial_rows;
   double insert_wall_ms = 0.0;
   const auto insert_stream_start = Clock::now();
   uint32_t next_shard_id = 2;
   while (next_row < nx && !failed.load()) {
+    if (!insert_admission_gate()) break;
+    if (was_backpressured) next_deadline = Clock::now();
+    if (period_ms > 0.0 && !first_batch) {
+      next_deadline += std::chrono::duration_cast<Clock::duration>(
+          std::chrono::duration<double, std::milli>(period_ms));
+      std::this_thread::sleep_until(next_deadline);
+      max_insert_lag_ms = std::max(max_insert_lag_ms,
+          std::max(0.0, std::chrono::duration<double, std::milli>(Clock::now() - next_deadline).count()));
+    }
+    first_batch = false;
+    if (failed.load()) break;
+
     const uint32_t end = std::min(nx, next_row + batch_size);
     const auto batch_start = Clock::now();
     OnlinePQUpdateStats update_stats;
@@ -746,13 +813,9 @@ int main(int argc, char** argv) {
     inserted_vectors += end - next_row;
     ++committed_batches;
     next_row = end;
-    if (period_ms > 0.0) {
-      next_deadline += std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(period_ms));
-      std::this_thread::sleep_until(next_deadline);
-      max_insert_lag_ms = std::max(max_insert_lag_ms,
-          std::max(0.0, std::chrono::duration<double, std::milli>(Clock::now() - next_deadline).count()));
-    }
     bool trigger = false;
+    bool request_merge = false;
+    bool request_rebuild = false;
     {
       std::lock_guard<std::mutex> lock(state_mutex);
       if (state.active) {
@@ -792,13 +855,13 @@ int main(int argc, char** argv) {
         if (state.frozen && rows_trigger)
           active_rows_over_trigger = std::max<double>(active_rows_over_trigger,
                                                        state.active->rows - trigger_rows);
-        if (trigger && !state.frozen) {
-          state.frozen = state.active;
-          state.active.reset();
-          active_window_ids.clear();
-          std::lock_guard<std::mutex> maintenance_lock(maintenance_mutex);
-          merge_requested = true;
-          maintenance_cv.notify_one();
+        if (trigger) {
+          if (!state.frozen) {
+            promote_active_to_frozen();
+            request_merge = true;
+          } else {
+            state.active_freeze_pending = true;
+          }
         }
       }
       bool global_trigger = config.enable_global_rebuild &&
@@ -829,12 +892,12 @@ int main(int argc, char** argv) {
         global_trigger = false;
       }
       if (global_trigger) {
-        std::lock_guard<std::mutex> maintenance_lock(maintenance_mutex);
-        rebuild_requested = true;
-        maintenance_cv.notify_one();
+        request_rebuild = true;
       }
     }
+    request_maintenance(request_merge, request_rebuild);
   }
+  if (!failed.load()) insert_admission_gate();
   insert_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - insert_stream_start).count();
   {
     std::unique_lock<std::mutex> lock(maintenance_mutex);
@@ -902,6 +965,11 @@ int main(int argc, char** argv) {
           << "  \"inserted_vectors\": " << inserted_vectors << ",\n"
           << "  \"committed_batches\": " << committed_batches << ",\n"
           << "  \"actual_insert_vecps\": " << (insert_wall_ms > 0 ? inserted_vectors * 1000.0 / insert_wall_ms : 0.0) << ",\n"
+          << "  \"insert_backpressure_events\": " << insert_backpressure_events << ",\n"
+          << "  \"insert_backpressure_total_ms\": " << insert_backpressure_total_ms << ",\n"
+          << "  \"insert_backpressure_max_ms\": " << insert_backpressure_max_ms << ",\n"
+          << "  \"insert_backpressure_ratio\": "
+          << (measurement_wall_ms > 0 ? insert_backpressure_total_ms / measurement_wall_ms : 0.0) << ",\n"
           << "  \"insert_batch_mean_ms\": " << (insert_batch_ms.empty() ? 0.0 : std::accumulate(insert_batch_ms.begin(), insert_batch_ms.end(), 0.0) / insert_batch_ms.size()) << ",\n"
           << "  \"insert_batch_p99_ms\": " << Percentile(insert_batch_ms, .99) << ",\n"
           << "  \"max_insert_lag_ms\": " << max_insert_lag_ms << ",\n"
