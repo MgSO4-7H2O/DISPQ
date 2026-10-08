@@ -502,6 +502,9 @@ int main(int argc, char** argv) {
   online_options.reencode_batch_after_update = config.online_pq_reencode_batch;
 
   std::shared_mutex workload_mutex;
+  std::mutex workload_entry_mutex;
+  std::condition_variable workload_entry_cv;
+  bool rebuild_pending = false;
   std::mutex state_mutex;
   std::mutex records_mutex;
   std::mutex version_mutex;
@@ -538,6 +541,7 @@ int main(int argc, char** argv) {
       }
       state_cv.notify_all();
       maintenance_cv.notify_all();
+      workload_entry_cv.notify_all();
     }
   };
   MergeOptions merge_options;
@@ -621,9 +625,8 @@ int main(int argc, char** argv) {
       merge_requested = false;
       wait_lock.unlock();
       if (rebuild) {
-        const auto begin = Clock::now();
+        const auto total_start = Clock::now();
         const uint64_t rebuild_id = rebuild_count.load() + 1;
-        std::unique_lock<std::shared_mutex> barrier(workload_mutex);
         uint32_t rebuild_rows = 0;
         uint32_t rebuild_main_rows = 0;
         {
@@ -631,14 +634,28 @@ int main(int argc, char** argv) {
           rebuild_rows = state.committed_rows;
           rebuild_main_rows = state.main_rows;
         }
-        std::cout << "[REBUILD] start id=" << rebuild_id
+        {
+          std::lock_guard<std::mutex> entry_lock(workload_entry_mutex);
+          rebuild_pending = true;
+        }
+        std::cout << "[REBUILD] requested id=" << rebuild_id
                   << " committed_rows=" << rebuild_rows
-                  << " main_rows=" << rebuild_main_rows
-                  << " elapsed_ms="
-                  << std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count()
-                  << std::endl;
+                  << " main_rows=" << rebuild_main_rows << std::endl;
+        const auto barrier_wait_start = Clock::now();
+        std::unique_lock<std::shared_mutex> barrier(workload_mutex);
+        const double barrier_wait_ms = std::chrono::duration<double, std::milli>(
+                                           Clock::now() - barrier_wait_start).count();
+        std::cout << "[REBUILD] barrier_acquired id=" << rebuild_id
+                  << " wait_ms=" << barrier_wait_ms << std::endl;
+        {
+          std::lock_guard<std::mutex> state_lock(state_mutex);
+          rebuild_rows = state.committed_rows;
+        }
         VersionSet versions{whiten_version, 0};
+        const auto build_start = Clock::now();
         auto replacement = BuildIndex(index_data, 0, rebuild_rows, ivf_params, &versions);
+        const double build_ms = std::chrono::duration<double, std::milli>(
+                                    Clock::now() - build_start).count();
         if (!replacement.ok()) {
           report_failure(replacement.status().ToString());
         } else {
@@ -653,11 +670,19 @@ int main(int argc, char** argv) {
           last_global_rebuild_rows = rebuild_rows;
           last_global_rebuild_main_rows = rebuild_rows;
         }
-        const double rebuild_ms = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+        barrier.unlock();
+        {
+          std::lock_guard<std::mutex> entry_lock(workload_entry_mutex);
+          rebuild_pending = false;
+        }
+        workload_entry_cv.notify_all();
+        const double rebuild_ms = std::chrono::duration<double, std::milli>(
+                                      Clock::now() - total_start).count();
         rebuild_total_ms += rebuild_ms;
         if (replacement.ok()) {
           std::cout << "[REBUILD] done id=" << rebuild_id
-                    << " rows=" << rebuild_rows << " total_ms=" << rebuild_ms << std::endl;
+                    << " build_ms=" << build_ms
+                    << " total_ms=" << rebuild_ms << std::endl;
         }
       } else {
         std::optional<Route> frozen;
@@ -746,7 +771,16 @@ int main(int argc, char** argv) {
       while (!stop_queries.load(std::memory_order_relaxed)) {
         const auto dispatch = Clock::now();
         const uint32_t qid = static_cast<uint32_t>(next_query.fetch_add(1) % nq);
-        std::shared_lock<std::shared_mutex> workload_access(workload_mutex);
+        std::shared_lock<std::shared_mutex> workload_access;
+        {
+          std::unique_lock<std::mutex> entry_lock(workload_entry_mutex);
+          workload_entry_cv.wait(entry_lock, [&] {
+            return !rebuild_pending || failed.load() ||
+                   stop_queries.load(std::memory_order_relaxed);
+          });
+          if (failed.load() || stop_queries.load(std::memory_order_relaxed)) break;
+          workload_access = std::shared_lock<std::shared_mutex>(workload_mutex);
+        }
         std::shared_ptr<IVFIndex> main_index;
         VersionSet main_versions;
         std::optional<Route> frozen, active;
@@ -875,7 +909,15 @@ int main(int argc, char** argv) {
     const auto insert_start = Clock::now();
     OnlinePQUpdateStats update_stats;
     {
-      std::shared_lock<std::shared_mutex> access(workload_mutex);
+      std::shared_lock<std::shared_mutex> access;
+      {
+        std::unique_lock<std::mutex> entry_lock(workload_entry_mutex);
+        workload_entry_cv.wait(entry_lock, [&] {
+          return !rebuild_pending || failed.load();
+        });
+        if (failed.load()) break;
+        access = std::shared_lock<std::shared_mutex>(workload_mutex);
+      }
       std::lock_guard<std::mutex> commit_lock(version_mutex);
       std::shared_ptr<IVFIndex> active_index;
       VersionSet active_versions;
@@ -1076,6 +1118,7 @@ int main(int argc, char** argv) {
   maintenance_cv.notify_one();
   maintenance.join();
   stop_queries = true;
+  workload_entry_cv.notify_all();
   for (auto& worker : query_workers) worker.join();
   const double measurement_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count();
   if (failed) { std::cerr << failure << '\n'; return 1; }
