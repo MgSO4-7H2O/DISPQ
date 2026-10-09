@@ -959,6 +959,14 @@ int main(int argc, char** argv) {
     });
   }
 
+#ifdef _OPENMP
+  omp_set_num_threads(std::max(1u, config.concurrent_insert_threads));
+  omp_set_dynamic(0);
+  omp_set_max_active_levels(1);
+  std::cout << "[THREADS] insert_omp_max_threads=" << omp_get_max_threads() << std::endl;
+#else
+  std::cout << "[THREADS] insert_omp_max_threads=1" << std::endl;
+#endif
   measurement_start = Clock::now();
   std::cout << "[WORKLOAD] concurrent workload start" << std::endl;
   start_workers.store(true, std::memory_order_release);
