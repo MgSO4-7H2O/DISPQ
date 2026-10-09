@@ -84,6 +84,15 @@ struct OnlinePQUpdateStats {
   double codebook_update_ms{0.0};
   double reencode_ms{0.0};
   double maintenance_ms{0.0};
+  double active_snapshot_us{0.0};
+  double active_prepare_ms{0.0};
+  double active_commit_wait_ms{0.0};
+  double active_commit_ms{0.0};
+};
+
+struct PreparedOnlinePQBatch {
+  std::shared_ptr<void> payload;
+  OnlinePQUpdateStats stats;
 };
 
 struct IngestProfiling {
@@ -243,6 +252,12 @@ class IVFIndex {
       const AlignedVector<VectorRecord>& recs,
       const AlignedVector<VectorRecord>& delete_recs,
       const OnlinePQUpdateOptions& options) = 0;
+
+  virtual Result<PreparedOnlinePQBatch> PrepareOnlinePQBatch(
+      const AlignedVector<VectorRecord>& recs,
+      const OnlinePQUpdateOptions& options) = 0;
+  virtual Result<OnlinePQUpdateStats> CommitPreparedOnlinePQBatch(
+      PreparedOnlinePQBatch prepared) = 0;
 
   // TS: Searches specified versions using whitened query.
   virtual Result<SearchResult> Search(Eigen::Ref<const Eigen::VectorXf> qw,

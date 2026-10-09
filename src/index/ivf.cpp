@@ -363,6 +363,36 @@ struct IndexData {
   IVFBuildProfiling build_profiling;
 };
 
+struct PreparedOnlinePQBatchData {
+  VersionId index_version{0};
+  uint64_t expected_mutation_generation{0};
+  uint32_t dim{0};
+  uint32_t nlist{0};
+  uint32_t M{0};
+  uint32_t nbits{0};
+  uint32_t Ks{0};
+  uint32_t dsub{0};
+  bool use_pq{false};
+  bool pq_residual{true};
+  bool pq_codebook_dimension_major{true};
+  bool pq_codes_subquantizer_major{true};
+  bool use_precomputed_table{false};
+  std::vector<int> centroids;
+  AlignedVector<ListEntry> entries;
+  bool updated_codebook{false};
+  std::vector<MatrixRM> pq_codebooks;
+  std::vector<MatrixRM> pq_codebooks_soa;
+  std::vector<std::vector<uint64_t>> pq_counts;
+  std::vector<float> pq_precomputed_table;
+  bool pq_code_reuse_safe{true};
+  double nqe_baseline{0.0};
+  double nqe_ema{0.0};
+  uint64_t online_pq_batch_count{0};
+  double warmup_nqe_sum{0.0};
+  uint32_t warmup_seen_batches{0};
+  OnlinePQUpdateStats stats;
+};
+
 void RebuildPQSoACache(IndexData* data) {
   if (data == nullptr) {
     return;
@@ -2027,11 +2057,196 @@ class KMeansIVFIndex : public IVFIndex {
     return AddWithOnlinePQSlidingWindowImpl(recs, delete_doc_ids, &delete_recs, options);
   }
 
+  Result<PreparedOnlinePQBatch> PrepareOnlinePQBatch(
+      const AlignedVector<VectorRecord>& recs,
+      const OnlinePQUpdateOptions& options) override {
+    if (options.ema_alpha <= 0.0 || options.ema_alpha > 1.0 ||
+        options.nqe_eps <= 0.0 ||
+        (options.warmup_enable && options.warmup_batches == 0) ||
+        (options.partial_top_alpha &&
+         (options.partial_alpha <= 0.0 || options.partial_alpha > 1.0)) ||
+        (options.partial_top_lambda &&
+         (options.partial_lambda <= 0.0 || options.partial_lambda > 1.0))) {
+      return Status::InvalidArgument("Invalid OnlinePQ update options");
+    }
+
+    const auto snapshot_start = std::chrono::steady_clock::now();
+    auto shadow = std::make_shared<KMeansIVFIndex>();
+    VersionId index_version = 0;
+    uint64_t mutation_generation = 0;
+    auto payload = std::make_shared<PreparedOnlinePQBatchData>();
+    {
+      std::shared_lock lock(mu_);
+      if (latest_version_ == 0) {
+        return Status::InvalidArgument("Index not built");
+      }
+      auto it = data_map_.find(latest_version_);
+      if (it == data_map_.end()) {
+        return Status::NotFound("Latest version missing");
+      }
+      const IndexData& data = *it->second;
+      Status validate = ValidateRecordsForInsertLocked(data, recs);
+      if (!validate.ok()) return validate;
+      const bool can_online = data.use_pq && data.pq_residual && data.M > 0 &&
+                              data.Ks > 0 && data.dsub > 0 &&
+                              data.pq_codebooks.size() == data.M &&
+                              data.pq_counts.size() == data.M;
+      if (!can_online) {
+        return Status::Unimplemented("Prepared insert requires residual PQ OnlinePQ state");
+      }
+
+      index_version = data.version;
+      mutation_generation = data.mutation_generation;
+      payload->index_version = index_version;
+      payload->expected_mutation_generation = mutation_generation;
+      payload->dim = data.dim;
+      payload->nlist = data.nlist;
+      payload->M = data.M;
+      payload->nbits = data.nbits;
+      payload->Ks = data.Ks;
+      payload->dsub = data.dsub;
+      payload->use_pq = data.use_pq;
+      payload->pq_residual = data.pq_residual;
+      payload->pq_codebook_dimension_major = data.pq_codebook_dimension_major;
+      payload->pq_codes_subquantizer_major = data.pq_codes_subquantizer_major;
+
+      auto snapshot = std::make_unique<IndexData>();
+      snapshot->dim = data.dim;
+      snapshot->nlist = data.nlist;
+      snapshot->version = data.version;
+      snapshot->use_pq = data.use_pq;
+      snapshot->pq_residual = data.pq_residual;
+      snapshot->pq_codebook_dimension_major = data.pq_codebook_dimension_major;
+      snapshot->pq_codes_subquantizer_major = data.pq_codes_subquantizer_major;
+      snapshot->M = data.M;
+      snapshot->nbits = data.nbits;
+      snapshot->Ks = data.Ks;
+      snapshot->dsub = data.dsub;
+      snapshot->mutation_generation = data.mutation_generation;
+      snapshot->routing_centroids = data.routing_centroids;
+      snapshot->routing_centroid_norms = data.routing_centroid_norms;
+      snapshot->pq_codebooks = data.pq_codebooks;
+      snapshot->pq_code_reuse_safe = data.pq_code_reuse_safe;
+      snapshot->pq_codebooks_soa = data.pq_codebooks_soa;
+      snapshot->use_precomputed_table = data.use_precomputed_table;
+      snapshot->pq_counts = data.pq_counts;
+      snapshot->nqe_baseline = data.nqe_baseline;
+      snapshot->nqe_ema = data.nqe_ema;
+      snapshot->defer_pq_stats_to_add = data.defer_pq_stats_to_add;
+      snapshot->online_pq_batch_count = data.online_pq_batch_count;
+      snapshot->warmup_nqe_sum = data.warmup_nqe_sum;
+      snapshot->warmup_seen_batches = data.warmup_seen_batches;
+      shadow->latest_version_ = index_version;
+      shadow->data_map_.emplace(index_version, std::move(snapshot));
+    }
+    const double snapshot_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - snapshot_start).count();
+
+    const auto prepare_start = std::chrono::steady_clock::now();
+    auto result = shadow->AddWithOnlinePQSlidingWindowImpl(
+        recs, {}, nullptr, options, payload.get(), false);
+    if (!result.ok()) return result.status();
+    payload->stats = result.value();
+    payload->stats.active_snapshot_us = snapshot_us;
+    auto& prepared_data = *shadow->data_map_.at(index_version);
+    if (payload->stats.updated_codebook) {
+      payload->pq_codebooks = std::move(prepared_data.pq_codebooks);
+      payload->pq_codebooks_soa = std::move(prepared_data.pq_codebooks_soa);
+      payload->pq_counts = std::move(prepared_data.pq_counts);
+      payload->pq_precomputed_table = std::move(prepared_data.pq_precomputed_table);
+      payload->use_precomputed_table = prepared_data.use_precomputed_table;
+      payload->pq_code_reuse_safe = prepared_data.pq_code_reuse_safe;
+    }
+    payload->nqe_baseline = prepared_data.nqe_baseline;
+    payload->nqe_ema = prepared_data.nqe_ema;
+    payload->online_pq_batch_count = prepared_data.online_pq_batch_count;
+    payload->warmup_nqe_sum = prepared_data.warmup_nqe_sum;
+    payload->warmup_seen_batches = prepared_data.warmup_seen_batches;
+    payload->stats.active_prepare_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - prepare_start).count();
+    OnlinePQUpdateStats stats = payload->stats;
+    return PreparedOnlinePQBatch{std::move(payload), std::move(stats)};
+  }
+
+  Result<OnlinePQUpdateStats> CommitPreparedOnlinePQBatch(
+      PreparedOnlinePQBatch prepared) override {
+    if (!prepared.payload) {
+      return Status::InvalidArgument("Prepared OnlinePQ payload is empty");
+    }
+    auto payload = std::static_pointer_cast<PreparedOnlinePQBatchData>(prepared.payload);
+    const auto wait_start = std::chrono::steady_clock::now();
+    std::unique_lock lock(mu_);
+    const auto lock_acquired = std::chrono::steady_clock::now();
+    auto it = data_map_.find(payload->index_version);
+    if (latest_version_ != payload->index_version || it == data_map_.end()) {
+      return Status::Unavailable("Prepared OnlinePQ index version is stale");
+    }
+    IndexData& data = *it->second;
+    if (data.version != payload->index_version ||
+        data.mutation_generation != payload->expected_mutation_generation ||
+        data.dim != payload->dim || data.nlist != payload->nlist ||
+        data.use_pq != payload->use_pq || data.pq_residual != payload->pq_residual ||
+        data.M != payload->M || data.nbits != payload->nbits ||
+        data.Ks != payload->Ks || data.dsub != payload->dsub ||
+        data.pq_codebook_dimension_major != payload->pq_codebook_dimension_major ||
+        data.pq_codes_subquantizer_major != payload->pq_codes_subquantizer_major ||
+        payload->centroids.size() != payload->entries.size() ||
+        payload->entries.empty()) {
+      return Status::Unavailable("Prepared OnlinePQ context is stale or invalid");
+    }
+    if (payload->stats.updated_codebook &&
+        (payload->pq_codebooks.size() != data.M || payload->pq_counts.size() != data.M ||
+         (data.pq_codebook_dimension_major && payload->pq_codebooks_soa.size() != data.M) ||
+         (payload->use_precomputed_table &&
+          payload->pq_precomputed_table.size() != PrecomputedTableElementCount(data)))) {
+      return Status::InvalidArgument("Prepared OnlinePQ state shape mismatch");
+    }
+    for (size_t i = 0; i < payload->entries.size(); ++i) {
+      if (payload->centroids[i] < 0 ||
+          static_cast<uint32_t>(payload->centroids[i]) >= data.nlist ||
+          payload->entries[i].pq_code.size() != data.M ||
+          payload->entries[i].versions.index_version != data.version) {
+        return Status::InvalidArgument("Prepared OnlinePQ entry shape mismatch");
+      }
+    }
+
+    data.last_ingest_profiling = IngestProfiling{};
+    data.last_ingest_profiling.records = payload->entries.size();
+    data.last_ingest_profiling.assignment_us = payload->stats.insert_assignment_us;
+    data.last_ingest_profiling.encode_us = payload->stats.insert_encode_ms * 1000.0;
+    if (payload->stats.updated_codebook) {
+      data.pq_codebooks.swap(payload->pq_codebooks);
+      data.pq_codebooks_soa.swap(payload->pq_codebooks_soa);
+      data.pq_counts.swap(payload->pq_counts);
+      data.pq_precomputed_table.swap(payload->pq_precomputed_table);
+      data.use_precomputed_table = payload->use_precomputed_table;
+      data.pq_code_reuse_safe = payload->pq_code_reuse_safe;
+    }
+    data.nqe_baseline = payload->nqe_baseline;
+    data.nqe_ema = payload->nqe_ema;
+    data.online_pq_batch_count = payload->online_pq_batch_count;
+    data.warmup_nqe_sum = payload->warmup_nqe_sum;
+    data.warmup_seen_batches = payload->warmup_seen_batches;
+    Timer commit_timer;
+    CommitPendingLocked(&data, payload->centroids.data(), &payload->entries);
+    payload->stats.insert_commit_ms = commit_timer.ElapsedMillis();
+    data.mutation_generation = next_mutation_generation_++;
+    data.last_ingest_profiling.commit_us = payload->stats.insert_commit_ms * 1000.0;
+    payload->stats.active_commit_wait_ms = std::chrono::duration<double, std::milli>(
+        lock_acquired - wait_start).count();
+    payload->stats.active_commit_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - lock_acquired).count();
+    payload->stats.insert_ms += payload->stats.insert_commit_ms;
+    return payload->stats;
+  }
+
   Result<OnlinePQUpdateStats> AddWithOnlinePQSlidingWindowImpl(
       const AlignedVector<VectorRecord>& recs,
       const std::vector<DocId>& delete_doc_ids,
       const AlignedVector<VectorRecord>* delete_recs,
-      const OnlinePQUpdateOptions& options) {
+      const OnlinePQUpdateOptions& options,
+      PreparedOnlinePQBatchData* prepared_output = nullptr,
+      bool allow_prepare = true) {
     if (options.ema_alpha <= 0.0 || options.ema_alpha > 1.0) {
       return Status::InvalidArgument("ema_alpha must be in (0,1]");
     }
@@ -2048,6 +2263,17 @@ class KMeansIVFIndex : public IVFIndex {
     if (options.partial_top_lambda &&
         (options.partial_lambda <= 0.0 || options.partial_lambda > 1.0)) {
       return Status::InvalidArgument("partial_lambda must be in (0,1]");
+    }
+
+    if (allow_prepare && prepared_output == nullptr && delete_recs == nullptr &&
+        delete_doc_ids.empty() && !recs.empty()) {
+      auto prepared = PrepareOnlinePQBatch(recs, options);
+      if (prepared.ok()) {
+        return CommitPreparedOnlinePQBatch(std::move(prepared.value()));
+      }
+      if (prepared.status().code() != StatusCode::kUnimplemented) {
+        return prepared.status();
+      }
     }
 
     OnlinePQUpdateStats stats;
@@ -2553,10 +2779,16 @@ class KMeansIVFIndex : public IVFIndex {
       entries[i] = std::move(entry);
     }
     stats.insert_entry_ms += entry_timer.ElapsedMillis();
-    Timer commit_timer;
-    CommitPendingLocked(&data, centroids.data(), &entries);
-    stats.insert_commit_ms += commit_timer.ElapsedMillis();
-    data.last_ingest_profiling.commit_us = stats.insert_commit_ms * 1000.0;
+    if (prepared_output != nullptr) {
+      prepared_output->centroids = std::move(centroids);
+      prepared_output->entries = std::move(entries);
+      prepared_output->stats = stats;
+    } else {
+      Timer commit_timer;
+      CommitPendingLocked(&data, centroids.data(), &entries);
+      stats.insert_commit_ms += commit_timer.ElapsedMillis();
+      data.last_ingest_profiling.commit_us = stats.insert_commit_ms * 1000.0;
+    }
     stats.insert_ms += stats.insert_assignment_us / 1000.0 +
                        stats.insert_encode_ms + stats.insert_entry_ms +
                        stats.insert_commit_ms;

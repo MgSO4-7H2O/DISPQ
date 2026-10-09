@@ -64,6 +64,9 @@ struct InsertTimelineRecord {
   double transform_ms{0.0};
   double insert_ms{0.0};
   double batch_ms{0.0};
+  double active_prepare_ms{0.0};
+  double active_commit_wait_ms{0.0};
+  double active_commit_ms{0.0};
 };
 
 enum class TimelineEventType { kMerge, kRebuild };
@@ -207,16 +210,11 @@ Result<std::shared_ptr<IVFIndex>> BuildIndex(const MatrixRM& data,
   return index;
 }
 
-Status AddOnline(const std::shared_ptr<IVFIndex>& index,
-                 const MatrixRM& data,
-                 uint32_t begin,
-                 uint32_t end,
-                 VersionSet versions,
-                 const OnlinePQUpdateOptions& options,
-                 uint32_t threads,
-                 bool sliding_window,
-                 const std::vector<DocId>& delete_ids,
-                 OnlinePQUpdateStats* stats) {
+AlignedVector<VectorRecord> BuildOnlineRecords(const MatrixRM& data,
+                                                uint32_t begin,
+                                                uint32_t end,
+                                                VersionSet versions,
+                                                uint32_t threads) {
   AlignedVector<VectorRecord> records(end - begin);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(threads)
@@ -229,6 +227,20 @@ Status AddOnline(const std::shared_ptr<IVFIndex>& index,
     record.versions = versions;
     record.x = data.row(row).transpose();
   }
+  return records;
+}
+
+Status AddOnline(const std::shared_ptr<IVFIndex>& index,
+                 const MatrixRM& data,
+                 uint32_t begin,
+                 uint32_t end,
+                 VersionSet versions,
+                 const OnlinePQUpdateOptions& options,
+                 uint32_t threads,
+                 bool sliding_window,
+                 const std::vector<DocId>& delete_ids,
+                 OnlinePQUpdateStats* stats) {
+  AlignedVector<VectorRecord> records = BuildOnlineRecords(data, begin, end, versions, threads);
   Result<OnlinePQUpdateStats> result = OnlinePQUpdateStats{};
   if (sliding_window) {
     AlignedVector<VectorRecord> deleted;
@@ -1054,10 +1066,9 @@ int main(int argc, char** argv) {
           break;
         }
       } else {
-        std::lock_guard<std::mutex> commit_lock(version_mutex);
+        std::vector<DocId> delete_ids;
         std::shared_ptr<IVFIndex> active_index;
         VersionSet active_versions;
-        std::vector<DocId> delete_ids;
         {
           std::lock_guard<std::mutex> lock(state_mutex);
           if (!state.active) {
@@ -1076,14 +1087,51 @@ int main(int argc, char** argv) {
           for (uint32_t i = 0; i < delete_count; ++i)
             delete_ids.push_back(active_window_ids[i]);
         }
-        const Status inserted = AddOnline(active_index, index_data, next_row, end,
-                                          active_versions, online_options,
-                                          config.concurrent_insert_threads, sliding_window,
-                                          delete_ids, &update_stats);
-        if (!inserted.ok()) { report_failure(inserted.ToString()); break; }
-        for (size_t i = 0; i < delete_ids.size(); ++i) active_window_ids.pop_front();
-        for (uint32_t row = next_row; row < end; ++row) active_window_ids.push_back(row);
-        {
+
+        bool use_prepared_commit = false;
+        PreparedOnlinePQBatch prepared_batch;
+        double active_prepare_ms = 0.0;
+        if (!sliding_window && delete_ids.empty() && config.pq_enable && config.pq_residual) {
+          const auto prepare_start = Clock::now();
+          auto records = BuildOnlineRecords(index_data, next_row, end, active_versions,
+                                            config.concurrent_insert_threads);
+          auto prepared = active_index->PrepareOnlinePQBatch(records, online_options);
+          if (!prepared.ok()) {
+            if (prepared.status().code() != StatusCode::kUnimplemented) {
+              report_failure(prepared.status().ToString());
+              break;
+            }
+          } else {
+            prepared_batch = std::move(prepared.value());
+            active_prepare_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - prepare_start).count();
+            use_prepared_commit = true;
+          }
+        }
+
+        if (use_prepared_commit) {
+          std::lock_guard<std::mutex> commit_lock(version_mutex);
+          auto inserted = active_index->CommitPreparedOnlinePQBatch(std::move(prepared_batch));
+          if (!inserted.ok()) { report_failure(inserted.status().ToString()); break; }
+          update_stats = inserted.value();
+          update_stats.active_prepare_ms = active_prepare_ms;
+          for (uint32_t row = next_row; row < end; ++row) active_window_ids.push_back(row);
+          std::lock_guard<std::mutex> lock(state_mutex);
+          if (state.active)
+            state.active->rows += end - next_row;
+          state.committed_rows = end;
+          ++state.version;
+          current_committed.store(end, std::memory_order_release);
+          current_version.store(state.version, std::memory_order_release);
+        } else {
+          std::lock_guard<std::mutex> commit_lock(version_mutex);
+          const Status inserted = AddOnline(active_index, index_data, next_row, end,
+                                            active_versions, online_options,
+                                            config.concurrent_insert_threads, sliding_window,
+                                            delete_ids, &update_stats);
+          if (!inserted.ok()) { report_failure(inserted.ToString()); break; }
+          for (size_t i = 0; i < delete_ids.size(); ++i) active_window_ids.pop_front();
+          for (uint32_t row = next_row; row < end; ++row) active_window_ids.push_back(row);
           std::lock_guard<std::mutex> lock(state_mutex);
           if (state.active)
             state.active->rows += end - next_row - static_cast<uint32_t>(delete_ids.size());
@@ -1101,7 +1149,10 @@ int main(int argc, char** argv) {
         batch_number, current_version.load(std::memory_order_acquire), batch_begin, end,
         std::chrono::duration<double, std::milli>(batch_start - measurement_start).count(),
         std::chrono::duration<double, std::milli>(batch_end - measurement_start).count(),
-        transform_ms, insert_ms, batch_ms});
+        transform_ms, insert_ms, batch_ms,
+        update_stats.active_prepare_ms,
+        update_stats.active_commit_wait_ms,
+        update_stats.active_commit_ms});
     insert_batch_ms.push_back(batch_ms);
     inserted_vectors += end - next_row;
     ++committed_batches;
@@ -1384,13 +1435,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   inserts << std::setprecision(12)
-          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms\n";
+          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms,active_prepare_ms,active_commit_wait_ms,active_commit_ms\n";
   for (const InsertTimelineRecord& record : insert_timeline_records) {
     inserts << record.batch << ',' << record.version << ','
             << record.begin_row << ',' << record.end_row << ','
             << record.start_ms << ',' << record.end_ms << ','
             << record.transform_ms << ',' << record.insert_ms << ','
-            << record.batch_ms << '\n';
+            << record.batch_ms << ',' << record.active_prepare_ms << ','
+            << record.active_commit_wait_ms << ',' << record.active_commit_ms << '\n';
   }
   inserts.close();
   if (!inserts) {
