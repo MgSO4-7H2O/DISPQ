@@ -585,6 +585,20 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> inserted_vectors{0}, committed_batches{0}, merge_count{0}, rebuild_count{0};
   double merge_total_ms = 0.0, merge_compute_ms = 0.0, merge_commit_ms = 0.0;
   double merge_codebook_rebuild_ms = 0.0, rebuild_total_ms = 0.0;
+  double merge_assignment_ms = 0.0;
+  double merge_assignment_distance_ms = 0.0;
+  double merge_assignment_top_r_ms = 0.0;
+  double merge_assignment_balance_ms = 0.0;
+  double merge_assignment_materialize_ms = 0.0;
+  double merge_stats_ms = 0.0;
+  double merge_scoring_ms = 0.0;
+  double merge_patch_prepare_ms = 0.0;
+  double merge_fetch_main_records_work_ms = 0.0;
+  double merge_repartition_pool_work_ms = 0.0;
+  double merge_repartition_distance_work_ms = 0.0;
+  double merge_repartition_candidate_work_ms = 0.0;
+  double merge_repartition_sort_work_ms = 0.0;
+  double merge_prepare_pq_work_ms = 0.0;
   double neighborhood_plan_us = 0.0;
   double neighborhood_execute_wall_us = 0.0;
   double neighborhood_combine_us = 0.0;
@@ -817,6 +831,31 @@ int main(int argc, char** argv) {
               event_codebook_rebuild_ms = merged.value().codebook_rebuild_ms;
               event_merge_commit_ms = merged.value().profiling.commit_us / 1000.0;
               event_profiling = merged.value().profiling;
+              merge_assignment_ms +=
+                  event_profiling.merge_delta_to_main_assignment_us / 1000.0;
+              merge_assignment_distance_ms +=
+                  event_profiling.merge_assignment_distance_us / 1000.0;
+              merge_assignment_top_r_ms +=
+                  event_profiling.merge_assignment_top_r_us / 1000.0;
+              merge_assignment_balance_ms +=
+                  event_profiling.merge_assignment_balance_us / 1000.0;
+              merge_assignment_materialize_ms +=
+                  event_profiling.merge_assignment_materialize_us / 1000.0;
+              merge_stats_ms += event_profiling.stats_us / 1000.0;
+              merge_scoring_ms += event_profiling.scoring_us / 1000.0;
+              merge_patch_prepare_ms += event_profiling.patch_prepare_us / 1000.0;
+              merge_fetch_main_records_work_ms +=
+                  event_profiling.fetch_main_records_us / 1000.0;
+              merge_repartition_pool_work_ms +=
+                  event_profiling.repartition_pool_us / 1000.0;
+              merge_repartition_distance_work_ms +=
+                  event_profiling.repartition_distance_us / 1000.0;
+              merge_repartition_candidate_work_ms +=
+                  event_profiling.repartition_candidate_selection_us / 1000.0;
+              merge_repartition_sort_work_ms +=
+                  event_profiling.repartition_sort_us / 1000.0;
+              merge_prepare_pq_work_ms +=
+                  event_profiling.prepare_pq_encode_us / 1000.0;
               neighborhood_plan_us += event_profiling.neighborhood_plan_us;
               neighborhood_execute_wall_us +=
                   event_profiling.neighborhood_execute_wall_us;
@@ -877,6 +916,51 @@ int main(int argc, char** argv) {
                       << " neighborhood_combine_us="
                       << event_profiling.neighborhood_combine_us
                       << " main_rows=" << merged_main_rows << std::endl;
+            const double known_major_phase_ms =
+                (event_profiling.merge_delta_to_main_assignment_us +
+                 event_profiling.stats_us + event_profiling.scoring_us +
+                 event_profiling.patch_prepare_us) / 1000.0;
+            std::cout << "[MERGE_PROFILE] id=" << frozen->id
+                      << " frozen_rows=" << frozen->rows
+                      << " main_rows=" << main_rows_for_merge
+                      << " compute_ms=" << event_merge_compute_ms
+                      << " assignment_wall_ms="
+                      << event_profiling.merge_delta_to_main_assignment_us / 1000.0
+                      << " assignment_distance_wall_ms="
+                      << event_profiling.merge_assignment_distance_us / 1000.0
+                      << " assignment_top_r_wall_ms="
+                      << event_profiling.merge_assignment_top_r_us / 1000.0
+                      << " assignment_balance_serial_ms="
+                      << event_profiling.merge_assignment_balance_us / 1000.0
+                      << " assignment_materialize_serial_ms="
+                      << event_profiling.merge_assignment_materialize_us / 1000.0
+                      << " stats_wall_ms=" << event_profiling.stats_us / 1000.0
+                      << " scoring_wall_ms=" << event_profiling.scoring_us / 1000.0
+                      << " patch_prepare_wall_ms="
+                      << event_profiling.patch_prepare_us / 1000.0
+                      << " neighborhood_top_r_wall_ms="
+                      << event_profiling.top_r_neighbor_us / 1000.0
+                      << " neighborhood_plan_wall_ms="
+                      << event_profiling.neighborhood_plan_us / 1000.0
+                      << " neighborhood_execute_wall_ms="
+                      << event_profiling.neighborhood_execute_wall_us / 1000.0
+                      << " neighborhood_combine_wall_ms="
+                      << event_profiling.neighborhood_combine_us / 1000.0
+                      << " fetch_main_records_work_ms="
+                      << event_profiling.fetch_main_records_us / 1000.0
+                      << " repartition_pool_work_ms="
+                      << event_profiling.repartition_pool_us / 1000.0
+                      << " repartition_distance_work_ms="
+                      << event_profiling.repartition_distance_us / 1000.0
+                      << " repartition_candidate_work_ms="
+                      << event_profiling.repartition_candidate_selection_us / 1000.0
+                      << " repartition_sort_work_ms="
+                      << event_profiling.repartition_sort_us / 1000.0
+                      << " pq_prepare_work_ms="
+                      << event_profiling.prepare_pq_encode_us / 1000.0
+                      << " commit_wall_ms=" << event_profiling.commit_us / 1000.0
+                      << " compute_unaccounted_ms="
+                      << event_merge_compute_ms - known_major_phase_ms << std::endl;
           }
         }
       }
@@ -1476,6 +1560,41 @@ int main(int argc, char** argv) {
           << "  \"merge_count\": " << merge_count << ",\n"
           << "  \"merge_total_ms\": " << merge_total_ms << ",\n"
           << "  \"merge_compute_ms\": " << merge_compute_ms << ",\n"
+          << "  \"merge_assignment_ms\": " << merge_assignment_ms << ",\n"
+          << "  \"merge_assignment_distance_ms\": "
+          << merge_assignment_distance_ms << ",\n"
+          << "  \"merge_assignment_top_r_ms\": " << merge_assignment_top_r_ms << ",\n"
+          << "  \"merge_assignment_balance_ms\": "
+          << merge_assignment_balance_ms << ",\n"
+          << "  \"merge_assignment_materialize_ms\": "
+          << merge_assignment_materialize_ms << ",\n"
+          << "  \"merge_stats_ms\": " << merge_stats_ms << ",\n"
+          << "  \"merge_scoring_ms\": " << merge_scoring_ms << ",\n"
+          << "  \"merge_patch_prepare_ms\": " << merge_patch_prepare_ms << ",\n"
+          << "  \"merge_fetch_main_records_work_ms\": "
+          << merge_fetch_main_records_work_ms << ",\n"
+          << "  \"merge_repartition_pool_work_ms\": "
+          << merge_repartition_pool_work_ms << ",\n"
+          << "  \"merge_repartition_distance_work_ms\": "
+          << merge_repartition_distance_work_ms << ",\n"
+          << "  \"merge_repartition_candidate_work_ms\": "
+          << merge_repartition_candidate_work_ms << ",\n"
+          << "  \"merge_repartition_sort_work_ms\": "
+          << merge_repartition_sort_work_ms << ",\n"
+          << "  \"merge_prepare_pq_work_ms\": " << merge_prepare_pq_work_ms << ",\n"
+          << "  \"merge_compute_unaccounted_ms\": "
+          << merge_compute_ms - merge_assignment_ms - merge_stats_ms -
+                 merge_scoring_ms - merge_patch_prepare_ms << ",\n"
+          << "  \"merge_assignment_ratio\": "
+          << (merge_compute_ms > 0.0 ? merge_assignment_ms / merge_compute_ms : 0.0)
+          << ",\n"
+          << "  \"merge_patch_prepare_ratio\": "
+          << (merge_compute_ms > 0.0 ? merge_patch_prepare_ms / merge_compute_ms : 0.0)
+          << ",\n"
+          << "  \"merge_assignment_distance_ratio\": "
+          << (merge_compute_ms > 0.0
+                  ? merge_assignment_distance_ms / merge_compute_ms
+                  : 0.0) << ",\n"
           << "  \"merge_codebook_rebuild_ms\": " << merge_codebook_rebuild_ms << ",\n"
           << "  \"merge_commit_ms\": " << merge_commit_ms << ",\n"
           << "  \"neighborhood_plan_us\": " << neighborhood_plan_us << ",\n"
