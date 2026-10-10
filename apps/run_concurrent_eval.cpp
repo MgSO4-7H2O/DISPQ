@@ -38,7 +38,6 @@ using namespace ann;
 using Clock = std::chrono::steady_clock;
 constexpr uint32_t kConcurrentTransformBlockRows = 65536;
 constexpr double kTimelineBucketMs = 200.0;
-constexpr uint64_t kMinRowsPerListForImbalance = 32;
 
 struct Route {
   std::shared_ptr<IVFIndex> index;
@@ -615,16 +614,7 @@ int main(int argc, char** argv) {
   merge_options.assignment_hard_cap_ratio = config.merge_assignment_hard_cap_ratio;
   merge_options.assignment_lambda = config.merge_assignment_lambda;
   const uint32_t trigger_rows = config.merge_trigger_rows ? config.merge_trigger_rows : delta_rows;
-  const uint64_t trigger_rows_wide = trigger_rows;
-  const uint64_t half_trigger_rows = trigger_rows_wide / 2 + trigger_rows_wide % 2;
-  const uint64_t configured_delta_nlist = delta_rows > 0
-      ? std::min<uint64_t>(delta_nlist, delta_rows)
-      : std::min<uint64_t>(delta_nlist, batch_size);
-  auto minimum_imbalance_rows = [&](uint64_t active_nlist) {
-    const uint64_t per_list_rows = active_nlist * kMinRowsPerListForImbalance;
-    return std::min(trigger_rows_wide,
-                    std::max(half_trigger_rows, per_list_rows));
-  };
+  const uint64_t imbalance_min_rows = static_cast<uint64_t>(trigger_rows);
   uint32_t last_global_rebuild_rows = initial_rows;
   uint32_t last_global_rebuild_main_rows = main_rows;
   Clock::time_point measurement_start;
@@ -1247,7 +1237,6 @@ int main(int argc, char** argv) {
     bool imbalance_trigger = false;
     bool imbalance_eligible = false;
     double imbalance_ratio = 0.0;
-    uint64_t imbalance_min_rows = minimum_imbalance_rows(configured_delta_nlist);
     bool request_merge = false;
     bool request_rebuild = false;
     std::shared_ptr<IVFIndex> frozen_active_index;
@@ -1262,7 +1251,7 @@ int main(int argc, char** argv) {
       std::lock_guard<std::mutex> lock(state_mutex);
       if (state.active) {
         trigger_active_rows = state.active->rows;
-        imbalance_eligible = state.active->rows >= imbalance_min_rows;
+        imbalance_eligible = static_cast<uint64_t>(state.active->rows) >= imbalance_min_rows;
         rows_trigger = trigger_rows > 0 && state.active->rows >= trigger_rows;
         qe_trigger = config.merge_trigger_qe_ratio > 0.0 &&
                                 update_stats.qe_ratio >= config.merge_trigger_qe_ratio;
@@ -1274,8 +1263,7 @@ int main(int argc, char** argv) {
         if (config.merge_trigger_imbalance_ratio > 0.0) {
           auto sizes = state.active->index->GetPartitionSizes(state.active->versions);
           if (sizes.ok() && !sizes.value().empty()) {
-            imbalance_min_rows = minimum_imbalance_rows(sizes.value().size());
-            imbalance_eligible = state.active->rows >= imbalance_min_rows;
+            imbalance_eligible = static_cast<uint64_t>(state.active->rows) >= imbalance_min_rows;
             uint64_t total = 0;
             uint32_t nonempty = 0, max_size = 0;
             for (uint32_t size : sizes.value()) {
@@ -1381,6 +1369,9 @@ int main(int argc, char** argv) {
               << " transform_ms=" << transform_ms
               << " insert_ms=" << insert_ms
               << " batch_ms=" << batch_ms
+              << " imbalance_ratio=" << imbalance_ratio
+              << " imbalance_eligible=" << (imbalance_eligible ? "true" : "false")
+              << " imbalance_min_rows=" << imbalance_min_rows
               << " elapsed_ms="
               << std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count()
               << " pending=" << (log_pending ? "true" : "false") << std::endl;
