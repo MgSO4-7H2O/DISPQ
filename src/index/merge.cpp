@@ -347,37 +347,54 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
   }
 
   constexpr size_t kMaxAssignmentChunkBytes = 64ULL * 1024ULL * 1024ULL;
+  Eigen::VectorXf centroid_norms(main_centroids.rows());
+  for (uint32_t i = 0; i < nlist; ++i) {
+    centroid_norms[static_cast<Eigen::Index>(i)] =
+        main_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+  }
   const size_t bytes_per_record =
       static_cast<size_t>(nlist) * sizeof(float) +
-      static_cast<size_t>(top_r) * sizeof(AssignmentTopCandidate);
+      static_cast<size_t>(top_r) * sizeof(AssignmentTopCandidate) +
+      static_cast<size_t>(main_centroids.cols()) * sizeof(float) + sizeof(float);
   const size_t chunk_records = std::max<size_t>(
       1,
       std::min<size_t>(16384,
                        kMaxAssignmentChunkBytes / std::max<size_t>(1, bytes_per_record)));
   std::vector<float> chunk_distances;
   std::vector<AssignmentTopCandidate> chunk_top_candidates;
+  MatrixRM chunk_vectors;
+  Eigen::VectorXf chunk_row_norms;
   if (!frozen_delta.records.empty()) {
     chunk_distances.resize(chunk_records * static_cast<size_t>(nlist));
     chunk_top_candidates.resize(chunk_records * static_cast<size_t>(top_r));
+    chunk_vectors.resize(static_cast<Eigen::Index>(chunk_records), main_centroids.cols());
+    chunk_row_norms.resize(static_cast<Eigen::Index>(chunk_records));
   }
-
   for (size_t chunk_begin = 0; chunk_begin < frozen_delta.records.size();
        chunk_begin += chunk_records) {
     const size_t chunk_count =
         std::min(chunk_records, frozen_delta.records.size() - chunk_begin);
 
     const auto distance_start = ProfilingClock::now();
-    #pragma omp parallel for schedule(static)
-    for (int64_t local_index = 0; local_index < static_cast<int64_t>(chunk_count);
-         ++local_index) {
+    for (size_t local_index = 0; local_index < chunk_count; ++local_index) {
       const auto& rec = frozen_delta.records[chunk_begin + static_cast<size_t>(local_index)];
-      float* distances = chunk_distances.data() +
-                         static_cast<size_t>(local_index) * static_cast<size_t>(nlist);
-      for (uint32_t i = 0; i < nlist; ++i) {
-        distances[static_cast<size_t>(i)] =
-            (rec.x - main_centroids.row(static_cast<Eigen::Index>(i)).transpose()).squaredNorm();
-      }
+      chunk_vectors.row(static_cast<Eigen::Index>(local_index)) = rec.x.transpose();
+      chunk_row_norms[static_cast<Eigen::Index>(local_index)] =
+          chunk_vectors.row(static_cast<Eigen::Index>(local_index)).squaredNorm();
     }
+    Eigen::Map<MatrixRM> chunk_distance_matrix(
+        chunk_distances.data(),
+        static_cast<Eigen::Index>(chunk_records),
+        static_cast<Eigen::Index>(nlist));
+    auto active_distances =
+        chunk_distance_matrix.topRows(static_cast<Eigen::Index>(chunk_count));
+    active_distances.noalias() =
+        chunk_vectors.topRows(static_cast<Eigen::Index>(chunk_count)) *
+        main_centroids.transpose();
+    active_distances *= -2.0f;
+    active_distances.colwise() +=
+        chunk_row_norms.head(static_cast<Eigen::Index>(chunk_count));
+    active_distances.rowwise() += centroid_norms.transpose();
     distance_us += ElapsedProfilingMicros(distance_start);
 
     const auto top_r_start = ProfilingClock::now();
