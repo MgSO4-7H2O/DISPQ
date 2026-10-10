@@ -78,6 +78,9 @@ struct MergeProfiling {
   uint32_t vector_accessor_max_materialize_rows{0};
   uint64_t seed_partitions{0};
   uint64_t neighborhoods{0};
+  double neighborhood_plan_us{0.0};
+  double neighborhood_execute_wall_us{0.0};
+  double neighborhood_combine_us{0.0};
   uint64_t main_records_loaded{0};
   uint64_t pooled_records{0};
   uint64_t repartitioned_records{0};

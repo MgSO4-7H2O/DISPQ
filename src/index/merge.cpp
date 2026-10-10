@@ -42,6 +42,35 @@ void AccumulateVectorAccessorMaterialization(
       destination->vector_accessor_max_materialize_rows, source.max_rows);
 }
 
+void AccumulateNeighborhoodProfiling(const MergeProfiling& source,
+                                     MergeProfiling* destination) {
+  if (destination == nullptr) {
+    return;
+  }
+  destination->fetch_main_records_us += source.fetch_main_records_us;
+  destination->main_records_loaded += source.main_records_loaded;
+  destination->vector_accessor_materialize_calls += source.vector_accessor_materialize_calls;
+  destination->vector_accessor_materialized_rows += source.vector_accessor_materialized_rows;
+  destination->vector_accessor_materialized_bytes += source.vector_accessor_materialized_bytes;
+  destination->vector_accessor_max_materialize_rows = std::max(
+      destination->vector_accessor_max_materialize_rows,
+      source.vector_accessor_max_materialize_rows);
+  destination->pooled_records += source.pooled_records;
+  destination->repartitioned_records += source.repartitioned_records;
+  destination->repartition_pool_us += source.repartition_pool_us;
+  destination->repartition_distance_us += source.repartition_distance_us;
+  destination->repartition_candidate_selection_us +=
+      source.repartition_candidate_selection_us;
+  destination->repartition_sort_us += source.repartition_sort_us;
+  destination->patch_dense_vector_bytes += source.patch_dense_vector_bytes;
+  destination->patch_retained_vector_bytes += source.patch_retained_vector_bytes;
+  destination->patch_elided_vector_bytes += source.patch_elided_vector_bytes;
+  destination->patch_final_pq_code_bytes += source.patch_final_pq_code_bytes;
+  destination->prepare_pq_codes_reused += source.prepare_pq_codes_reused;
+  destination->prepare_pq_codes_reencoded += source.prepare_pq_codes_reencoded;
+  destination->prepare_pq_encode_us += source.prepare_pq_encode_us;
+}
+
 bool SamePQEncodingContext(const PQEncodingContext& lhs,
                            const PQEncodingContext& rhs) {
   return lhs.index_version == rhs.index_version &&
@@ -1143,6 +1172,9 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
           "prepare_partition_patch: assignments size mismatch with centroids");
     }
 
+    const auto plan_start = profiling != nullptr
+                                ? ProfilingClock::now()
+                                : ProfilingClock::time_point{};
     std::vector<uint32_t> seeds;
     seeds.reserve(assignments.size());
     for (uint32_t p = 0; p < static_cast<uint32_t>(assignments.size()); ++p) {
@@ -1160,7 +1192,18 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       profiling->seed_partitions = static_cast<uint64_t>(seeds.size());
     }
 
-    PartitionPatch patch;
+    struct MergeNeighborhoodPlan {
+      uint32_t seed_partition{0};
+      std::vector<uint32_t> partition_ids;
+    };
+    struct MergeNeighborhoodResult {
+      std::vector<uint32_t> partition_ids;
+      std::vector<AlignedVector<VectorRecord>> replacement_records;
+      std::optional<PreparedPQPayload> prepared_pq;
+      MergeProfiling profiling;
+    };
+
+    std::vector<MergeNeighborhoodPlan> plans;
     std::vector<uint8_t> claimed(assignments.size(), 0u);
     for (uint32_t seed : seeds) {
       if (claimed[static_cast<size_t>(seed)] != 0u) {
@@ -1184,15 +1227,27 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
       if (active_neighborhood.empty()) {
         continue;
       }
-      if (profiling != nullptr) {
-        ++profiling->neighborhoods;
-      }
-
-      std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
-      neighborhood_main_records.reserve(active_neighborhood.size());
       for (uint32_t part : active_neighborhood) {
+        claimed[static_cast<size_t>(part)] = 1u;
+      }
+      plans.push_back(MergeNeighborhoodPlan{seed, std::move(active_neighborhood)});
+    }
+    if (profiling != nullptr) {
+      profiling->neighborhoods += static_cast<uint64_t>(plans.size());
+      profiling->neighborhood_plan_us += ElapsedProfilingMicros(plan_start);
+    }
+
+    std::vector<MergeNeighborhoodResult> results(plans.size());
+    auto execute_neighborhood = [&](size_t plan_index) -> Status {
+      const MergeNeighborhoodPlan& plan = plans[plan_index];
+      MergeNeighborhoodResult& result = results[plan_index];
+      result.partition_ids = plan.partition_ids;
+      MergeProfiling* local_profiling = profiling != nullptr ? &result.profiling : nullptr;
+      std::vector<AlignedVector<VectorRecord>> neighborhood_main_records;
+      neighborhood_main_records.reserve(plan.partition_ids.size());
+      for (uint32_t part : plan.partition_ids) {
         VectorAccessorMaterializationStats materialization_profile;
-        const auto fetch_start = profiling != nullptr
+        const auto fetch_start = local_profiling != nullptr
                                      ? ProfilingClock::now()
                                      : ProfilingClock::time_point{};
         auto main_records_res =
@@ -1201,48 +1256,101 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
                                           part,
                                           vector_accessor,
                                           &materialization_profile);
-        if (profiling != nullptr) {
-          profiling->fetch_main_records_us += ElapsedProfilingMicros(fetch_start);
-          AccumulateVectorAccessorMaterialization(materialization_profile, profiling);
+        if (local_profiling != nullptr) {
+          local_profiling->fetch_main_records_us += ElapsedProfilingMicros(fetch_start);
+          AccumulateVectorAccessorMaterialization(materialization_profile, local_profiling);
         }
         if (!main_records_res.ok()) {
           return main_records_res.status();
         }
-        if (profiling != nullptr) {
-          profiling->main_records_loaded +=
+        if (local_profiling != nullptr) {
+          local_profiling->main_records_loaded +=
               static_cast<uint64_t>(main_records_res.value().size());
         }
         neighborhood_main_records.push_back(std::move(main_records_res.value()));
       }
 
-      auto repartition_res = RepartitionNeighborhood(active_neighborhood,
+      auto repartition_res = RepartitionNeighborhood(plan.partition_ids,
                                                      std::move(neighborhood_main_records),
                                                      frozen_delta,
                                                      consumable_frozen_delta,
                                                      assignments,
                                                      centroids_res.value(),
                                                      options,
-                                                     profiling);
+                                                     local_profiling);
       if (!repartition_res.ok()) {
         return repartition_res.status();
       }
       std::vector<AlignedVector<VectorRecord>> repartitioned = std::move(repartition_res.value());
       auto finalization_res = FinalizePartitionPQCodes(
-          main_ivf, main_versions, active_neighborhood, &repartitioned);
+          main_ivf, main_versions, plan.partition_ids, &repartitioned);
       if (!finalization_res.ok()) {
         return finalization_res.status();
       }
-      AccumulatePQFinalizationProfiling(finalization_res.value(), profiling);
+      AccumulatePQFinalizationProfiling(finalization_res.value(), local_profiling);
+      result.prepared_pq = std::move(finalization_res.value().prepared_pq);
+      result.replacement_records = std::move(repartitioned);
+      return Status::OK();
+    };
+
+    const auto execute_start = profiling != nullptr
+                                   ? ProfilingClock::now()
+                                   : ProfilingClock::time_point{};
+    if (consumable_frozen_delta == nullptr) {
+      std::atomic<bool> failed{false};
+      std::mutex error_mutex;
+      Status first_error = Status::OK();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+      for (int64_t i = 0; i < static_cast<int64_t>(plans.size()); ++i) {
+        if (failed.load(std::memory_order_relaxed)) {
+          continue;
+        }
+        Status status = execute_neighborhood(static_cast<size_t>(i));
+        if (!status.ok()) {
+          std::lock_guard<std::mutex> lock(error_mutex);
+          if (!failed.load(std::memory_order_relaxed)) {
+            first_error = std::move(status);
+            failed.store(true, std::memory_order_relaxed);
+          }
+        }
+      }
+      if (failed.load(std::memory_order_relaxed)) {
+        return first_error;
+      }
+    } else {
+      for (size_t i = 0; i < plans.size(); ++i) {
+        Status status = execute_neighborhood(i);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+    if (profiling != nullptr) {
+      profiling->neighborhood_execute_wall_us += ElapsedProfilingMicros(execute_start);
+    }
+
+    PartitionPatch patch;
+    const auto combine_start = profiling != nullptr
+                                   ? ProfilingClock::now()
+                                   : ProfilingClock::time_point{};
+    for (MergeNeighborhoodResult& result : results) {
+      if (profiling != nullptr) {
+        AccumulateNeighborhoodProfiling(result.profiling, profiling);
+      }
       Status append_prepared = AppendPreparedPQPayload(
-          std::move(finalization_res.value().prepared_pq), assignments.size(), &patch);
+          std::move(result.prepared_pq), assignments.size(), &patch);
       if (!append_prepared.ok()) {
         return append_prepared;
       }
-      for (size_t i = 0; i < active_neighborhood.size(); ++i) {
-        patch.partition_ids.push_back(active_neighborhood[i]);
-        patch.replacement_records.push_back(std::move(repartitioned[i]));
-        claimed[static_cast<size_t>(active_neighborhood[i])] = 1u;
+      for (size_t i = 0; i < result.partition_ids.size(); ++i) {
+        patch.partition_ids.push_back(result.partition_ids[i]);
+        patch.replacement_records.push_back(std::move(result.replacement_records[i]));
       }
+    }
+    if (profiling != nullptr) {
+      profiling->neighborhood_combine_us += ElapsedProfilingMicros(combine_start);
     }
     if (profiling != nullptr) {
       profiling->patch_records = 0;

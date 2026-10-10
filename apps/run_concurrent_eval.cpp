@@ -91,6 +91,9 @@ struct TimelineEvent {
   double commit_validation_us{0.0};
   double commit_docmap_us{0.0};
   double commit_partition_swap_us{0.0};
+  double neighborhood_plan_us{0.0};
+  double neighborhood_execute_wall_us{0.0};
+  double neighborhood_combine_us{0.0};
 };
 
 struct RuntimeState {
@@ -582,6 +585,9 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> inserted_vectors{0}, committed_batches{0}, merge_count{0}, rebuild_count{0};
   double merge_total_ms = 0.0, merge_compute_ms = 0.0, merge_commit_ms = 0.0;
   double merge_codebook_rebuild_ms = 0.0, rebuild_total_ms = 0.0;
+  double neighborhood_plan_us = 0.0;
+  double neighborhood_execute_wall_us = 0.0;
+  double neighborhood_combine_us = 0.0;
   uint64_t merge_patch_partitions = 0, merge_append_partitions = 0;
   uint64_t merge_recluster_partitions = 0;
   double max_insert_lag_ms = 0.0, active_rows_over_trigger = 0.0;
@@ -811,6 +817,10 @@ int main(int argc, char** argv) {
               event_codebook_rebuild_ms = merged.value().codebook_rebuild_ms;
               event_merge_commit_ms = merged.value().profiling.commit_us / 1000.0;
               event_profiling = merged.value().profiling;
+              neighborhood_plan_us += event_profiling.neighborhood_plan_us;
+              neighborhood_execute_wall_us +=
+                  event_profiling.neighborhood_execute_wall_us;
+              neighborhood_combine_us += event_profiling.neighborhood_combine_us;
               ++merge_count;
               merge_compute_ms += event_merge_compute_ms;
               merge_codebook_rebuild_ms += event_codebook_rebuild_ms;
@@ -845,6 +855,10 @@ int main(int argc, char** argv) {
             event.commit_validation_us = event_profiling.commit_validation_us;
             event.commit_docmap_us = event_profiling.commit_docmap_us;
             event.commit_partition_swap_us = event_profiling.commit_partition_swap_us;
+            event.neighborhood_plan_us = event_profiling.neighborhood_plan_us;
+            event.neighborhood_execute_wall_us =
+                event_profiling.neighborhood_execute_wall_us;
+            event.neighborhood_combine_us = event_profiling.neighborhood_combine_us;
             timeline_events.push_back(event);
             uint32_t merged_main_rows = 0;
             {
@@ -857,6 +871,11 @@ int main(int argc, char** argv) {
                       << " compute_ms=" << event_merge_compute_ms
                       << " codebook_ms=" << event_codebook_rebuild_ms
                       << " commit_ms=" << event_merge_commit_ms
+                      << " neighborhood_plan_us=" << event_profiling.neighborhood_plan_us
+                      << " neighborhood_execute_wall_us="
+                      << event_profiling.neighborhood_execute_wall_us
+                      << " neighborhood_combine_us="
+                      << event_profiling.neighborhood_combine_us
                       << " main_rows=" << merged_main_rows << std::endl;
           }
         }
@@ -1459,6 +1478,10 @@ int main(int argc, char** argv) {
           << "  \"merge_compute_ms\": " << merge_compute_ms << ",\n"
           << "  \"merge_codebook_rebuild_ms\": " << merge_codebook_rebuild_ms << ",\n"
           << "  \"merge_commit_ms\": " << merge_commit_ms << ",\n"
+          << "  \"neighborhood_plan_us\": " << neighborhood_plan_us << ",\n"
+          << "  \"neighborhood_execute_wall_us\": "
+          << neighborhood_execute_wall_us << ",\n"
+          << "  \"neighborhood_combine_us\": " << neighborhood_combine_us << ",\n"
           << "  \"merge_patch_partitions\": " << merge_patch_partitions << ",\n"
           << "  \"merge_append_partitions\": " << merge_append_partitions << ",\n"
           << "  \"merge_recluster_partitions\": " << merge_recluster_partitions << ",\n"
@@ -1560,7 +1583,8 @@ int main(int argc, char** argv) {
   events << std::setprecision(12)
          << "type,id,request_ms,start_ms,compute_done_ms,commit_wait_start_ms,"
             "commit_lock_acquired_ms,commit_done_ms,end_ms,rows,main_rows,"
-            "prepare_publish_us,commit_validation_us,commit_docmap_us,commit_partition_swap_us\n";
+            "prepare_publish_us,commit_validation_us,commit_docmap_us,commit_partition_swap_us,"
+            "neighborhood_plan_us,neighborhood_execute_wall_us,neighborhood_combine_us\n";
   for (const TimelineEvent& event : timeline_events) {
     events << (event.type == TimelineEventType::kMerge ? "merge" : "rebuild")
            << ',' << event.id << ',' << event.request_ms << ',' << event.start_ms << ','
@@ -1568,7 +1592,10 @@ int main(int argc, char** argv) {
            << event.commit_lock_acquired_ms << ',' << event.commit_done_ms << ','
            << event.end_ms << ',' << event.rows << ',' << event.main_rows << ','
            << event.prepare_publish_us << ',' << event.commit_validation_us << ','
-           << event.commit_docmap_us << ',' << event.commit_partition_swap_us << '\n';
+           << event.commit_docmap_us << ',' << event.commit_partition_swap_us << ','
+           << event.neighborhood_plan_us << ','
+           << event.neighborhood_execute_wall_us << ','
+           << event.neighborhood_combine_us << '\n';
   }
   events.close();
   if (!events) {
