@@ -1898,6 +1898,106 @@ class KMeansIVFIndex : public IVFIndex {
     return version;
   }
 
+  Result<IVFModelSnapshot> ExportModel(
+      const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it = data_map_.find(route_versions.index_version);
+    if (it == data_map_.end()) {
+      return Status::NotFound("Index version not built");
+    }
+    const IndexData& data = *it->second;
+    IVFModelSnapshot model;
+    model.dim = data.dim;
+    model.nlist = data.nlist;
+    model.use_pq = data.use_pq;
+    model.pq_residual = data.pq_residual;
+    model.pq_codebook_dimension_major = data.pq_codebook_dimension_major;
+    model.pq_codes_subquantizer_major = data.pq_codes_subquantizer_major;
+    model.M = data.M;
+    model.nbits = data.nbits;
+    model.Ks = data.Ks;
+    model.dsub = data.dsub;
+    model.routing_centroids = data.routing_centroids;
+    model.pq_codebooks = data.pq_codebooks;
+    return model;
+  }
+
+  Result<VersionId> InitializeEmptyFromModel(
+      const IVFModelSnapshot& model,
+      VersionId index_version) override {
+    if (model.dim == 0 || model.nlist == 0 ||
+        model.routing_centroids.rows() != static_cast<Eigen::Index>(model.nlist) ||
+        model.routing_centroids.cols() != static_cast<Eigen::Index>(model.dim)) {
+      return Status::InvalidArgument("Invalid IVF model snapshot shape");
+    }
+    if (model.use_pq &&
+        (model.M == 0 || model.nbits == 0 || model.nbits > 8 ||
+         model.dim % model.M != 0 || model.Ks != (1u << model.nbits) ||
+         model.dsub != model.dim / model.M || model.pq_codebooks.size() != model.M)) {
+      return Status::InvalidArgument("Invalid IVF model snapshot PQ shape");
+    }
+    if (!model.use_pq && !model.pq_codebooks.empty()) {
+      return Status::InvalidArgument("Non-PQ IVF model contains PQ codebooks");
+    }
+    for (const MatrixRM& codebook : model.pq_codebooks) {
+      if (codebook.rows() != static_cast<Eigen::Index>(model.Ks) ||
+          codebook.cols() != static_cast<Eigen::Index>(model.dsub)) {
+        return Status::InvalidArgument("Invalid IVF model snapshot codebook shape");
+      }
+    }
+
+    auto data = std::make_unique<IndexData>();
+    data->dim = model.dim;
+    data->nlist = model.nlist;
+    data->use_pq = model.use_pq;
+    data->pq_residual = model.pq_residual;
+    data->pq_codebook_dimension_major = model.pq_codebook_dimension_major;
+    data->pq_codes_subquantizer_major = model.pq_codes_subquantizer_major;
+    data->M = model.use_pq ? model.M : 0;
+    data->nbits = model.use_pq ? model.nbits : 8;
+    data->Ks = model.use_pq ? model.Ks : 0;
+    data->dsub = model.use_pq ? model.dsub : 0;
+    data->routing_centroids = model.routing_centroids;
+    data->routing_centroid_norms = data->routing_centroids.rowwise().squaredNorm();
+    data->pq_codebooks = model.pq_codebooks;
+    RebuildPQSoACache(data.get());
+    data->lists.resize(model.nlist);
+    if (model.use_pq) {
+      data->doc_ids_by_list.resize(model.nlist);
+      data->pq_codes_by_list.resize(model.nlist);
+      if (model.pq_codes_subquantizer_major) {
+        data->pq_codes_soa_by_list.resize(model.nlist);
+      }
+      data->pq_counts.assign(model.M, std::vector<uint64_t>(model.Ks, 0));
+      BuildPrecomputedTable(data.get());
+    }
+    data->doc_to_list.Clear();
+    data->ntotal = 0;
+    data->pq_code_reuse_safe = true;
+    data->nqe_baseline = 0.0;
+    data->nqe_ema = 0.0;
+    data->defer_pq_stats_to_add = false;
+    data->online_pq_batch_count = 0;
+    data->warmup_nqe_sum = 0.0;
+    data->warmup_seen_batches = 0;
+    data->deferred_nqe_sum = 0.0;
+    data->deferred_nqe_count = 0;
+    data->last_patch_pq_reencode_ms = 0.0;
+    data->last_patch_profiling = PatchProfiling{};
+    data->last_ingest_profiling = IngestProfiling{};
+
+    std::unique_lock lock(mu_);
+    if (latest_version_ != 0 || !data_map_.empty()) {
+      return Status::AlreadyExists("IVF index is already initialized");
+    }
+    const VersionId version = index_version == 0 ? next_version_++ : index_version;
+    data->version = version;
+    data->mutation_generation = next_mutation_generation_++;
+    data_map_[version] = std::move(data);
+    latest_version_ = version;
+    return version;
+  }
+
   Status Add(const AlignedVector<VectorRecord>& recs) override {
     return AddBatch(recs, true, nullptr);
   }
@@ -2583,7 +2683,8 @@ class KMeansIVFIndex : public IVFIndex {
           options.force_update_interval > 0 &&
           (data.online_pq_batch_count % options.force_update_interval == 0);
       // Keep qe_ratio for diagnostics, but update is only controlled by force interval.
-      stats.trigger_update = options.enable && force_periodic_update;
+      stats.trigger_update = options.enable && force_periodic_update &&
+                             !options.skip_codebook_update_once;
       stats.in_warmup = false;
       stats.warmup_batches_left = 0;
     }

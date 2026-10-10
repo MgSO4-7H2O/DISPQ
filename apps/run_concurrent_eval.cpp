@@ -67,6 +67,10 @@ struct InsertTimelineRecord {
   double active_prepare_ms{0.0};
   double active_commit_wait_ms{0.0};
   double active_commit_ms{0.0};
+  double new_active_model_init_ms{0.0};
+  double new_active_first_batch_prepare_ms{0.0};
+  double new_active_first_batch_commit_ms{0.0};
+  double new_active_full_build_ms{0.0};
 };
 
 enum class TimelineEventType { kMerge, kRebuild };
@@ -98,6 +102,7 @@ struct RuntimeState {
   uint32_t committed_rows{0};
   uint32_t main_rows{0};
   bool active_freeze_pending{false};
+  bool active_model_reuse_valid{false};
 };
 
 double Percentile(std::vector<double> values, double quantile) {
@@ -571,6 +576,7 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> next_query{0};
   std::vector<QueryRecord> query_records;
   std::vector<InsertTimelineRecord> insert_timeline_records;
+  std::optional<IVFModelSnapshot> reusable_active_model;
   std::vector<TimelineEvent> timeline_events;
   std::vector<double> insert_batch_ms;
   std::atomic<uint64_t> inserted_vectors{0}, committed_batches{0}, merge_count{0}, rebuild_count{0};
@@ -730,6 +736,7 @@ int main(int argc, char** argv) {
           state.active.reset();
           state.frozen.reset();
           state.active_freeze_pending = false;
+          state.active_model_reuse_valid = false;
           ++rebuild_count;
           last_global_rebuild_rows = rebuild_rows;
           last_global_rebuild_main_rows = rebuild_rows;
@@ -1018,6 +1025,10 @@ int main(int argc, char** argv) {
     const double transform_ms = std::chrono::duration<double, std::milli>(Clock::now() - transform_start).count();
     const auto insert_start = Clock::now();
     OnlinePQUpdateStats update_stats;
+    double new_active_model_init_ms = 0.0;
+    double new_active_first_batch_prepare_ms = 0.0;
+    double new_active_first_batch_commit_ms = 0.0;
+    double new_active_full_build_ms = 0.0;
     {
       std::shared_lock<std::shared_mutex> access;
       {
@@ -1034,34 +1045,90 @@ int main(int argc, char** argv) {
         create_active = !state.active;
       }
       if (create_active) {
-        IVFParams params = ivf_params;
-        params.nlist = delta_nlist;
-        params.kmeans_iterations = 10;
-        VersionSet versions{whiten_version, 0};
-        auto built = BuildIndex(index_data, next_row, end, params, &versions);
-        if (!built.ok()) { report_failure(built.status().ToString()); break; }
-
-        Route new_active{built.value(), versions, end - next_row, next_shard_id};
         std::deque<DocId> new_active_window_ids;
         for (uint32_t row = next_row; row < end; ++row)
           new_active_window_ids.push_back(row);
-
-        bool active_already_published = false;
-        {
-          std::lock_guard<std::mutex> commit_lock(version_mutex);
+        auto publish_active = [&](Route&& new_active) {
           std::lock_guard<std::mutex> state_lock(state_mutex);
-          active_already_published = state.active.has_value();
-          if (!active_already_published) {
-            state.active = std::move(new_active);
-            active_window_ids.swap(new_active_window_ids);
-            state.committed_rows = end;
-            ++state.version;
-            current_committed.store(end, std::memory_order_release);
-            current_version.store(state.version, std::memory_order_release);
-            ++next_shard_id;
+          if (state.active) return false;
+          state.active = std::move(new_active);
+          active_window_ids.swap(new_active_window_ids);
+          state.committed_rows = end;
+          ++state.version;
+          current_committed.store(end, std::memory_order_release);
+          current_version.store(state.version, std::memory_order_release);
+          ++next_shard_id;
+          return true;
+        };
+
+        bool model_reuse_valid = false;
+        {
+          std::lock_guard<std::mutex> state_lock(state_mutex);
+          model_reuse_valid = state.active_model_reuse_valid;
+          state.active_model_reuse_valid = false;
+        }
+        const bool can_reuse_model = model_reuse_valid && reusable_active_model.has_value() &&
+            config.online_pq_update_scheme == "minibatch" &&
+            config.online_pq_sliding_window_size == 0 &&
+            config.pq_enable && config.pq_residual;
+        std::optional<IVFModelSnapshot> model_to_reuse =
+            std::move(reusable_active_model);
+        reusable_active_model.reset();
+        bool active_published = false;
+        bool commit_failed = false;
+
+        if (can_reuse_model) {
+          auto new_index = CreateIVFIndex();
+          const auto model_init_start = Clock::now();
+          auto initialized = new_index->InitializeEmptyFromModel(*model_to_reuse, 0);
+          new_active_model_init_ms = std::chrono::duration<double, std::milli>(
+              Clock::now() - model_init_start).count();
+          if (initialized.ok()) {
+            VersionSet versions{whiten_version, initialized.value()};
+            const auto prepare_start = Clock::now();
+            auto records = BuildOnlineRecords(index_data, next_row, end, versions,
+                                              config.concurrent_insert_threads);
+            OnlinePQUpdateOptions first_batch_options = online_options;
+            first_batch_options.skip_codebook_update_once = true;
+            auto prepared = new_index->PrepareOnlinePQBatch(records, first_batch_options);
+            new_active_first_batch_prepare_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - prepare_start).count();
+            if (prepared.ok()) {
+              std::lock_guard<std::mutex> commit_lock(version_mutex);
+              const auto commit_start = Clock::now();
+              auto inserted = new_index->CommitPreparedOnlinePQBatch(
+                  std::move(prepared.value()));
+              if (!inserted.ok()) {
+                report_failure(inserted.status().ToString());
+                commit_failed = true;
+              } else {
+                update_stats = inserted.value();
+                update_stats.active_prepare_ms = new_active_first_batch_prepare_ms;
+                Route new_active{new_index, versions, end - next_row, next_shard_id};
+                active_published = publish_active(std::move(new_active));
+                new_active_first_batch_commit_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - commit_start).count();
+              }
+            }
           }
         }
-        if (active_already_published) {
+
+        if (commit_failed) break;
+        if (!active_published) {
+          IVFParams params = ivf_params;
+          params.nlist = delta_nlist;
+          params.kmeans_iterations = 10;
+          VersionSet versions{whiten_version, 0};
+          const auto full_build_start = Clock::now();
+          auto built = BuildIndex(index_data, next_row, end, params, &versions);
+          new_active_full_build_ms = std::chrono::duration<double, std::milli>(
+              Clock::now() - full_build_start).count();
+          if (!built.ok()) { report_failure(built.status().ToString()); break; }
+          std::lock_guard<std::mutex> commit_lock(version_mutex);
+          active_published = publish_active(
+              Route{built.value(), versions, end - next_row, next_shard_id});
+        }
+        if (!active_published) {
           report_failure("Active shard appeared while preparing a new Active index");
           break;
         }
@@ -1152,7 +1219,11 @@ int main(int argc, char** argv) {
         transform_ms, insert_ms, batch_ms,
         update_stats.active_prepare_ms,
         update_stats.active_commit_wait_ms,
-        update_stats.active_commit_ms});
+        update_stats.active_commit_ms,
+        new_active_model_init_ms,
+        new_active_first_batch_prepare_ms,
+        new_active_first_batch_commit_ms,
+        new_active_full_build_ms});
     insert_batch_ms.push_back(batch_ms);
     inserted_vectors += end - next_row;
     ++committed_batches;
@@ -1165,6 +1236,8 @@ int main(int argc, char** argv) {
     bool imbalance_trigger = false;
     bool request_merge = false;
     bool request_rebuild = false;
+    std::shared_ptr<IVFIndex> frozen_active_index;
+    VersionSet frozen_active_versions;
     uint32_t log_active_rows = 0;
     uint32_t trigger_active_rows = 0;
     uint32_t log_frozen_rows = 0;
@@ -1211,6 +1284,9 @@ int main(int argc, char** argv) {
           active_rows_over_trigger = std::max<double>(active_rows_over_trigger,
                                                        state.active->rows - trigger_rows);
         if (trigger) {
+          frozen_active_index = state.active->index;
+          frozen_active_versions = state.active->versions;
+          state.active_model_reuse_valid = true;
           if (!state.frozen) {
             promote_active_to_frozen();
             request_merge = true;
@@ -1253,6 +1329,16 @@ int main(int argc, char** argv) {
       }
       if (global_trigger) {
         request_rebuild = true;
+      }
+    }
+    if (frozen_active_index) {
+      auto model = frozen_active_index->ExportModel(frozen_active_versions);
+      if (model.ok()) {
+        reusable_active_model = std::move(model.value());
+      } else {
+        reusable_active_model.reset();
+        std::lock_guard<std::mutex> state_lock(state_mutex);
+        state.active_model_reuse_valid = false;
       }
     }
     if (trigger) {
@@ -1435,14 +1521,18 @@ int main(int argc, char** argv) {
     return 1;
   }
   inserts << std::setprecision(12)
-          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms,active_prepare_ms,active_commit_wait_ms,active_commit_ms\n";
+          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms,active_prepare_ms,active_commit_wait_ms,active_commit_ms,new_active_model_init_ms,new_active_first_batch_prepare_ms,new_active_first_batch_commit_ms,new_active_full_build_ms\n";
   for (const InsertTimelineRecord& record : insert_timeline_records) {
     inserts << record.batch << ',' << record.version << ','
             << record.begin_row << ',' << record.end_row << ','
             << record.start_ms << ',' << record.end_ms << ','
             << record.transform_ms << ',' << record.insert_ms << ','
             << record.batch_ms << ',' << record.active_prepare_ms << ','
-            << record.active_commit_wait_ms << ',' << record.active_commit_ms << '\n';
+            << record.active_commit_wait_ms << ',' << record.active_commit_ms << ','
+            << record.new_active_model_init_ms << ','
+            << record.new_active_first_batch_prepare_ms << ','
+            << record.new_active_first_batch_commit_ms << ','
+            << record.new_active_full_build_ms << '\n';
   }
   inserts.close();
   if (!inserts) {

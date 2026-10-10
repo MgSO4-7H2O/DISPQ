@@ -53,6 +53,7 @@ struct OnlinePQUpdateOptions {
   bool partial_top_lambda{false};
   double partial_lambda{1.0};
   bool reencode_batch_after_update{true};
+  bool skip_codebook_update_once{false};
 };
 
 struct OnlinePQUpdateStats {
@@ -93,6 +94,21 @@ struct OnlinePQUpdateStats {
 struct PreparedOnlinePQBatch {
   std::shared_ptr<void> payload;
   OnlinePQUpdateStats stats;
+};
+
+struct IVFModelSnapshot {
+  uint32_t dim{0};
+  uint32_t nlist{0};
+  bool use_pq{false};
+  bool pq_residual{true};
+  bool pq_codebook_dimension_major{true};
+  bool pq_codes_subquantizer_major{true};
+  uint32_t M{0};
+  uint32_t nbits{8};
+  uint32_t Ks{0};
+  uint32_t dsub{0};
+  MatrixRM routing_centroids;
+  std::vector<MatrixRM> pq_codebooks;
 };
 
 struct IngestProfiling {
@@ -227,6 +243,12 @@ class IVFIndex {
                                   const IVFParams& p,
                                   VersionId index_version,
                                   std::vector<int>* routing_assignments = nullptr) = 0;
+
+  virtual Result<IVFModelSnapshot> ExportModel(
+      const VersionSet& route_versions) const = 0;
+  virtual Result<VersionId> InitializeEmptyFromModel(
+      const IVFModelSnapshot& model,
+      VersionId index_version) = 0;
 
   // NTS: Adds vector records to the mutable shard.
   virtual Status Add(const AlignedVector<VectorRecord>& recs) = 0;
