@@ -1,6 +1,7 @@
 #include "index/merge.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -245,6 +246,8 @@ struct AssignmentTopCandidate {
   uint32_t part{0};
 };
 
+constexpr uint32_t kFastAssignmentTopR = 32;
+
 struct AssignmentCandidateState {
   uint32_t part{0};
   float dist{0.0f};
@@ -253,7 +256,28 @@ struct AssignmentCandidateState {
 };
 
 struct AssignmentScratch {
-  std::vector<AssignmentTopCandidate> top_candidates;
+  std::array<AssignmentTopCandidate, kFastAssignmentTopR> fixed_candidates{};
+  std::vector<AssignmentTopCandidate> fallback_candidates;
+  uint32_t fixed_size{0};
+
+  void Reserve(uint32_t top_r) {
+    if (top_r > kFastAssignmentTopR) {
+      fallback_candidates.reserve(top_r);
+    }
+  }
+
+  void Clear(uint32_t top_r) {
+    if (top_r <= kFastAssignmentTopR) {
+      fixed_size = 0;
+    } else {
+      fallback_candidates.clear();
+    }
+  }
+
+  const AssignmentTopCandidate* Data(uint32_t top_r) const {
+    return top_r <= kFastAssignmentTopR ? fixed_candidates.data()
+                                       : fallback_candidates.data();
+  }
 };
 
 bool IsAssignmentCandidateLess(const AssignmentTopCandidate& lhs,
@@ -267,7 +291,31 @@ bool IsAssignmentCandidateLess(const AssignmentTopCandidate& lhs,
 void InsertAssignmentTopCandidate(AssignmentScratch* scratch,
                                   AssignmentTopCandidate candidate,
                                   uint32_t top_r) {
-  auto& top_candidates = scratch->top_candidates;
+  if (top_r <= kFastAssignmentTopR) {
+    auto& top_candidates = scratch->fixed_candidates;
+    uint32_t& size = scratch->fixed_size;
+    if (size == top_r &&
+        !IsAssignmentCandidateLess(candidate, top_candidates[top_r - 1])) {
+      return;
+    }
+
+    uint32_t insert_pos = 0;
+    while (insert_pos < size &&
+           IsAssignmentCandidateLess(top_candidates[insert_pos], candidate)) {
+      ++insert_pos;
+    }
+    const uint32_t last = std::min(size, top_r - 1);
+    for (uint32_t i = last; i > insert_pos; --i) {
+      top_candidates[i] = top_candidates[i - 1];
+    }
+    top_candidates[insert_pos] = candidate;
+    if (size < top_r) {
+      ++size;
+    }
+    return;
+  }
+
+  auto& top_candidates = scratch->fallback_candidates;
   if (top_candidates.size() == static_cast<size_t>(top_r) &&
       !IsAssignmentCandidateLess(candidate, top_candidates.back())) {
     return;
@@ -401,22 +449,22 @@ Result<PartitionAssignments> assign_delta_to_main_centroids_for_merge(
     #pragma omp parallel
     {
       AssignmentScratch scratch;
-      scratch.top_candidates.reserve(static_cast<size_t>(top_r));
+      scratch.Reserve(top_r);
       #pragma omp for schedule(static)
       for (int64_t local_index = 0; local_index < static_cast<int64_t>(chunk_count);
            ++local_index) {
         const float* distances = chunk_distances.data() +
                                  static_cast<size_t>(local_index) * static_cast<size_t>(nlist);
-        scratch.top_candidates.clear();
+        scratch.Clear(top_r);
         for (uint32_t i = 0; i < nlist; ++i) {
           InsertAssignmentTopCandidate(
               &scratch,
               AssignmentTopCandidate{distances[static_cast<size_t>(i)], i},
               top_r);
         }
-        std::copy(scratch.top_candidates.begin(), scratch.top_candidates.end(),
-                  chunk_top_candidates.begin() +
-                      static_cast<size_t>(local_index) * static_cast<size_t>(top_r));
+        std::copy_n(scratch.Data(top_r), top_r,
+                    chunk_top_candidates.begin() +
+                        static_cast<size_t>(local_index) * static_cast<size_t>(top_r));
       }
     }
     top_r_us += ElapsedProfilingMicros(top_r_start);
