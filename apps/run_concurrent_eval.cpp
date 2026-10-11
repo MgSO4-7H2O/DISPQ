@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -361,6 +362,226 @@ Status SaveGroundTruth(const std::string& path,
   return out ? Status::OK() : Status::IOError("Failed writing GT artifact");
 }
 
+struct InitArtifactMetadata {
+  std::string base_identity;
+  uint32_t dim{0};
+  uint32_t main_index_rows_config{0};
+  uint32_t main_rows{0};
+  uint32_t initial_rows{0};
+  uint32_t delta_rows{0};
+  uint32_t stream_batch_size{0};
+  uint32_t delta_train_window{0};
+  uint32_t ivf_nlist{0};
+  uint32_t delta_ivf_nlist{0};
+  bool pq_enable{false};
+  uint32_t pq_m{0};
+  uint32_t pq_nbits{0};
+  bool pq_residual{false};
+  bool pq_codebook_dimension_major{false};
+  bool pq_codes_subquantizer_major{false};
+  bool use_whitening{false};
+  bool use_cosine{false};
+  uint32_t seed{0};
+  VersionId whiten_version{0};
+  VersionId main_index_version{0};
+  bool has_active{false};
+  VersionId active_index_version{0};
+  uint64_t logical_version{0};
+};
+
+bool ReadInitString(std::istream& in, std::string* value) {
+  uint32_t size = 0;
+  if (!ReadValue(in, &size) || size > (1u << 20)) return false;
+  value->resize(size);
+  return static_cast<bool>(in.read(value->data(), size));
+}
+
+Status WriteBlob(std::ostream& out, const std::vector<uint8_t>& bytes) {
+  const uint64_t size = static_cast<uint64_t>(bytes.size());
+  WriteValue(out, size);
+  if (!bytes.empty()) {
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+  }
+  return out ? Status::OK() : Status::IOError("Failed writing init artifact payload");
+}
+
+Status ReadBlob(std::istream& in, std::vector<uint8_t>* bytes) {
+  uint64_t size = 0;
+  if (!ReadValue(in, &size) || size > std::numeric_limits<size_t>::max() ||
+      size > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+    return Status::InvalidArgument("Invalid init artifact payload size");
+  }
+  bytes->resize(static_cast<size_t>(size));
+  if (size > 0 && !in.read(reinterpret_cast<char*>(bytes->data()),
+                           static_cast<std::streamsize>(size))) {
+    return Status::IOError("Truncated init artifact payload");
+  }
+  return Status::OK();
+}
+
+void WriteInitMetadata(std::ostream& out, const InitArtifactMetadata& metadata) {
+  WriteString(out, metadata.base_identity);
+  WriteValue(out, metadata.dim);
+  WriteValue(out, metadata.main_index_rows_config);
+  WriteValue(out, metadata.main_rows);
+  WriteValue(out, metadata.initial_rows);
+  WriteValue(out, metadata.delta_rows);
+  WriteValue(out, metadata.stream_batch_size);
+  WriteValue(out, metadata.delta_train_window);
+  WriteValue(out, metadata.ivf_nlist);
+  WriteValue(out, metadata.delta_ivf_nlist);
+  WriteValue(out, static_cast<uint8_t>(metadata.pq_enable));
+  WriteValue(out, metadata.pq_m);
+  WriteValue(out, metadata.pq_nbits);
+  WriteValue(out, static_cast<uint8_t>(metadata.pq_residual));
+  WriteValue(out, static_cast<uint8_t>(metadata.pq_codebook_dimension_major));
+  WriteValue(out, static_cast<uint8_t>(metadata.pq_codes_subquantizer_major));
+  WriteValue(out, static_cast<uint8_t>(metadata.use_whitening));
+  WriteValue(out, static_cast<uint8_t>(metadata.use_cosine));
+  WriteValue(out, metadata.seed);
+  WriteValue(out, metadata.whiten_version);
+  WriteValue(out, metadata.main_index_version);
+  WriteValue(out, static_cast<uint8_t>(metadata.has_active));
+  WriteValue(out, metadata.active_index_version);
+  WriteValue(out, metadata.logical_version);
+}
+
+bool ReadInitMetadata(std::istream& in, InitArtifactMetadata* metadata) {
+  uint8_t pq_enable = 0, pq_residual = 0, pq_codebook_dimension_major = 0;
+  uint8_t pq_codes_subquantizer_major = 0, use_whitening = 0, use_cosine = 0;
+  uint8_t has_active = 0;
+  if (!ReadInitString(in, &metadata->base_identity) ||
+      !ReadValue(in, &metadata->dim) || !ReadValue(in, &metadata->main_index_rows_config) ||
+      !ReadValue(in, &metadata->main_rows) ||
+      !ReadValue(in, &metadata->initial_rows) || !ReadValue(in, &metadata->delta_rows) ||
+      !ReadValue(in, &metadata->stream_batch_size) ||
+      !ReadValue(in, &metadata->delta_train_window) ||
+      !ReadValue(in, &metadata->ivf_nlist) || !ReadValue(in, &metadata->delta_ivf_nlist) ||
+      !ReadValue(in, &pq_enable) || !ReadValue(in, &metadata->pq_m) ||
+      !ReadValue(in, &metadata->pq_nbits) || !ReadValue(in, &pq_residual) ||
+      !ReadValue(in, &pq_codebook_dimension_major) ||
+      !ReadValue(in, &pq_codes_subquantizer_major) || !ReadValue(in, &use_whitening) ||
+      !ReadValue(in, &use_cosine) || !ReadValue(in, &metadata->seed) ||
+      !ReadValue(in, &metadata->whiten_version) ||
+      !ReadValue(in, &metadata->main_index_version) || !ReadValue(in, &has_active) ||
+      !ReadValue(in, &metadata->active_index_version) ||
+      !ReadValue(in, &metadata->logical_version)) return false;
+  if (pq_enable > 1 || pq_residual > 1 || pq_codebook_dimension_major > 1 ||
+      pq_codes_subquantizer_major > 1 || use_whitening > 1 || use_cosine > 1 ||
+      has_active > 1) return false;
+  metadata->pq_enable = pq_enable != 0;
+  metadata->pq_residual = pq_residual != 0;
+  metadata->pq_codebook_dimension_major = pq_codebook_dimension_major != 0;
+  metadata->pq_codes_subquantizer_major = pq_codes_subquantizer_major != 0;
+  metadata->use_whitening = use_whitening != 0;
+  metadata->use_cosine = use_cosine != 0;
+  metadata->has_active = has_active != 0;
+  return true;
+}
+
+Status CheckInitMetadata(const InitArtifactMetadata& artifact,
+                         const InitArtifactMetadata& config) {
+#define CHECK_INIT_FIELD(field) \
+  if (artifact.field != config.field) { \
+    return Status::InvalidArgument("Init artifact metadata mismatch: " #field \
+                                   " artifact=" + std::to_string(artifact.field) + \
+                                   " config=" + std::to_string(config.field)); \
+  }
+  if (artifact.base_identity != config.base_identity) {
+    return Status::InvalidArgument("Init artifact metadata mismatch: base_path_identity artifact=" +
+                                   artifact.base_identity + " config=" + config.base_identity);
+  }
+  CHECK_INIT_FIELD(dim)
+  CHECK_INIT_FIELD(main_index_rows_config)
+  CHECK_INIT_FIELD(main_rows)
+  CHECK_INIT_FIELD(initial_rows)
+  CHECK_INIT_FIELD(delta_rows)
+  CHECK_INIT_FIELD(stream_batch_size)
+  CHECK_INIT_FIELD(delta_train_window)
+  CHECK_INIT_FIELD(ivf_nlist)
+  CHECK_INIT_FIELD(delta_ivf_nlist)
+  CHECK_INIT_FIELD(pq_enable)
+  CHECK_INIT_FIELD(pq_m)
+  CHECK_INIT_FIELD(pq_nbits)
+  CHECK_INIT_FIELD(pq_residual)
+  CHECK_INIT_FIELD(pq_codebook_dimension_major)
+  CHECK_INIT_FIELD(pq_codes_subquantizer_major)
+  CHECK_INIT_FIELD(use_whitening)
+  CHECK_INIT_FIELD(use_cosine)
+  CHECK_INIT_FIELD(seed)
+#undef CHECK_INIT_FIELD
+  if (artifact.logical_version != 0 || artifact.main_index_version == 0 ||
+      (artifact.has_active != (config.delta_rows > 0)) ||
+      (artifact.has_active && artifact.active_index_version == 0) ||
+      (!artifact.has_active && artifact.active_index_version != 0) ||
+      (artifact.use_whitening && artifact.whiten_version == 0) ||
+      (!artifact.use_whitening && artifact.whiten_version != 0)) {
+    return Status::InvalidArgument("Invalid initial versions in init artifact");
+  }
+  return Status::OK();
+}
+
+Status SaveInitArtifact(const std::string& path,
+                        const InitArtifactMetadata& metadata,
+                        const std::shared_ptr<WhiteningModel>& whitening,
+                        const std::shared_ptr<IVFIndex>& main,
+                        const std::shared_ptr<IVFIndex>& active) {
+  const std::filesystem::path artifact_path(path);
+  if (!artifact_path.parent_path().empty()) {
+    std::error_code error;
+    std::filesystem::create_directories(artifact_path.parent_path(), error);
+    if (error) return Status::IOError("Unable to create init artifact directory: " +
+                                      error.message());
+  }
+  std::ofstream out(path, std::ios::binary);
+  if (!out) return Status::IOError("Unable to write init artifact: " + path);
+  out.write("DISPINIT", 8);
+  WriteValue(out, uint32_t{1});
+  WriteInitMetadata(out, metadata);
+  Status status = Status::OK();
+  {
+    auto whitening_bytes = whitening->Serialize();
+    if (!whitening_bytes.ok()) return whitening_bytes.status();
+    status = WriteBlob(out, whitening_bytes.value());
+    if (!status.ok()) return status;
+  }
+  {
+    auto main_bytes = main->Serialize();
+    if (!main_bytes.ok()) return main_bytes.status();
+    status = WriteBlob(out, main_bytes.value());
+    if (!status.ok()) return status;
+  }
+  if (active) {
+    auto active_bytes = active->Serialize();
+    if (!active_bytes.ok()) return active_bytes.status();
+    status = WriteBlob(out, active_bytes.value());
+  } else {
+    status = WriteBlob(out, {});
+  }
+  if (!status.ok()) return status;
+  out.flush();
+  return out ? Status::OK() : Status::IOError("Failed writing init artifact: " + path);
+}
+
+Status OpenInitArtifact(const std::string& path,
+                        const InitArtifactMetadata& expected,
+                        std::unique_ptr<std::ifstream>* in,
+                        InitArtifactMetadata* metadata) {
+  in->reset(new std::ifstream(path, std::ios::binary));
+  if (!**in) return Status::IOError("Unable to open init artifact: " + path);
+  char magic[8]{};
+  uint32_t version = 0;
+  if (!(**in).read(magic, sizeof(magic)) || !ReadValue(**in, &version) ||
+      std::string(magic, sizeof(magic)) != "DISPINIT" || version != 1) {
+    return Status::InvalidArgument("Invalid init artifact header");
+  }
+  if (!ReadInitMetadata(**in, metadata)) {
+    return Status::IOError("Truncated init artifact metadata");
+  }
+  return CheckInitMetadata(*metadata, expected);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -418,8 +639,6 @@ int main(int argc, char** argv) {
   MatrixRM index_data(static_cast<Eigen::Index>(nx),
                       static_cast<Eigen::Index>(base_source.dim));
   MatrixRM query_data = queries;
-  auto whitening = CreateWhiteningModel();
-  VersionId whiten_version = 0;
   uint32_t main_rows = config.enable_streaming ? config.main_index_rows : nx;
   if (main_rows == 0 && config.enable_streaming) main_rows = std::max(1u, nx / 2);
   if (main_rows >= nx && nx > 1) main_rows = nx - 1;
@@ -433,17 +652,118 @@ int main(int argc, char** argv) {
   }
   const uint32_t initial_rows = main_rows + delta_rows;
   const uint32_t batch_size = insert_step;
+  if (config.concurrent_init_mode != "off" && config.dim != base_source.dim) {
+    std::cerr << "Init artifact metadata mismatch: dim config=" << config.dim
+              << " dataset=" << base_source.dim << '\n';
+    return 1;
+  }
+  const uint32_t delta_nlist = config.delta_ivf_nlist ? config.delta_ivf_nlist : config.ivf_nlist;
+  InitArtifactMetadata expected_init;
+  expected_init.base_identity = base_path;
+  expected_init.dim = base_source.dim;
+  expected_init.main_index_rows_config = config.main_index_rows;
+  expected_init.main_rows = main_rows;
+  expected_init.initial_rows = initial_rows;
+  expected_init.delta_rows = delta_rows;
+  expected_init.stream_batch_size = config.stream_batch_size;
+  expected_init.delta_train_window = config.delta_train_window;
+  expected_init.ivf_nlist = config.ivf_nlist;
+  expected_init.delta_ivf_nlist = config.delta_ivf_nlist;
+  expected_init.pq_enable = config.pq_enable;
+  expected_init.pq_m = config.pq_m;
+  expected_init.pq_nbits = config.pq_nbits;
+  expected_init.pq_residual = config.pq_residual;
+  expected_init.pq_codebook_dimension_major = config.pq_codebook_dimension_major;
+  expected_init.pq_codes_subquantizer_major = config.pq_codes_subquantizer_major;
+  expected_init.use_whitening = config.use_whitening;
+  expected_init.use_cosine = config.use_cosine;
+  expected_init.seed = config.seed;
+
   const auto whitening_fit_start = Clock::now();
-  if (config.use_whitening) {
+  auto whitening = CreateWhiteningModel();
+  VersionId whiten_version = 0;
+  std::shared_ptr<IVFIndex> loaded_main;
+  std::shared_ptr<IVFIndex> loaded_active;
+  VersionSet loaded_main_versions;
+  VersionSet loaded_active_versions;
+  Clock::time_point init_artifact_start = Clock::now();
+  if (config.concurrent_init_mode == "prepare") {
+    std::cout << "[INIT_ARTIFACT] prepare start" << std::endl;
+  } else if (config.concurrent_init_mode == "load") {
+    std::cout << "[INIT_ARTIFACT] load start" << std::endl;
+    std::unique_ptr<std::ifstream> artifact_in;
+    InitArtifactMetadata artifact_metadata;
+    Status status = OpenInitArtifact(config.concurrent_init_path, expected_init,
+                                     &artifact_in, &artifact_metadata);
+    if (!status.ok()) {
+      std::cerr << status.ToString() << '\n';
+      return 1;
+    }
+    std::vector<uint8_t> section;
+    status = ReadBlob(*artifact_in, &section);
+    if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
+    status = whitening->Deserialize(section);
+    if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
+    std::vector<uint8_t>().swap(section);
+    whiten_version = artifact_metadata.whiten_version;
+    loaded_main_versions = VersionSet{whiten_version, artifact_metadata.main_index_version};
+    status = ReadBlob(*artifact_in, &section);
+    if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
+    loaded_main = CreateIVFIndex();
+    status = loaded_main->Deserialize(section);
+    if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
+    std::vector<uint8_t>().swap(section);
+    auto main_sizes = loaded_main->GetPartitionSizes(loaded_main_versions);
+    if (!main_sizes.ok()) { std::cerr << main_sizes.status().ToString() << '\n'; return 1; }
+    const uint64_t restored_main_rows = std::accumulate(
+        main_sizes.value().begin(), main_sizes.value().end(), uint64_t{0});
+    if (restored_main_rows != main_rows) {
+      std::cerr << "Init artifact main row count mismatch: artifact=" << restored_main_rows
+                << " config=" << main_rows << '\n';
+      return 1;
+    }
+    status = ReadBlob(*artifact_in, &section);
+    if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
+    if (artifact_metadata.has_active) {
+      loaded_active_versions = VersionSet{whiten_version, artifact_metadata.active_index_version};
+      loaded_active = CreateIVFIndex();
+      status = loaded_active->Deserialize(section);
+      if (!status.ok()) { std::cerr << status.ToString() << '\n'; return 1; }
+      auto active_sizes = loaded_active->GetPartitionSizes(loaded_active_versions);
+      if (!active_sizes.ok()) { std::cerr << active_sizes.status().ToString() << '\n'; return 1; }
+      const uint64_t restored_active_rows = std::accumulate(
+          active_sizes.value().begin(), active_sizes.value().end(), uint64_t{0});
+      if (restored_active_rows != delta_rows) {
+        std::cerr << "Init artifact active row count mismatch: artifact=" << restored_active_rows
+                  << " config=" << delta_rows << '\n';
+        return 1;
+      }
+      std::vector<uint8_t>().swap(section);
+    } else if (!section.empty()) {
+      std::cerr << "Init artifact Active payload mismatch\n";
+      return 1;
+    }
+    if (artifact_in->peek() != std::char_traits<char>::eof()) {
+      std::cerr << "Trailing data in init artifact\n";
+      return 1;
+    }
+    std::cout << "[INIT_ARTIFACT] loaded path=" << config.concurrent_init_path
+              << " main_rows=" << main_rows << " active_rows=" << delta_rows
+              << " elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - init_artifact_start).count()
+              << std::endl;
+  } else if (config.use_whitening) {
     auto fit_rows = base_source.LoadRange(0, main_rows);
     if (!fit_rows.ok()) { std::cerr << fit_rows.status().ToString() << '\n'; return 1; }
     auto fit = whitening->Fit(fit_rows.value());
     if (!fit.ok()) { std::cerr << fit.status().ToString() << '\n'; return 1; }
     whiten_version = fit.value();
   }
-  std::cout << "[INIT] whitening fit done, elapsed_ms="
-            << std::chrono::duration<double, std::milli>(Clock::now() - whitening_fit_start).count()
-            << std::endl;
+  if (config.concurrent_init_mode != "load") {
+    std::cout << "[INIT] whitening fit done, elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - whitening_fit_start).count()
+              << std::endl;
+  }
 
   const auto initial_transform_start = Clock::now();
   const Status initial_transform = TransformBaseRangeToIndexData(
@@ -482,7 +802,8 @@ int main(int argc, char** argv) {
   const std::string gt_path = config.concurrent_gt_path.empty()
                                   ? std::string(argv[1]) + ".concurrent.gt"
                                   : config.concurrent_gt_path;
-  if (config.concurrent_gt_mode == "prepare") {
+  if (config.concurrent_init_mode != "prepare" &&
+      config.concurrent_gt_mode == "prepare") {
     const Status remaining_transform = TransformBaseRangeToIndexData(
         base_source, initial_rows, nx, config.use_whitening, whiten_version,
         whitening, config.use_cosine, &index_data);
@@ -496,7 +817,7 @@ int main(int argc, char** argv) {
     std::cout << "GT artifact written: " << gt_path << '\n';
     return 0;
   }
-  if (config.concurrent_gt_mode == "load") {
+  if (config.concurrent_init_mode != "prepare" && config.concurrent_gt_mode == "load") {
     const auto gt_load_start = Clock::now();
     auto result = LoadGroundTruth(gt_path, base_identity, query_identity, nq, config.topk,
                                   initial_rows, batch_size, frontiers);
@@ -520,28 +841,56 @@ int main(int argc, char** argv) {
   RuntimeState state;
   state.committed_rows = initial_rows;
   state.main_rows = main_rows;
-  state.main_versions.whiten_version = whiten_version;
-  const auto main_build_start = Clock::now();
-  auto main = BuildIndex(index_data, 0, main_rows, ivf_params, &state.main_versions);
-  if (!main.ok()) { std::cerr << main.status().ToString() << '\n'; return 1; }
-  state.main = main.value();
-  std::cout << "[INIT] main index built, rows=" << main_rows << ", elapsed_ms="
-            << std::chrono::duration<double, std::milli>(Clock::now() - main_build_start).count()
-            << std::endl;
-  const uint32_t delta_nlist = config.delta_ivf_nlist ? config.delta_ivf_nlist : config.ivf_nlist;
-  const auto active_build_start = Clock::now();
-  if (delta_rows > 0) {
-    IVFParams delta_params = ivf_params;
-    delta_params.nlist = delta_nlist;
-    delta_params.kmeans_iterations = 10;
-    VersionSet versions{whiten_version, 0};
-    auto delta = BuildIndex(index_data, main_rows, initial_rows, delta_params, &versions);
-    if (!delta.ok()) { std::cerr << delta.status().ToString() << '\n'; return 1; }
-    state.active = Route{delta.value(), versions, delta_rows, 1};
+  if (config.concurrent_init_mode == "load") {
+    state.main = loaded_main;
+    state.main_versions = loaded_main_versions;
+    if (loaded_active) {
+      state.active = Route{loaded_active, loaded_active_versions, delta_rows, 1};
+    }
+    std::cout << "[INIT] main index loaded, rows=" << main_rows << std::endl;
+    std::cout << "[INIT] initial active loaded, rows=" << delta_rows << std::endl;
+  } else {
+    state.main_versions.whiten_version = whiten_version;
+    const auto main_build_start = Clock::now();
+    auto main = BuildIndex(index_data, 0, main_rows, ivf_params, &state.main_versions);
+    if (!main.ok()) { std::cerr << main.status().ToString() << '\n'; return 1; }
+    state.main = main.value();
+    std::cout << "[INIT] main index built, rows=" << main_rows << ", elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - main_build_start).count()
+              << std::endl;
+    const auto active_build_start = Clock::now();
+    if (delta_rows > 0) {
+      IVFParams delta_params = ivf_params;
+      delta_params.nlist = delta_nlist;
+      delta_params.kmeans_iterations = 10;
+      VersionSet versions{whiten_version, 0};
+      auto delta = BuildIndex(index_data, main_rows, initial_rows, delta_params, &versions);
+      if (!delta.ok()) { std::cerr << delta.status().ToString() << '\n'; return 1; }
+      state.active = Route{delta.value(), versions, delta_rows, 1};
+    }
+    std::cout << "[INIT] initial active built, rows=" << delta_rows << ", elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - active_build_start).count()
+              << std::endl;
   }
-  std::cout << "[INIT] initial active built, rows=" << delta_rows << ", elapsed_ms="
-            << std::chrono::duration<double, std::milli>(Clock::now() - active_build_start).count()
-            << std::endl;
+
+  if (config.concurrent_init_mode == "prepare") {
+    InitArtifactMetadata artifact_metadata = expected_init;
+    artifact_metadata.whiten_version = whiten_version;
+    artifact_metadata.main_index_version = state.main_versions.index_version;
+    artifact_metadata.has_active = state.active.has_value();
+    artifact_metadata.active_index_version = state.active ? state.active->versions.index_version : 0;
+    artifact_metadata.logical_version = state.version;
+    const Status saved = SaveInitArtifact(config.concurrent_init_path, artifact_metadata,
+                                          whitening, state.main,
+                                          state.active ? state.active->index : nullptr);
+    if (!saved.ok()) { std::cerr << saved.ToString() << '\n'; return 1; }
+    std::cout << "[INIT_ARTIFACT] written path=" << config.concurrent_init_path
+              << " main_rows=" << main_rows << " active_rows=" << delta_rows
+              << " elapsed_ms="
+              << std::chrono::duration<double, std::milli>(Clock::now() - init_artifact_start).count()
+              << std::endl;
+    return 0;
+  }
   std::deque<DocId> active_window_ids;
   if (config.online_pq_update_scheme == "sliding_window") {
     for (uint32_t row = main_rows; row < initial_rows; ++row) active_window_ids.push_back(row);

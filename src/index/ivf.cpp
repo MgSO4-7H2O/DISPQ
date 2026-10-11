@@ -38,7 +38,7 @@ constexpr uint32_t kPQTrainingConcurrency = 1;
 constexpr uint32_t kInvalidListId = std::numeric_limits<uint32_t>::max();
 constexpr size_t kDenseDocCompactMinGaps = 65536;
 constexpr uint32_t kIVFSerializeMagic = 0x49564637;  // 'IVF7'
-constexpr uint32_t kIVFSerializeFormatVersion = 1;
+constexpr uint32_t kIVFSerializeFormatVersion = 2;
 
 void AppendRaw(std::vector<uint8_t>* bytes, const void* data, size_t len) {
   if (len == 0) {
@@ -189,6 +189,80 @@ Result<std::vector<uint64_t>> ReadUint64Vector(const std::vector<uint8_t>& bytes
     return status;
   }
   return values;
+}
+
+void AppendUint32Vector(std::vector<uint8_t>* bytes, const std::vector<uint32_t>& values) {
+  const uint64_t size = static_cast<uint64_t>(values.size());
+  AppendPod(bytes, size);
+  AppendRaw(bytes, values.data(), sizeof(uint32_t) * values.size());
+}
+
+Result<std::vector<uint32_t>> ReadUint32Vector(const std::vector<uint8_t>& bytes,
+                                               size_t* offset) {
+  uint64_t size = 0;
+  Status status = ReadPod(bytes, offset, &size);
+  if (!status.ok()) return status;
+  if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(uint32_t))) {
+    return Status::InvalidArgument("Uint32 vector in IVF payload is too large");
+  }
+  std::vector<uint32_t> values(static_cast<size_t>(size));
+  status = ReadRaw(bytes, offset, values.data(), sizeof(uint32_t) * values.size());
+  if (!status.ok()) return status;
+  return values;
+}
+
+void AppendDocIdLists(std::vector<uint8_t>* bytes,
+                      const std::vector<std::vector<DocId>>& lists) {
+  const uint32_t count = static_cast<uint32_t>(lists.size());
+  AppendPod(bytes, count);
+  for (const auto& values : lists) {
+    const uint64_t size = static_cast<uint64_t>(values.size());
+    AppendPod(bytes, size);
+    AppendRaw(bytes, values.data(), sizeof(DocId) * values.size());
+  }
+}
+
+Status ReadDocIdLists(const std::vector<uint8_t>& bytes,
+                      size_t* offset,
+                      std::vector<std::vector<DocId>>* lists) {
+  uint32_t count = 0;
+  Status status = ReadPod(bytes, offset, &count);
+  if (!status.ok()) return status;
+  lists->resize(count);
+  for (auto& values : *lists) {
+    uint64_t size = 0;
+    status = ReadPod(bytes, offset, &size);
+    if (!status.ok()) return status;
+    if (size > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(DocId))) {
+      return Status::InvalidArgument("DocId list in IVF payload is too large");
+    }
+    values.resize(static_cast<size_t>(size));
+    status = ReadRaw(bytes, offset, values.data(), sizeof(DocId) * values.size());
+    if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
+void AppendByteLists(std::vector<uint8_t>* bytes,
+                     const std::vector<std::vector<uint8_t>>& lists) {
+  const uint32_t count = static_cast<uint32_t>(lists.size());
+  AppendPod(bytes, count);
+  for (const auto& values : lists) AppendByteVector(bytes, values);
+}
+
+Status ReadByteLists(const std::vector<uint8_t>& bytes,
+                     size_t* offset,
+                     std::vector<std::vector<uint8_t>>* lists) {
+  uint32_t count = 0;
+  Status status = ReadPod(bytes, offset, &count);
+  if (!status.ok()) return status;
+  lists->resize(count);
+  for (auto& values : *lists) {
+    auto result = ReadByteVector(bytes, offset);
+    if (!result.ok()) return result.status();
+    values = std::move(result.value());
+  }
+  return Status::OK();
 }
 
 struct DenseDocListMap {
@@ -428,11 +502,16 @@ void AppendIndexData(std::vector<uint8_t>* bytes, const IndexData& data) {
   AppendPod(bytes, data.version);
   AppendBool(bytes, data.use_pq);
   AppendBool(bytes, data.pq_residual);
+  AppendBool(bytes, data.pq_codebook_dimension_major);
+  AppendBool(bytes, data.pq_codes_subquantizer_major);
   AppendPod(bytes, data.M);
   AppendPod(bytes, data.nbits);
   AppendPod(bytes, data.Ks);
   AppendPod(bytes, data.dsub);
   AppendMatrix(bytes, data.routing_centroids);
+  AppendFloatVector(bytes, data.routing_centroid_norms);
+  AppendBool(bytes, data.pq_code_reuse_safe);
+  AppendPod(bytes, data.mutation_generation);
   AppendPod(bytes, data.nqe_baseline);
   AppendPod(bytes, data.nqe_ema);
   AppendBool(bytes, data.defer_pq_stats_to_add);
@@ -469,10 +548,28 @@ void AppendIndexData(std::vector<uint8_t>* bytes, const IndexData& data) {
       AppendByteVector(bytes, entry.pq_code);
     }
   }
+
+  AppendDocIdLists(bytes, data.doc_ids_by_list);
+  AppendByteLists(bytes, data.pq_codes_by_list);
+  const uint32_t soa_count = static_cast<uint32_t>(data.pq_codes_soa_by_list.size());
+  AppendPod(bytes, soa_count);
+  for (const ListPQCodesSoA& soa : data.pq_codes_soa_by_list) {
+    const uint64_t rows = static_cast<uint64_t>(soa.rows);
+    const uint64_t stride = static_cast<uint64_t>(soa.stride);
+    AppendPod(bytes, rows);
+    AppendPod(bytes, stride);
+    AppendByteVector(bytes, soa.codes);
+  }
+  AppendPod(bytes, data.doc_to_list.base);
+  const uint64_t leading_invalid = static_cast<uint64_t>(data.doc_to_list.leading_invalid);
+  AppendPod(bytes, leading_invalid);
+  AppendUint32Vector(bytes, data.doc_to_list.list_ids);
+  AppendPod(bytes, data.ntotal);
 }
 
 Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& bytes,
-                                                 size_t* offset) {
+                                                 size_t* offset,
+                                                 uint32_t format_version) {
   auto data = std::make_unique<IndexData>();
   Status status = ReadPod(bytes, offset, &data->dim);
   if (!status.ok()) return status;
@@ -484,6 +581,12 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
   if (!status.ok()) return status;
   status = ReadBool(bytes, offset, &data->pq_residual);
   if (!status.ok()) return status;
+  if (format_version >= 2) {
+    status = ReadBool(bytes, offset, &data->pq_codebook_dimension_major);
+    if (!status.ok()) return status;
+    status = ReadBool(bytes, offset, &data->pq_codes_subquantizer_major);
+    if (!status.ok()) return status;
+  }
   status = ReadPod(bytes, offset, &data->M);
   if (!status.ok()) return status;
   status = ReadPod(bytes, offset, &data->nbits);
@@ -495,6 +598,15 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
   auto centroids_res = ReadMatrix(bytes, offset);
   if (!centroids_res.ok()) return centroids_res.status();
   data->routing_centroids = std::move(centroids_res.value());
+  if (format_version >= 2) {
+    auto norms_res = ReadFloatVector(bytes, offset);
+    if (!norms_res.ok()) return norms_res.status();
+    data->routing_centroid_norms = std::move(norms_res.value());
+    status = ReadBool(bytes, offset, &data->pq_code_reuse_safe);
+    if (!status.ok()) return status;
+    status = ReadPod(bytes, offset, &data->mutation_generation);
+    if (!status.ok()) return status;
+  }
   status = ReadPod(bytes, offset, &data->nqe_baseline);
   if (!status.ok()) return status;
   status = ReadPod(bytes, offset, &data->nqe_ema);
@@ -513,7 +625,9 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
   if (!status.ok()) return status;
   status = ReadPod(bytes, offset, &data->last_patch_pq_reencode_ms);
   if (!status.ok()) return status;
-  data->pq_code_reuse_safe = (data->online_pq_batch_count == 0);
+  if (format_version == 1) {
+    data->pq_code_reuse_safe = (data->online_pq_batch_count == 0);
+  }
 
   if (data->dim == 0 || data->nlist == 0 || data->version == 0) {
     return Status::InvalidArgument("Invalid IVF metadata in payload");
@@ -522,10 +636,14 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
       data->routing_centroids.cols() != static_cast<Eigen::Index>(data->dim)) {
     return Status::InvalidArgument("Routing centroid shape mismatch in IVF payload");
   }
-  data->routing_centroid_norms.resize(static_cast<Eigen::Index>(data->nlist));
-  for (uint32_t i = 0; i < data->nlist; ++i) {
-    data->routing_centroid_norms(static_cast<Eigen::Index>(i)) =
-        data->routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+  if (format_version == 1) {
+    data->routing_centroid_norms.resize(static_cast<Eigen::Index>(data->nlist));
+    for (uint32_t i = 0; i < data->nlist; ++i) {
+      data->routing_centroid_norms(static_cast<Eigen::Index>(i)) =
+          data->routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+    }
+  } else if (data->routing_centroid_norms.size() != static_cast<Eigen::Index>(data->nlist)) {
+    return Status::InvalidArgument("Routing centroid norm count mismatch in IVF payload");
   }
   if (data->use_pq) {
     if (data->M == 0 || data->Ks == 0 || data->dsub == 0 ||
@@ -615,6 +733,73 @@ Result<std::unique_ptr<IndexData>> ReadIndexData(const std::vector<uint8_t>& byt
         return Status::InvalidArgument("Vector dimension mismatch in IVF payload");
       }
       list[static_cast<size_t>(i)] = std::move(entry);
+    }
+  }
+
+  if (format_version >= 2) {
+    status = ReadDocIdLists(bytes, offset, &data->doc_ids_by_list);
+    if (!status.ok()) return status;
+    status = ReadByteLists(bytes, offset, &data->pq_codes_by_list);
+    if (!status.ok()) return status;
+    uint32_t soa_count = 0;
+    status = ReadPod(bytes, offset, &soa_count);
+    if (!status.ok()) return status;
+    data->pq_codes_soa_by_list.resize(soa_count);
+    for (ListPQCodesSoA& soa : data->pq_codes_soa_by_list) {
+      uint64_t rows = 0;
+      uint64_t stride = 0;
+      status = ReadPod(bytes, offset, &rows);
+      if (!status.ok()) return status;
+      status = ReadPod(bytes, offset, &stride);
+      if (!status.ok()) return status;
+      auto codes = ReadByteVector(bytes, offset);
+      if (!codes.ok()) return codes.status();
+      soa.rows = static_cast<size_t>(rows);
+      soa.stride = static_cast<size_t>(stride);
+      soa.codes = std::move(codes.value());
+    }
+    status = ReadPod(bytes, offset, &data->doc_to_list.base);
+    if (!status.ok()) return status;
+    uint64_t leading_invalid = 0;
+    status = ReadPod(bytes, offset, &leading_invalid);
+    if (!status.ok()) return status;
+    if (leading_invalid > std::numeric_limits<size_t>::max()) {
+      return Status::InvalidArgument("Doc map offset in IVF payload is too large");
+    }
+    data->doc_to_list.leading_invalid = static_cast<size_t>(leading_invalid);
+    auto doc_map = ReadUint32Vector(bytes, offset);
+    if (!doc_map.ok()) return doc_map.status();
+    data->doc_to_list.list_ids = std::move(doc_map.value());
+    status = ReadPod(bytes, offset, &data->ntotal);
+    if (!status.ok()) return status;
+    if (data->use_pq &&
+        (data->doc_ids_by_list.size() != data->nlist ||
+         data->pq_codes_by_list.size() != data->nlist ||
+         (data->pq_codes_subquantizer_major &&
+          data->pq_codes_soa_by_list.size() != data->nlist))) {
+      return Status::InvalidArgument("Compact cache count mismatch in IVF payload");
+    }
+    uint64_t restored_rows = 0;
+    for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
+      const size_t list_rows = data->lists[static_cast<size_t>(list_id)].size();
+      restored_rows += static_cast<uint64_t>(list_rows);
+      if (!data->use_pq) continue;
+      if (data->doc_ids_by_list[static_cast<size_t>(list_id)].size() != list_rows ||
+          data->pq_codes_by_list[static_cast<size_t>(list_id)].size() !=
+              list_rows * static_cast<size_t>(data->M)) {
+        return Status::InvalidArgument("Compact PQ cache shape mismatch in IVF payload");
+      }
+      if (data->pq_codes_subquantizer_major) {
+        const ListPQCodesSoA& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+        if (soa.rows != list_rows || soa.stride < list_rows ||
+            soa.codes.size() != static_cast<size_t>(data->M) * soa.stride) {
+          return Status::InvalidArgument("SoA PQ cache shape mismatch in IVF payload");
+        }
+      }
+    }
+    if (restored_rows != data->ntotal ||
+        data->doc_to_list.leading_invalid > data->doc_to_list.list_ids.size()) {
+      return Status::InvalidArgument("IVF runtime cache shape mismatch in payload");
     }
   }
 
@@ -3738,7 +3923,7 @@ class KMeansIVFIndex : public IVFIndex {
     if (!status.ok()) {
       return status;
     }
-    if (format_version != kIVFSerializeFormatVersion) {
+    if (format_version == 0 || format_version > kIVFSerializeFormatVersion) {
       return Status::InvalidArgument("Unsupported IVF payload format version");
     }
 
@@ -3757,8 +3942,9 @@ class KMeansIVFIndex : public IVFIndex {
 
     std::unordered_map<VersionId, std::unique_ptr<IndexData>> loaded;
     VersionId max_version = 0;
+    uint64_t max_mutation_generation = 0;
     for (uint32_t i = 0; i < data_count; ++i) {
-      auto data_res = ReadIndexData(bytes, &offset);
+      auto data_res = ReadIndexData(bytes, &offset, format_version);
       if (!data_res.ok()) {
         return data_res.status();
       }
@@ -3777,30 +3963,36 @@ class KMeansIVFIndex : public IVFIndex {
     for (auto& kv : loaded) {
       IndexData* data = kv.second.get();
       max_version = std::max(max_version, data->version);
+      max_mutation_generation = std::max(max_mutation_generation, data->mutation_generation);
       if (data->use_pq) {
-        data->doc_ids_by_list.clear();
-        data->doc_ids_by_list.resize(data->lists.size());
-        data->pq_codes_by_list.clear();
-        data->pq_codes_by_list.resize(data->lists.size());
-        data->pq_codes_soa_by_list.clear();
-        if (data->pq_codes_subquantizer_major) {
-          data->pq_codes_soa_by_list.resize(data->lists.size());
-        }
-        for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
-          RebuildListPQCodes(data, list_id);
+        if (format_version == 1) {
+          data->doc_ids_by_list.clear();
+          data->doc_ids_by_list.resize(data->lists.size());
+          data->pq_codes_by_list.clear();
+          data->pq_codes_by_list.resize(data->lists.size());
+          data->pq_codes_soa_by_list.clear();
+          if (data->pq_codes_subquantizer_major) {
+            data->pq_codes_soa_by_list.resize(data->lists.size());
+          }
+          for (uint32_t list_id = 0; list_id < data->nlist; ++list_id) {
+            RebuildListPQCodes(data, list_id);
+          }
         }
         BuildPrecomputedTable(data);
       }
-      RebuildDocMapLocked(data);
+      if (format_version == 1) RebuildDocMapLocked(data);
     }
 
     std::unique_lock lock(mu_);
     for (auto& kv : loaded) {
-      kv.second->mutation_generation = next_mutation_generation_++;
+      if (format_version == 1) {
+        kv.second->mutation_generation = next_mutation_generation_++;
+      }
     }
     data_map_ = std::move(loaded);
     latest_version_ = latest_version;
     next_version_ = std::max(next_version, max_version + 1);
+    next_mutation_generation_ = std::max(next_mutation_generation_, max_mutation_generation + 1);
     return Status::OK();
   }
 

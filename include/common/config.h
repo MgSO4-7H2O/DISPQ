@@ -130,6 +130,8 @@ struct Config {
   uint32_t concurrent_insert_threads{1};
   uint32_t concurrent_maintenance_threads{1};
   double concurrent_target_insert_vecps{0.0};
+  std::string concurrent_init_mode{"off"};
+  std::string concurrent_init_path;
   std::string concurrent_gt_mode{"off"};
   std::string concurrent_gt_path;
 

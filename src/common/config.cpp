@@ -157,6 +157,8 @@ std::string Config::ToString() const {
       << "concurrent_insert_threads=" << concurrent_insert_threads << ", "
       << "concurrent_maintenance_threads=" << concurrent_maintenance_threads << ", "
       << "concurrent_target_insert_vecps=" << concurrent_target_insert_vecps << ", "
+      << "concurrent_init_mode=" << concurrent_init_mode << ", "
+      << "concurrent_init_path=" << concurrent_init_path << ", "
       << "concurrent_gt_mode=" << concurrent_gt_mode << ", "
       << "concurrent_gt_path=" << concurrent_gt_path << "}";
   return oss.str();
@@ -257,6 +259,8 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   ExtractUint(text, "concurrent_insert_threads", &cfg.concurrent_insert_threads);
   ExtractUint(text, "concurrent_maintenance_threads", &cfg.concurrent_maintenance_threads);
   ExtractDouble(text, "concurrent_target_insert_vecps", &cfg.concurrent_target_insert_vecps);
+  ExtractString(text, "concurrent_init_mode", &cfg.concurrent_init_mode);
+  ExtractString(text, "concurrent_init_path", &cfg.concurrent_init_path);
   ExtractString(text, "concurrent_gt_mode", &cfg.concurrent_gt_mode);
   ExtractString(text, "concurrent_gt_path", &cfg.concurrent_gt_path);
 
@@ -270,6 +274,13 @@ Result<Config> LoadConfigFromJson(const std::string& path) {
   if (cfg.concurrent_gt_mode != "off" && cfg.concurrent_gt_mode != "prepare" &&
       cfg.concurrent_gt_mode != "load") {
     return Status::InvalidArgument("concurrent_gt_mode must be off, prepare, or load");
+  }
+  if (cfg.concurrent_init_mode != "off" && cfg.concurrent_init_mode != "prepare" &&
+      cfg.concurrent_init_mode != "load") {
+    return Status::InvalidArgument("concurrent_init_mode must be off, prepare, or load");
+  }
+  if (cfg.concurrent_init_mode != "off" && cfg.concurrent_init_path.empty()) {
+    return Status::InvalidArgument("concurrent_init_path must be set when concurrent_init_mode is enabled");
   }
   if (cfg.concurrent_target_insert_vecps < 0.0) {
     return Status::InvalidArgument("concurrent_target_insert_vecps must be >= 0");
