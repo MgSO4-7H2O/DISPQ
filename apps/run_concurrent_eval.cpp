@@ -689,7 +689,8 @@ int main(int argc, char** argv) {
   Clock::time_point init_artifact_start = Clock::now();
   if (config.concurrent_init_mode == "prepare") {
     std::cout << "[INIT_ARTIFACT] prepare start" << std::endl;
-  } else if (config.concurrent_init_mode == "load") {
+  }
+  if (config.concurrent_init_mode == "load") {
     std::cout << "[INIT_ARTIFACT] load start" << std::endl;
     std::unique_ptr<std::ifstream> artifact_in;
     InitArtifactMetadata artifact_metadata;
