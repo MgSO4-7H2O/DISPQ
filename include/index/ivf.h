@@ -89,6 +89,11 @@ struct OnlinePQUpdateStats {
   double active_prepare_ms{0.0};
   double active_commit_wait_ms{0.0};
   double active_commit_ms{0.0};
+  double active_commit_validate_ms{0.0};
+  double active_commit_list_ms{0.0};
+  double active_commit_docmap_ms{0.0};
+  double active_commit_pq_cache_ms{0.0};
+  double active_commit_state_ms{0.0};
 };
 
 struct PreparedOnlinePQBatch {

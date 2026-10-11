@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -389,6 +390,13 @@ struct ListPQCodesSoA {
   std::vector<uint8_t> codes;
 };
 
+struct PreparedListAppend {
+  AlignedVector<ListEntry> entries;
+  std::vector<DocId> doc_ids;
+  std::vector<uint8_t> pq_codes;
+  std::vector<uint8_t> pq_codes_soa;
+};
+
 struct IndexData {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   uint32_t dim{0};
@@ -453,6 +461,10 @@ struct PreparedOnlinePQBatchData {
   bool use_precomputed_table{false};
   std::vector<int> centroids;
   AlignedVector<ListEntry> entries;
+  std::vector<PreparedListAppend> list_appends;
+  size_t record_count{0};
+  DocId min_doc_id{0};
+  DocId max_doc_id{0};
   bool updated_codebook{false};
   std::vector<MatrixRM> pq_codebooks;
   std::vector<MatrixRM> pq_codebooks_soa;
@@ -1497,6 +1509,112 @@ void AppendListPQCaches(IndexData* data,
   reserved.rows = rows_before + 1;
 }
 
+// Grouping once outside the index write lock keeps publication list-oriented,
+// while preserving each list's original order from the input batch.
+Status PrepareListAppends(PreparedOnlinePQBatchData* payload) {
+  if (payload->centroids.size() != payload->entries.size() ||
+      payload->entries.empty() || payload->nlist == 0) {
+    return Status::InvalidArgument("Prepared OnlinePQ batch shape mismatch");
+  }
+
+  payload->list_appends.resize(payload->nlist);
+  std::vector<size_t> list_counts(payload->nlist, 0);
+  payload->min_doc_id = std::numeric_limits<DocId>::max();
+  payload->max_doc_id = std::numeric_limits<DocId>::lowest();
+  for (size_t i = 0; i < payload->entries.size(); ++i) {
+    const int list_id = payload->centroids[i];
+    const ListEntry& entry = payload->entries[i];
+    if (list_id < 0 || static_cast<uint32_t>(list_id) >= payload->nlist ||
+        entry.pq_code.size() != payload->M ||
+        entry.versions.index_version != payload->index_version) {
+      return Status::InvalidArgument("Prepared OnlinePQ entry shape mismatch");
+    }
+    ++list_counts[static_cast<size_t>(list_id)];
+    payload->min_doc_id = std::min(payload->min_doc_id, entry.doc_id);
+    payload->max_doc_id = std::max(payload->max_doc_id, entry.doc_id);
+  }
+
+  for (uint32_t list_id = 0; list_id < payload->nlist; ++list_id) {
+    const size_t count = list_counts[list_id];
+    if (count == 0) continue;
+    auto& bucket = payload->list_appends[list_id];
+    bucket.entries.reserve(count);
+    bucket.doc_ids.reserve(count);
+    bucket.pq_codes.reserve(count * payload->M);
+  }
+  for (size_t i = 0; i < payload->entries.size(); ++i) {
+    auto& entry = payload->entries[i];
+    auto& bucket = payload->list_appends[static_cast<size_t>(payload->centroids[i])];
+    bucket.doc_ids.push_back(entry.doc_id);
+    bucket.pq_codes.insert(bucket.pq_codes.end(), entry.pq_code.begin(), entry.pq_code.end());
+    bucket.entries.push_back(std::move(entry));
+  }
+  if (payload->pq_codes_subquantizer_major) {
+    for (auto& bucket : payload->list_appends) {
+      const size_t rows = bucket.entries.size();
+      if (rows == 0) continue;
+      bucket.pq_codes_soa.resize(rows * payload->M);
+      for (size_t row = 0; row < rows; ++row) {
+        for (uint32_t m = 0; m < payload->M; ++m) {
+          bucket.pq_codes_soa[static_cast<size_t>(m) * rows + row] =
+              bucket.pq_codes[row * payload->M + m];
+        }
+      }
+    }
+  }
+  payload->record_count = payload->entries.size();
+  std::vector<int>().swap(payload->centroids);
+  AlignedVector<ListEntry>().swap(payload->entries);
+  return Status::OK();
+}
+
+// Bulk cache publication avoids per-record growth and SoA stride checks while
+// keeping the existing AoS/SoA layouts unchanged.
+void AppendListPQCachesBulk(IndexData* data,
+                            uint32_t list_id,
+                            size_t rows_before,
+                            const PreparedListAppend& bucket) {
+  const size_t append_rows = bucket.entries.size();
+  if (append_rows == 0) return;
+  auto& doc_ids = data->doc_ids_by_list[static_cast<size_t>(list_id)];
+  auto& flat = data->pq_codes_by_list[static_cast<size_t>(list_id)];
+  const bool cache_valid = doc_ids.size() == rows_before &&
+                           flat.size() == rows_before * data->M;
+  bool soa_valid = true;
+  if (data->pq_codes_subquantizer_major) {
+    const auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+    soa_valid = soa.rows == rows_before && soa.stride >= rows_before &&
+                soa.codes.size() == static_cast<size_t>(data->M) * soa.stride;
+  }
+  if (!cache_valid || !soa_valid) {
+    RebuildListPQCodes(data, list_id);
+    return;
+  }
+
+  const size_t ids_needed = rows_before + append_rows;
+  if (doc_ids.capacity() < ids_needed) {
+    doc_ids.reserve(std::max(ids_needed, doc_ids.capacity() * 2));
+  }
+  doc_ids.insert(doc_ids.end(), bucket.doc_ids.begin(), bucket.doc_ids.end());
+
+  const size_t codes_needed = rows_before * data->M + bucket.pq_codes.size();
+  if (flat.capacity() < codes_needed) {
+    flat.reserve(std::max(codes_needed, flat.capacity() * 2));
+  }
+  flat.insert(flat.end(), bucket.pq_codes.begin(), bucket.pq_codes.end());
+
+  if (data->pq_codes_subquantizer_major) {
+    ReserveListPQCodesSoA(data, list_id, ids_needed);
+    auto& soa = data->pq_codes_soa_by_list[static_cast<size_t>(list_id)];
+    for (uint32_t m = 0; m < data->M; ++m) {
+      std::copy_n(bucket.pq_codes_soa.data() + static_cast<size_t>(m) * append_rows,
+                  append_rows,
+                  soa.codes.data() + static_cast<size_t>(m) * soa.stride + rows_before);
+    }
+    soa.rows = ids_needed;
+  }
+}
+
 void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   if (data == nullptr || !data->use_pq || data->M == 0) {
     return;
@@ -2447,6 +2565,8 @@ class KMeansIVFIndex : public IVFIndex {
     payload->online_pq_batch_count = prepared_data.online_pq_batch_count;
     payload->warmup_nqe_sum = prepared_data.warmup_nqe_sum;
     payload->warmup_seen_batches = prepared_data.warmup_seen_batches;
+    const Status grouped = PrepareListAppends(payload.get());
+    if (!grouped.ok()) return grouped;
     payload->stats.active_prepare_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - prepare_start).count();
     OnlinePQUpdateStats stats = payload->stats;
@@ -2462,6 +2582,7 @@ class KMeansIVFIndex : public IVFIndex {
     const auto wait_start = std::chrono::steady_clock::now();
     std::unique_lock lock(mu_);
     const auto lock_acquired = std::chrono::steady_clock::now();
+    const auto validate_start = std::chrono::steady_clock::now();
     auto it = data_map_.find(payload->index_version);
     if (latest_version_ != payload->index_version || it == data_map_.end()) {
       return Status::Unavailable("Prepared OnlinePQ index version is stale");
@@ -2475,8 +2596,8 @@ class KMeansIVFIndex : public IVFIndex {
         data.Ks != payload->Ks || data.dsub != payload->dsub ||
         data.pq_codebook_dimension_major != payload->pq_codebook_dimension_major ||
         data.pq_codes_subquantizer_major != payload->pq_codes_subquantizer_major ||
-        payload->centroids.size() != payload->entries.size() ||
-        payload->entries.empty()) {
+        payload->list_appends.size() != data.nlist || payload->record_count == 0 ||
+        payload->min_doc_id > payload->max_doc_id) {
       return Status::Unavailable("Prepared OnlinePQ context is stale or invalid");
     }
     if (payload->stats.updated_codebook &&
@@ -2486,19 +2607,81 @@ class KMeansIVFIndex : public IVFIndex {
           payload->pq_precomputed_table.size() != PrecomputedTableElementCount(data)))) {
       return Status::InvalidArgument("Prepared OnlinePQ state shape mismatch");
     }
-    for (size_t i = 0; i < payload->entries.size(); ++i) {
-      if (payload->centroids[i] < 0 ||
-          static_cast<uint32_t>(payload->centroids[i]) >= data.nlist ||
-          payload->entries[i].pq_code.size() != data.M ||
-          payload->entries[i].versions.index_version != data.version) {
-        return Status::InvalidArgument("Prepared OnlinePQ entry shape mismatch");
+    size_t grouped_rows = 0;
+    for (const auto& bucket : payload->list_appends) {
+      const size_t rows = bucket.entries.size();
+      if (bucket.doc_ids.size() != rows || bucket.pq_codes.size() != rows * data.M ||
+          (data.pq_codes_subquantizer_major &&
+           bucket.pq_codes_soa.size() != rows * data.M) ||
+          (!data.pq_codes_subquantizer_major && !bucket.pq_codes_soa.empty())) {
+        return Status::InvalidArgument("Prepared OnlinePQ list payload shape mismatch");
+      }
+      grouped_rows += rows;
+    }
+    if (grouped_rows != payload->record_count) {
+      return Status::InvalidArgument("Prepared OnlinePQ grouped row count mismatch");
+    }
+    payload->stats.active_commit_validate_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - validate_start).count();
+
+    const auto list_start = std::chrono::steady_clock::now();
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      auto& bucket = payload->list_appends[list_id];
+      if (bucket.entries.empty()) continue;
+      auto& list = data.lists[static_cast<size_t>(list_id)];
+      const size_t needed = list.size() + bucket.entries.size();
+      if (list.capacity() < needed) {
+        list.reserve(std::max(needed, std::max<size_t>(8, list.capacity() * 2)));
+      }
+      list.insert(list.end(), std::make_move_iterator(bucket.entries.begin()),
+                  std::make_move_iterator(bucket.entries.end()));
+    }
+    payload->stats.active_commit_list_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - list_start).count();
+
+    const auto docmap_start = std::chrono::steady_clock::now();
+    data.doc_to_list.EnsureRange(payload->min_doc_id, payload->max_doc_id);
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      for (DocId doc_id : payload->list_appends[list_id].doc_ids) {
+        const size_t offset = static_cast<size_t>(doc_id - data.doc_to_list.base);
+        data.doc_to_list.list_ids[offset] = list_id;
+        if (offset < data.doc_to_list.leading_invalid) {
+          data.doc_to_list.leading_invalid = offset;
+        }
       }
     }
+    payload->stats.active_commit_docmap_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - docmap_start).count();
 
-    data.last_ingest_profiling = IngestProfiling{};
-    data.last_ingest_profiling.records = payload->entries.size();
-    data.last_ingest_profiling.assignment_us = payload->stats.insert_assignment_us;
-    data.last_ingest_profiling.encode_us = payload->stats.insert_encode_ms * 1000.0;
+    const auto pq_cache_start = std::chrono::steady_clock::now();
+    if (data.doc_ids_by_list.size() != data.lists.size()) {
+      data.doc_ids_by_list.resize(data.lists.size());
+    }
+    if (data.pq_codes_by_list.size() != data.lists.size()) {
+      data.pq_codes_by_list.resize(data.lists.size());
+    }
+    if (data.pq_codes_subquantizer_major &&
+        data.pq_codes_soa_by_list.size() != data.lists.size()) {
+      data.pq_codes_soa_by_list.resize(data.lists.size());
+    }
+    for (uint32_t list_id = 0; list_id < data.nlist; ++list_id) {
+      const auto& bucket = payload->list_appends[list_id];
+      if (bucket.entries.empty()) continue;
+      const size_t rows_before =
+          data.lists[static_cast<size_t>(list_id)].size() - bucket.entries.size();
+      AppendListPQCachesBulk(&data, list_id, rows_before, bucket);
+    }
+    payload->stats.active_commit_pq_cache_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - pq_cache_start).count();
+    payload->stats.insert_commit_ms = payload->stats.active_commit_list_ms +
+                                      payload->stats.active_commit_docmap_ms +
+                                      payload->stats.active_commit_pq_cache_ms;
+
+    const auto state_start = std::chrono::steady_clock::now();
     if (payload->stats.updated_codebook) {
       data.pq_codebooks.swap(payload->pq_codebooks);
       data.pq_codebooks_soa.swap(payload->pq_codebooks_soa);
@@ -2512,11 +2695,16 @@ class KMeansIVFIndex : public IVFIndex {
     data.online_pq_batch_count = payload->online_pq_batch_count;
     data.warmup_nqe_sum = payload->warmup_nqe_sum;
     data.warmup_seen_batches = payload->warmup_seen_batches;
-    Timer commit_timer;
-    CommitPendingLocked(&data, payload->centroids.data(), &payload->entries);
-    payload->stats.insert_commit_ms = commit_timer.ElapsedMillis();
+    data.ntotal += static_cast<uint64_t>(payload->record_count);
     data.mutation_generation = next_mutation_generation_++;
+    data.last_ingest_profiling = IngestProfiling{};
+    data.last_ingest_profiling.records = payload->record_count;
+    data.last_ingest_profiling.assignment_us = payload->stats.insert_assignment_us;
+    data.last_ingest_profiling.encode_us = payload->stats.insert_encode_ms * 1000.0;
     data.last_ingest_profiling.commit_us = payload->stats.insert_commit_ms * 1000.0;
+    payload->stats.active_commit_state_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - state_start).count();
     payload->stats.active_commit_wait_ms = std::chrono::duration<double, std::milli>(
         lock_acquired - wait_start).count();
     payload->stats.active_commit_ms = std::chrono::duration<double, std::milli>(

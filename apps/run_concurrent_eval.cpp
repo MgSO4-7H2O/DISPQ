@@ -68,6 +68,11 @@ struct InsertTimelineRecord {
   double active_prepare_ms{0.0};
   double active_commit_wait_ms{0.0};
   double active_commit_ms{0.0};
+  double active_commit_validate_ms{0.0};
+  double active_commit_list_ms{0.0};
+  double active_commit_docmap_ms{0.0};
+  double active_commit_pq_cache_ms{0.0};
+  double active_commit_state_ms{0.0};
   double new_active_model_init_ms{0.0};
   double new_active_first_batch_prepare_ms{0.0};
   double new_active_first_batch_commit_ms{0.0};
@@ -1674,6 +1679,11 @@ int main(int argc, char** argv) {
         update_stats.active_prepare_ms,
         update_stats.active_commit_wait_ms,
         update_stats.active_commit_ms,
+        update_stats.active_commit_validate_ms,
+        update_stats.active_commit_list_ms,
+        update_stats.active_commit_docmap_ms,
+        update_stats.active_commit_pq_cache_ms,
+        update_stats.active_commit_state_ms,
         new_active_model_init_ms,
         new_active_first_batch_prepare_ms,
         new_active_first_batch_commit_ms,
@@ -1828,6 +1838,15 @@ int main(int argc, char** argv) {
               << " elapsed_ms="
               << std::chrono::duration<double, std::milli>(Clock::now() - measurement_start).count()
               << " pending=" << (log_pending ? "true" : "false") << std::endl;
+    if (update_stats.active_commit_ms > 0.0) {
+      std::cout << "[INSERT_COMMIT_PROFILE] records=" << (end - batch_begin)
+                << " validate_ms=" << update_stats.active_commit_validate_ms
+                << " list_ms=" << update_stats.active_commit_list_ms
+                << " docmap_ms=" << update_stats.active_commit_docmap_ms
+                << " pq_cache_ms=" << update_stats.active_commit_pq_cache_ms
+                << " state_ms=" << update_stats.active_commit_state_ms
+                << " total_ms=" << update_stats.active_commit_ms << std::endl;
+    }
     request_maintenance(request_merge, request_rebuild);
   }
   if (!failed.load()) insert_admission_gate();
@@ -2025,7 +2044,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   inserts << std::setprecision(12)
-          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms,active_prepare_ms,active_commit_wait_ms,active_commit_ms,new_active_model_init_ms,new_active_first_batch_prepare_ms,new_active_first_batch_commit_ms,new_active_full_build_ms\n";
+          << "batch,version,begin_row,end_row,start_ms,end_ms,transform_ms,insert_ms,batch_ms,active_prepare_ms,active_commit_wait_ms,active_commit_ms,active_commit_validate_ms,active_commit_list_ms,active_commit_docmap_ms,active_commit_pq_cache_ms,active_commit_state_ms,new_active_model_init_ms,new_active_first_batch_prepare_ms,new_active_first_batch_commit_ms,new_active_full_build_ms\n";
   for (const InsertTimelineRecord& record : insert_timeline_records) {
     inserts << record.batch << ',' << record.version << ','
             << record.begin_row << ',' << record.end_row << ','
@@ -2033,6 +2052,9 @@ int main(int argc, char** argv) {
             << record.transform_ms << ',' << record.insert_ms << ','
             << record.batch_ms << ',' << record.active_prepare_ms << ','
             << record.active_commit_wait_ms << ',' << record.active_commit_ms << ','
+            << record.active_commit_validate_ms << ',' << record.active_commit_list_ms << ','
+            << record.active_commit_docmap_ms << ',' << record.active_commit_pq_cache_ms << ','
+            << record.active_commit_state_ms << ','
             << record.new_active_model_init_ms << ','
             << record.new_active_first_batch_prepare_ms << ','
             << record.new_active_first_batch_commit_ms << ','
