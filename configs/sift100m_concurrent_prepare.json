@@ -41,7 +41,7 @@
   "global_rebuild_force_main_rows": 0,
   "global_rebuild_cooldown_rows": 5000000,
   "streaming_mode": "batch",
-  "stream_batch_size": 2000000,
+  "stream_batch_size": 500000,
   "streaming_use_stream_batch_size": true,
   "online_pq_enable": true,
   "online_pq_update_scheme": "minibatch",
@@ -65,5 +65,5 @@
   "concurrent_maintenance_threads": 3,
   "concurrent_target_insert_vecps": 0,
   "concurrent_gt_mode": "prepare",
-  "concurrent_gt_path": "artifacts/sift100m_concurrent.gt"
+  "concurrent_gt_path": "artifacts/sift100m_concurrent_500k.gt"
 }
