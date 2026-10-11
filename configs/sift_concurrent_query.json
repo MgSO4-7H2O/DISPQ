@@ -62,8 +62,8 @@
   "concurrent_query_workers": 8,
   "concurrent_query_threads_per_request": 3,
   "concurrent_insert_threads": 3,
-  "concurrent_maintenance_threads": 3,
-  "concurrent_target_insert_vecps": 0,
+  "concurrent_maintenance_threads": 4,
+  "concurrent_target_insert_vecps": 12000,
   "concurrent_gt_mode": "load",
   "concurrent_gt_path": "artifacts/sift_concurrent.gt"
 }

@@ -6,6 +6,7 @@
 /artifacts
 /test
 .vscode
+.venv
 *.pdf
 /build-avx512
 /build-generic
