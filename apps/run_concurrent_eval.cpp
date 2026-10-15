@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -596,24 +597,51 @@ int main(int argc, char** argv) {
 #else
   const int runtime_max_threads = 1;
 #endif
-  if (argc < 3 || argc > 5) {
+  std::vector<std::string> positional_args;
+  std::optional<uint64_t> max_insert_vectors;
+  for (int arg = 1; arg < argc; ++arg) {
+    const std::string value = argv[arg];
+    if (value == "--max-insert-vectors") {
+      if (max_insert_vectors || arg + 1 >= argc) {
+        std::cerr << "--max-insert-vectors requires one non-negative integer value and may be specified once\n";
+        return 2;
+      }
+      const std::string count_text = argv[++arg];
+      uint64_t count = 0;
+      const auto parsed = std::from_chars(count_text.data(),
+                                          count_text.data() + count_text.size(), count);
+      if (count_text.empty() || parsed.ec != std::errc{} ||
+          parsed.ptr != count_text.data() + count_text.size()) {
+        std::cerr << "Invalid --max-insert-vectors value '" << count_text
+                  << "': expected a non-negative integer\n";
+        return 2;
+      }
+      max_insert_vectors = count;
+    } else if (value.rfind("--", 0) == 0) {
+      std::cerr << "Unknown option: " << value << '\n';
+      return 2;
+    } else {
+      positional_args.push_back(value);
+    }
+  }
+  if (positional_args.size() < 2 || positional_args.size() > 4) {
     std::cerr << "Usage: run_concurrent_eval <config.json> <dataset_dir_or_base_file> "
-                 "[query_or_dir] [summary.json]\n";
+                 "[query_or_dir] [summary.json] [--max-insert-vectors N]\n";
     return 2;
   }
-  auto config_result = LoadConfigFromJson(argv[1]);
+  auto config_result = LoadConfigFromJson(positional_args[0]);
   if (!config_result.ok()) { std::cerr << config_result.status().ToString() << '\n'; return 1; }
   const Config config = config_result.value();
   if (!config.concurrent_workload_enable) {
     std::cerr << "concurrent_workload_enable must be true for this executable\n";
     return 1;
   }
-  auto base_path_result = ResolveFvecsPath(argv[2], "_base.fvecs");
+  auto base_path_result = ResolveFvecsPath(positional_args[1], "_base.fvecs");
   if (!base_path_result.ok()) { std::cerr << base_path_result.status().ToString() << '\n'; return 1; }
   const std::string base_path = base_path_result.value();
   std::string query_path;
-  if (argc >= 4) {
-    auto result = ResolveFvecsPath(argv[3], "_query.fvecs");
+  if (positional_args.size() >= 3) {
+    auto result = ResolveFvecsPath(positional_args[2], "_query.fvecs");
     if (!result.ok()) { std::cerr << result.status().ToString() << '\n'; return 1; }
     query_path = result.value();
   } else {
@@ -656,6 +684,12 @@ int main(int argc, char** argv) {
     delta_rows = std::min<uint32_t>(nx - main_rows, static_cast<uint32_t>(wanted));
   }
   const uint32_t initial_rows = main_rows + delta_rows;
+  const uint64_t remaining_rows = static_cast<uint64_t>(nx) - initial_rows;
+  const uint64_t effective_insert_vectors = max_insert_vectors
+      ? std::min(*max_insert_vectors, remaining_rows)
+      : remaining_rows;
+  const uint32_t effective_end_row = static_cast<uint32_t>(
+      static_cast<uint64_t>(initial_rows) + effective_insert_vectors);
   const uint32_t batch_size = insert_step;
   if (config.concurrent_init_mode != "off" && config.dim != base_source.dim) {
     std::cerr << "Init artifact metadata mismatch: dim config=" << config.dim
@@ -800,18 +834,28 @@ int main(int argc, char** argv) {
   }
 
   std::vector<uint32_t> frontiers{initial_rows};
-  for (uint32_t end = initial_rows; end < nx; end += batch_size)
-    frontiers.push_back(std::min(nx, end + batch_size));
+  for (uint64_t end = initial_rows; end < effective_end_row;) {
+    end = std::min<uint64_t>(effective_end_row, end + batch_size);
+    frontiers.push_back(static_cast<uint32_t>(end));
+  }
   const std::string base_identity = base_path;
   const std::string query_identity = query_path;
   std::vector<std::vector<std::vector<DocId>>> gt;
-  const std::string gt_path = config.concurrent_gt_path.empty()
-                                  ? std::string(argv[1]) + ".concurrent.gt"
-                                  : config.concurrent_gt_path;
+  std::string gt_path = config.concurrent_gt_path.empty()
+                            ? positional_args[0] + ".concurrent.gt"
+                            : config.concurrent_gt_path;
+  if (max_insert_vectors) {
+    std::filesystem::path path(gt_path);
+    std::string extension = path.extension().string();
+    if (extension.empty()) extension = ".gt";
+    path.replace_filename(path.stem().string() + ".cap" +
+                          std::to_string(*max_insert_vectors) + extension);
+    gt_path = path.string();
+  }
   if (config.concurrent_init_mode != "prepare" &&
       config.concurrent_gt_mode == "prepare") {
     const Status remaining_transform = TransformBaseRangeToIndexData(
-        base_source, initial_rows, nx, config.use_whitening, whiten_version,
+        base_source, initial_rows, effective_end_row, config.use_whitening, whiten_version,
         whitening, config.use_cosine, &index_data);
     if (!remaining_transform.ok()) {
       std::cerr << remaining_transform.ToString() << '\n';
@@ -1456,7 +1500,7 @@ int main(int argc, char** argv) {
   double insert_wall_ms = 0.0;
   const auto insert_stream_start = Clock::now();
   uint32_t next_shard_id = 2;
-  while (next_row < nx && !failed.load()) {
+  while (next_row < effective_end_row && !failed.load()) {
     if (!insert_admission_gate()) break;
     if (was_backpressured) next_deadline = Clock::now();
     if (period_ms > 0.0 && !first_batch) {
@@ -1469,7 +1513,8 @@ int main(int argc, char** argv) {
     first_batch = false;
     if (failed.load()) break;
 
-    const uint32_t end = std::min(nx, next_row + batch_size);
+    const uint32_t end = static_cast<uint32_t>(std::min<uint64_t>(
+        effective_end_row, static_cast<uint64_t>(next_row) + batch_size));
     const uint32_t batch_begin = next_row;
     const uint64_t batch_number = committed_batches.load() + 1;
     const auto batch_start = Clock::now();
@@ -1891,7 +1936,9 @@ int main(int argc, char** argv) {
     }
   }
   if (!query_records.empty() && !gt.empty()) recall /= query_records.size();
-  const std::string summary_path = argc == 5 ? argv[4] : "concurrent_summary.json";
+  const std::string summary_path = positional_args.size() == 4
+                                       ? positional_args[3]
+                                       : "concurrent_summary.json";
   std::ofstream summary(summary_path);
   summary << "{\n"
           << "  \"query_workers\": " << config.concurrent_query_workers << ",\n"
@@ -1904,6 +1951,14 @@ int main(int argc, char** argv) {
           << "  \"topk\": " << config.topk << ",\n"
           << "  \"nprobe\": " << config.nprobe << ",\n"
           << "  \"initial_rows\": " << initial_rows << ",\n"
+          << "  \"dataset_rows\": " << nx << ",\n"
+          << "  \"requested_max_insert_vectors\": ";
+  if (max_insert_vectors) summary << *max_insert_vectors << ",\n";
+  else summary << "null,\n";
+  summary << "  \"effective_insert_vectors\": " << effective_insert_vectors << ",\n"
+          << "  \"effective_end_row\": " << effective_end_row << ",\n"
+          << "  \"truncated_run\": "
+          << (effective_end_row < nx ? "true" : "false") << ",\n"
           << "  \"final_committed_rows\": " << current_committed.load() << ",\n"
           << "  \"measurement_wall_ms\": " << measurement_wall_ms << ",\n"
           << "  \"completed_queries\": " << query_records.size() << ",\n"

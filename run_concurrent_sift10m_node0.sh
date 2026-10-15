@@ -19,6 +19,18 @@ fatal() {
     exit 1
 }
 
+MAX_INSERT_ARGS=()
+if [[ -n "${MAX_INSERT_VECTORS:-}" ]]; then
+    [[ "${MAX_INSERT_VECTORS}" =~ ^[0-9]+$ ]] \
+        || fatal "MAX_INSERT_VECTORS must be a non-negative integer"
+    MAX_INSERT_ARGS=(--max-insert-vectors "${MAX_INSERT_VECTORS}")
+    if [[ "${GT_PATH}" == *.gt ]]; then
+        GT_PATH="${GT_PATH%.gt}.cap${MAX_INSERT_VECTORS}.gt"
+    else
+        GT_PATH="${GT_PATH}.cap${MAX_INSERT_VECTORS}.gt"
+    fi
+fi
+
 [[ -x "${BINARY}" ]] || fatal "binary not found or not executable: ${BINARY}"
 [[ -f "${PREP_CONFIG}" ]] || fatal "prepare config not found: ${PREP_CONFIG}"
 [[ -f "${QUERY_CONFIG}" ]] || fatal "query config not found: ${QUERY_CONFIG}"
@@ -86,6 +98,7 @@ run_stage() {
             NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS}" \
             stdbuf -oL -eL \
             "${BINARY}" "${config}" "${DATASET}" "${QUERY}" "${summary}" \
+            "${MAX_INSERT_ARGS[@]}" \
         >"${log}" 2>&1 || rc=$?
 
     echo "[END] stage=${stage} exit_code=${rc} log=${log} resource=${resource}"

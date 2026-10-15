@@ -13,4 +13,7 @@ TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/sift_drift_concurrent_${TIMESTAMP}}"
 
 export PROJECT_ROOT DATASET QUERY NODE PREP_CONFIG QUERY_CONFIG GT_PATH LOG_DIR
+if [[ -n "${MAX_INSERT_VECTORS:-}" ]]; then
+    export MAX_INSERT_VECTORS
+fi
 exec "${PROJECT_ROOT}/run_concurrent_sift10m_node0.sh"
