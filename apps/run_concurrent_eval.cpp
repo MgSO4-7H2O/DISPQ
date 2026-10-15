@@ -1872,6 +1872,8 @@ int main(int argc, char** argv) {
   if (failed) { std::cerr << failure << '\n'; return 1; }
 
   std::vector<double> latencies;
+  std::vector<double> query_recalls;
+  query_recalls.reserve(query_records.size());
   double recall = 0.0;
   for (const QueryRecord& record : query_records) {
     latencies.push_back(record.latency_ms);
@@ -1881,7 +1883,11 @@ int main(int argc, char** argv) {
       uint32_t hits = 0;
       for (DocId id : record.returned_topk)
         if (std::find(expected.begin(), expected.end(), id) != expected.end()) ++hits;
-      recall += static_cast<double>(hits) / config.topk;
+      const double query_recall = static_cast<double>(hits) / config.topk;
+      query_recalls.push_back(query_recall);
+      recall += query_recall;
+    } else {
+      query_recalls.push_back(std::numeric_limits<double>::quiet_NaN());
     }
   }
   if (!query_records.empty() && !gt.empty()) recall /= query_records.size();
@@ -1990,6 +1996,7 @@ int main(int argc, char** argv) {
   const auto timeseries_path = timeline_path("_timeseries.csv");
   const auto insert_path = timeline_path("_insert.csv");
   const auto events_path = timeline_path("_events.csv");
+  const auto progress_path = timeline_path("_progress.csv");
 
   struct QueryBucket {
     std::vector<double> latencies;
@@ -2063,6 +2070,80 @@ int main(int argc, char** argv) {
   inserts.close();
   if (!inserts) {
     std::cerr << "Failed writing insert timeline CSV: " << insert_path << '\n';
+    return 1;
+  }
+
+  std::vector<double> insert_progress(insert_timeline_records.size(), 100.0);
+  if (insert_timeline_records.size() > 1) {
+    const double first_end_row = insert_timeline_records.front().end_row;
+    const double last_end_row = insert_timeline_records.back().end_row;
+    const double row_span = last_end_row - first_end_row;
+    if (row_span > 0.0) {
+      for (size_t i = 0; i < insert_timeline_records.size(); ++i) {
+        insert_progress[i] =
+            (insert_timeline_records[i].end_row - first_end_row) / row_span * 100.0;
+      }
+    }
+  }
+
+  std::ofstream progress(progress_path);
+  if (!progress) {
+    std::cerr << "Failed to open progress timeline CSV: " << progress_path << '\n';
+    return 1;
+  }
+  progress << std::setprecision(12)
+           << "batch,insert_progress_pct,begin_row,end_row,batch_start_ms,batch_end_ms,"
+              "query_count,query_qps,recall_at_k,query_latency_mean_ms,"
+              "query_latency_p50_ms,query_latency_p95_ms,query_latency_p99_ms,"
+              "query_latency_max_ms,insert_ms,batch_ms\n";
+  for (size_t batch_index = 0; batch_index < insert_timeline_records.size(); ++batch_index) {
+    const InsertTimelineRecord& batch = insert_timeline_records[batch_index];
+    std::vector<double> batch_latencies;
+    double batch_recall = 0.0;
+    for (size_t query_index = 0; query_index < query_records.size(); ++query_index) {
+      const double completion_ms = query_records[query_index].completion_ms;
+      const bool in_interval = completion_ms >= batch.start_ms &&
+                               completion_ms <= batch.end_ms;
+      if (!in_interval) continue;
+      batch_latencies.push_back(query_records[query_index].latency_ms);
+      if (std::isfinite(query_recalls[query_index]))
+        batch_recall += query_recalls[query_index];
+    }
+
+    const double duration_ms = batch.end_ms - batch.start_ms;
+    const double duration_seconds = duration_ms / 1000.0;
+    const double latency_mean = batch_latencies.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : std::accumulate(batch_latencies.begin(), batch_latencies.end(), 0.0) /
+              batch_latencies.size();
+    const double latency_max = batch_latencies.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : *std::max_element(batch_latencies.begin(), batch_latencies.end());
+    const double recall_mean = batch_latencies.empty() || gt.empty()
+        ? std::numeric_limits<double>::quiet_NaN()
+        : batch_recall / batch_latencies.size();
+    progress << batch.batch << ',' << insert_progress[batch_index] << ','
+             << batch.begin_row << ',' << batch.end_row << ','
+             << batch.start_ms << ',' << batch.end_ms << ','
+             << batch_latencies.size() << ','
+             << (duration_seconds > 0.0 ? batch_latencies.size() / duration_seconds : 0.0)
+             << ',';
+    if (std::isfinite(recall_mean)) progress << recall_mean;
+    progress << ',';
+    if (std::isfinite(latency_mean)) progress << latency_mean;
+    progress << ',';
+    if (!batch_latencies.empty()) progress << Percentile(batch_latencies, .50);
+    progress << ',';
+    if (!batch_latencies.empty()) progress << Percentile(batch_latencies, .95);
+    progress << ',';
+    if (!batch_latencies.empty()) progress << Percentile(batch_latencies, .99);
+    progress << ',';
+    if (std::isfinite(latency_max)) progress << latency_max;
+    progress << ',' << batch.insert_ms << ',' << batch.batch_ms << '\n';
+  }
+  progress.close();
+  if (!progress) {
+    std::cerr << "Failed writing progress timeline CSV: " << progress_path << '\n';
     return 1;
   }
 

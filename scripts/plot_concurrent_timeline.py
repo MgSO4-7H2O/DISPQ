@@ -20,16 +20,16 @@ def main():
 
     summary_path = args.summary_json
     stem = summary_path.stem
-    timeseries_path = summary_path.with_name(f"{stem}_timeseries.csv")
+    progress_path = summary_path.with_name(f"{stem}_progress.csv")
     insert_path = summary_path.with_name(f"{stem}_insert.csv")
     events_path = summary_path.with_name(f"{stem}_events.csv")
-    for path in (summary_path, timeseries_path, insert_path, events_path):
+    for path in (summary_path, progress_path, insert_path, events_path):
         if not path.is_file():
             parser.error(f"required input file not found: {path}")
 
     with summary_path.open(encoding="utf-8") as summary_file:
         summary = json.load(summary_file)
-    timeseries = pd.read_csv(timeseries_path)
+    progress = pd.read_csv(progress_path)
     inserts = pd.read_csv(insert_path)
     events = pd.read_csv(events_path)
 
@@ -41,27 +41,57 @@ def main():
     title = (f"Q{query_workers}x{query_threads} / I{insert_threads} / "
              f"M{maintenance_threads} / target={target_vecps}")
 
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(14, 10))
-    qps_x = (timeseries["window_start_ms"] + timeseries["window_end_ms"]) / 2000.0
-    axes[0].plot(qps_x, timeseries["query_qps"], color="tab:blue", label="Query QPS")
-    axes[0].set_ylabel("Query QPS")
+    fig, axes = plt.subplots(4, 1, sharex=True, figsize=(14, 12))
+    progress_x = progress["insert_progress_pct"]
+    axes[0].plot(progress_x, progress["recall_at_k"], color="tab:purple",
+                 marker="o", label="Recall@k")
+    axes[0].set_ylabel("Recall@k")
 
-    latency_x = qps_x
-    axes[1].plot(latency_x, timeseries["query_latency_p50_ms"], label="p50")
-    axes[1].plot(latency_x, timeseries["query_latency_p95_ms"], label="p95")
-    axes[1].plot(latency_x, timeseries["query_latency_p99_ms"], label="p99")
+    axes[1].plot(progress_x, progress["query_qps"], color="tab:blue", marker="o",
+                 label="Query QPS")
+    axes[1].set_ylabel("Query QPS")
+
+    axes[2].plot(progress_x, progress["query_latency_p50_ms"], label="p50")
+    axes[2].plot(progress_x, progress["query_latency_p95_ms"], label="p95")
+    axes[2].plot(progress_x, progress["query_latency_p99_ms"], label="p99")
     if args.show_max:
-        axes[1].scatter(latency_x, timeseries["query_latency_max_ms"],
-                         s=12, alpha=0.55, label="max")
-    axes[1].set_ylabel("Query latency (ms)")
+        axes[2].scatter(progress_x, progress["query_latency_max_ms"],
+                        s=12, alpha=0.55, label="max")
+    axes[2].set_ylabel("Query latency (ms)")
 
     if not inserts.empty:
-        insert_x = inserts["end_ms"] / 1000.0
-        axes[2].plot(insert_x, inserts["batch_ms"], marker="o", label="batch_ms")
-        axes[2].plot(insert_x, inserts["insert_ms"], marker=".", linestyle="--",
+        axes[3].plot(progress_x, progress["batch_ms"], marker="o", label="batch_ms")
+        axes[3].plot(progress_x, progress["insert_ms"], marker=".", linestyle="--",
                      alpha=0.75, label="insert_ms")
-    axes[2].set_ylabel("Insert latency (ms)")
-    axes[2].set_xlabel("Elapsed time (s)")
+    axes[3].set_ylabel("Insert latency (ms)")
+    axes[3].set_xlabel("Dynamic Insert Progress (%)")
+
+    insert_rows = list(inserts.itertuples(index=False))
+    insert_progress = progress["insert_progress_pct"].tolist()
+
+    def time_to_progress(timestamp_ms):
+        if not insert_rows:
+            return 0.0
+        timestamp_ms = float(timestamp_ms)
+        first_start = float(insert_rows[0].start_ms)
+        if timestamp_ms <= first_start:
+            return float(insert_progress[0])
+        for index, batch in enumerate(insert_rows):
+            start_ms = float(batch.start_ms)
+            end_ms = float(batch.end_ms)
+            current_progress = float(insert_progress[index])
+            previous_progress = (float(insert_progress[index - 1])
+                                 if index > 0 else current_progress)
+            if timestamp_ms <= end_ms:
+                if timestamp_ms <= start_ms or end_ms <= start_ms:
+                    return previous_progress
+                fraction = min(1.0, max(0.0,
+                    (timestamp_ms - start_ms) / (end_ms - start_ms)))
+                return previous_progress + fraction * (current_progress - previous_progress)
+            if index + 1 < len(insert_rows) and \
+                    timestamp_ms < float(insert_rows[index + 1].start_ms):
+                return current_progress
+        return float(insert_progress[-1])
 
     event_colors = {"merge": "tab:green", "rebuild": "tab:red"}
     has_rebuild_wait = False
@@ -71,31 +101,40 @@ def main():
         for event in events.itertuples(index=False):
             event_type = str(event.type)
             color = event_colors.get(event_type, "gray")
-            start_s = float(event.start_ms) / 1000.0
-            end_s = float(event.end_ms) / 1000.0
+            request_progress = time_to_progress(event.request_ms)
+            start_progress = time_to_progress(event.start_ms)
+            commit_lock_progress = time_to_progress(event.commit_lock_acquired_ms)
+            commit_done_progress = time_to_progress(event.commit_done_ms)
+            end_progress = time_to_progress(event.end_ms)
             for axis in axes:
-                if end_s > start_s:
-                    axis.axvspan(start_s, end_s, color=color,
+                if end_progress > start_progress:
+                    axis.axvspan(start_progress, end_progress, color=color,
                                  alpha=0.12 if event_type == "merge" else 0.16)
+                elif float(event.end_ms) > float(event.start_ms):
+                    axis.axvline(start_progress, color=color, alpha=0.35, linewidth=2)
                 if (event_type == "merge" and
                         event.commit_done_ms > event.commit_lock_acquired_ms):
-                    axis.axvspan(float(event.commit_lock_acquired_ms) / 1000.0,
-                                 float(event.commit_done_ms) / 1000.0,
-                                 color="darkgreen", alpha=0.30)
+                    if commit_done_progress > commit_lock_progress:
+                        axis.axvspan(commit_lock_progress, commit_done_progress,
+                                     color="darkgreen", alpha=0.30)
+                    else:
+                        axis.axvline(commit_lock_progress, color="darkgreen",
+                                     alpha=0.75, linewidth=3)
                     has_merge_commit = True
                 if (event_type == "merge" and
                         event.commit_wait_start_ms > event.start_ms):
-                    axis.axvline(float(event.commit_wait_start_ms) / 1000.0,
+                    axis.axvline(time_to_progress(event.commit_wait_start_ms),
                                  color="darkgreen", linestyle="--", alpha=0.7)
                     has_commit_wait = True
                 if event_type == "rebuild" and event.request_ms < event.start_ms:
-                    axis.axvline(float(event.request_ms) / 1000.0,
+                    axis.axvline(request_progress,
                                  color=color, linestyle=":", alpha=0.65)
                     has_rebuild_wait = True
 
     for axis in axes:
         axis.grid(True, alpha=0.25)
         axis.legend(loc="upper left")
+        axis.set_xlim(0, 100)
 
     event_handles = [
         Patch(facecolor=event_colors["merge"], alpha=0.25, label="Merge"),
