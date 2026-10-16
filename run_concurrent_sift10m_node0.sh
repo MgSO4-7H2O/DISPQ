@@ -2,7 +2,7 @@
 
 set -uo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/home/ydy/DISPQ-profiling}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/ydy/DISPQ_con}"
 BINARY="${BINARY:-${PROJECT_ROOT}/build_release/run_concurrent_eval}"
 DATASET="${DATASET:-/home/ydy/data/sift10M/origin}"
 QUERY="${QUERY:-${DATASET}}"
