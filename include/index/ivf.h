@@ -68,7 +68,10 @@ class MainPartitionAdmission {
   std::atomic<uint64_t> epoch_{0};
 };
 
-struct MainSearchPlan { std::vector<std::pair<float, uint32_t>> probes; };
+struct MainSearchPlan {
+  const void* index_data{nullptr};
+  std::vector<std::pair<float, uint32_t>> probes;
+};
 
 struct PQParams {
   bool enable{false};

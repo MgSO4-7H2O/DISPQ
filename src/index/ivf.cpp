@@ -3328,6 +3328,7 @@ class KMeansIVFIndex : public IVFIndex {
     const IndexData& data=*it->second;
     if(static_cast<uint32_t>(qw.size())!=data.dim) return Status::InvalidArgument("Query dim mismatch");
     MainSearchPlan plan;
+    plan.index_data = &data;
     plan.probes=SelectMainProbes(data,qw,std::max<uint32_t>(1,std::min<uint32_t>(nprobe,data.nlist)));
     return plan;
   }
@@ -3336,10 +3337,8 @@ class KMeansIVFIndex : public IVFIndex {
       uint32_t topk,const VersionSet& route_versions,const MainSearchPlan& plan,
       uint8_t from_new,bool collect_scan_trace) const override {
     if(topk==0) return Status::InvalidArgument("topk must be positive");
-    // Concurrent evaluator's workload shared lock pins the Main object against rebuild.
-    auto it=data_map_.find(route_versions.index_version);
-    if(it==data_map_.end()) return Status::NotFound("Index version not built");
-    const IndexData& data=*it->second;
+    // The evaluator's workload shared barrier keeps this pointed-to Main object alive.
+    const IndexData& data = *static_cast<const IndexData*>(plan.index_data);
     if(static_cast<uint32_t>(qw.size())!=data.dim) return Status::InvalidArgument("Query dim mismatch");
     return SearchSingleQuery(data,qw,topk,static_cast<uint32_t>(plan.probes.size()),
                              from_new,collect_scan_trace,&plan.probes);
