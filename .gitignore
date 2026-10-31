@@ -8,7 +8,4 @@
 .vscode
 .venv
 *.pdf
-.codegraph
 /logs
-.codex
-AGENTS.md
