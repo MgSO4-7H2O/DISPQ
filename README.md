@@ -1,16 +1,64 @@
 # DISPQ
+DiSPQ is a dual-index IVF-PQ system for streaming vector search. It combines online quantization adaptation, hierarchical index maintenance, and efficient query processing to support evolving vector collections without frequent full-index reconstruction.
 
-DISPQ is a C++17 research prototype for approximate nearest-neighbor (ANN) search over vector data that changes over time. It combines an IVF/PQ index with an online update path, so new vectors can be ingested and searched without rebuilding the full index after every batch.
+## Features and Core Modules
 
-## What it does
+DiSPQ is a dual-index IVF-PQ system for streaming vector search. It combines online quantization adaptation, hierarchical index maintenance, and efficient query processing to support evolving vector collections without frequent full-index reconstruction.
 
-- Builds an IVF/PQ main index, with optional whitening and cosine-distance support.
-- Accepts streaming inserts into an active delta index and adapts its product quantizer (OnlinePQ).
-- Searches the main index and available delta shards together, with optional exact reranking of candidates.
-- Freezes and merges delta shards into the main index as configured. Balanced merge locally reassigns vectors to help repair routing and list-size imbalance; an optional global rebuild is also available.
-- Provides evaluation executables that report recall and performance metrics, as well as a concurrent query/insert workload runner.
+### 1. Dual-Index Architecture and Query Processing
 
-The project is intended for experimenting with streaming ANN indexing, online PQ adaptation, merge policies, and query/update performance. It is an experimental index and evaluation codebase, not a standalone vector database service.
+DiSPQ maintains a consolidated **Main Index** and a mutable **Delta Index** for recent updates. The Delta Index can transition between Active and Sealed states, allowing insertion and background merging to proceed concurrently.
+
+Queries search the Main and available Delta shards, combine candidates, and optionally perform exact reranking using full-precision vectors.
+
+**Implementation:** `src/index/ivf.cpp`, `apps/run_concurrent_eval.cpp`
+
+### 2. Online PQ Adaptation
+
+The Active Delta supports streaming insertions and incrementally adapts its PQ codebooks to changing data distributions. This reduces quantization mismatch without requiring frequent reconstruction of the Main Index.
+
+**Implementation:** `src/index/ivf.cpp`
+
+### 3. Hierarchical Index Maintenance
+
+DiSPQ organizes maintenance into three complementary levels:
+
+| Level | Mechanism | Purpose |
+| --- | --- | --- |
+| L1 | **Delta PQ Adaptation** | Adapt quantization to recent data. |
+| L2 | **Balanced Merge** | Consolidate Delta vectors and repair affected Main partitions. |
+| L3 | **Global Rebuild** | Reconstruct the index under substantial distribution changes. |
+
+Maintenance can be triggered by index size, quantization quality, distribution drift, and partition imbalance.
+
+**Implementation:** `src/index/ivf.cpp`, `src/index/merge.cpp`, `apps/run_concurrent_eval.cpp`
+
+### 4. Balanced Merge
+
+Balanced Merge consolidates a Sealed Delta into the Main Index without rebuilding the entire index. It uses distance- and load-aware assignment, identifies affected partition neighborhoods, and performs local reassignment to improve routing quality and list balance.
+
+The resulting partitions are materialized as **complete replacement inverted lists**, while the Main quantizers remain unchanged.
+
+**Implementation:** `src/index/merge.cpp`, `src/index/ivf.cpp`
+
+### 5. Concurrent Search and Merge
+
+DiSPQ performs expensive merge preparation in the background and coordinates only the final replacement stage.
+
+Queries accessing affected Main partitions are blocked during the commit, while queries accessing unaffected partitions can continue. The replacement of affected partitions and retirement of the corresponding Sealed Delta are coordinated to provide a consistent query-visible transition.
+
+**Implementation:** `src/index/ivf.cpp`, `apps/run_concurrent_eval.cpp`
+
+### 6. Efficient IVF-PQ Computation
+
+DiSPQ incorporates two optimizations to reduce search and maintenance overhead:
+
+- **Computation-Aligned PQ Layouts:** Organize PQ codebooks and encoded vectors for efficient memory access and vectorized distance computation.
+- **Reuse-Aware Merge Materialization:** Reuse valid existing PQ codes during Balanced Merge and re-encode only records whose encoding context changes.
+
+These optimizations reduce redundant computation in PQ-based search and incremental maintenance.
+
+**Implementation:** `src/index/ivf.cpp`, `src/index/merge.cpp`, `src/index/soa_kernels.cpp`
 
 ## Requirements
 
