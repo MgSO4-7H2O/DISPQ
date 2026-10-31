@@ -29,6 +29,29 @@
 #include "soa_kernels.h"
 
 namespace ann {
+
+void MainPartitionAdmission::ReadTicket::Release() { if (owner_) owner_->ReleaseRead(ids_); owner_=nullptr; }
+void MainPartitionAdmission::WriteTicket::Release() { if (owner_) owner_->ReleaseWrite(ids_); owner_=nullptr; }
+MainPartitionAdmission::ReadTicket MainPartitionAdmission::AcquireRead(const std::vector<uint32_t>& ids) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (uint32_t id : ids) if (readers_.size() <= id) { readers_.resize(id+1); pending_.resize(id+1); }
+  cv_.wait(lock, [&] { for (uint32_t id : ids) if (pending_[id]) return false; return true; });
+  for (uint32_t id : ids) ++readers_[id];
+  return ReadTicket(this, ids);
+}
+MainPartitionAdmission::WriteTicket MainPartitionAdmission::AcquireWrite(const std::vector<uint32_t>& ids) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (uint32_t id : ids) if (readers_.size() <= id) { readers_.resize(id+1); pending_.resize(id+1); }
+  for (uint32_t id : ids) pending_[id]=1;
+  cv_.wait(lock, [&] { for (uint32_t id : ids) if (readers_[id]) return false; return true; });
+  return WriteTicket(this, ids);
+}
+void MainPartitionAdmission::ReleaseRead(const std::vector<uint32_t>& ids) {
+  std::lock_guard<std::mutex> lock(mutex_); for (uint32_t id : ids) --readers_[id]; cv_.notify_all();
+}
+void MainPartitionAdmission::ReleaseWrite(const std::vector<uint32_t>& ids) {
+  std::lock_guard<std::mutex> lock(mutex_); for (uint32_t id : ids) pending_[id]=0; cv_.notify_all();
+}
 namespace {
 
 constexpr uint32_t kDefaultKMeansIterations = 20;
@@ -1683,12 +1706,27 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   }
 }
 
+std::vector<std::pair<float, uint32_t>> SelectMainProbes(
+    const IndexData& data, Eigen::Ref<const Eigen::VectorXf> qw, uint32_t probes) {
+  const bool has_norms = data.routing_centroid_norms.size() == data.routing_centroids.rows();
+  const float qnorm = qw.squaredNorm();
+  std::vector<std::pair<float, uint32_t>> distances(data.nlist);
+  for (uint32_t i=0;i<data.nlist;++i) {
+    const float dot=data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
+    const float norm=has_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i)) : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+    distances[i]={SquaredL2FromNormDot(norm,qnorm,dot),i};
+  }
+  std::partial_sort(distances.begin(),distances.begin()+probes,distances.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+  distances.resize(probes); return distances;
+}
+
 SearchResult SearchSingleQuery(const IndexData& data,
                                Eigen::Ref<const Eigen::VectorXf> qw,
                                uint32_t topk,
                                uint32_t probes,
                                uint8_t from_new,
-                               bool collect_scan_trace) {
+                               bool collect_scan_trace,
+                               const std::vector<std::pair<float,uint32_t>>* selected=nullptr) {
   auto heap_cmp = [](const Candidate& a, const Candidate& b) {
     return a.approx_dist < b.approx_dist;
   };
@@ -1704,20 +1742,9 @@ SearchResult SearchSingleQuery(const IndexData& data,
   const bool use_vectorized_code_soa_scan =
       use_pq && data.pq_codes_subquantizer_major &&
       internal::HasVectorizedPQCodeSoAScan();
-  const bool has_routing_norms =
-      data.routing_centroid_norms.size() == data.routing_centroids.rows();
   const float qw_norm = qw.squaredNorm();
-  std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
-  for (uint32_t i = 0; i < data.nlist; ++i) {
-    const float dot = data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
-    const float centroid_norm =
-        has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i))
-                          : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
-    const float dist = SquaredL2FromNormDot(centroid_norm, qw_norm, dot);
-    centroid_dists[static_cast<size_t>(i)] = {dist, i};
-  }
-  std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
-                    [](const auto& a, const auto& b) { return a.first < b.first; });
+  auto local_probes = selected ? std::vector<std::pair<float,uint32_t>>() : SelectMainProbes(data,qw,probes);
+  const auto& centroid_dists = selected ? *selected : local_probes;
 
   struct ProbeResult {
     std::vector<Candidate> heap;
@@ -3293,6 +3320,31 @@ class KMeansIVFIndex : public IVFIndex {
     return SearchSingleQuery(data, qw, topk, probes, from_new, collect_scan_trace);
   }
 
+  Result<MainSearchPlan> PrepareMainSearch(Eigen::Ref<const Eigen::VectorXf> qw,
+      uint32_t nprobe, const VersionSet& route_versions) const override {
+    std::shared_lock lock(mu_);
+    auto it=data_map_.find(route_versions.index_version);
+    if(it==data_map_.end()) return Status::NotFound("Index version not built");
+    const IndexData& data=*it->second;
+    if(static_cast<uint32_t>(qw.size())!=data.dim) return Status::InvalidArgument("Query dim mismatch");
+    MainSearchPlan plan;
+    plan.probes=SelectMainProbes(data,qw,std::max<uint32_t>(1,std::min<uint32_t>(nprobe,data.nlist)));
+    return plan;
+  }
+
+  Result<SearchResult> SearchMainAdmitted(Eigen::Ref<const Eigen::VectorXf> qw,
+      uint32_t topk,const VersionSet& route_versions,const MainSearchPlan& plan,
+      uint8_t from_new,bool collect_scan_trace) const override {
+    if(topk==0) return Status::InvalidArgument("topk must be positive");
+    // Concurrent evaluator's workload shared lock pins the Main object against rebuild.
+    auto it=data_map_.find(route_versions.index_version);
+    if(it==data_map_.end()) return Status::NotFound("Index version not built");
+    const IndexData& data=*it->second;
+    if(static_cast<uint32_t>(qw.size())!=data.dim) return Status::InvalidArgument("Query dim mismatch");
+    return SearchSingleQuery(data,qw,topk,static_cast<uint32_t>(plan.probes.size()),
+                             from_new,collect_scan_trace,&plan.probes);
+  }
+
   Result<std::vector<SearchResult>> SearchBatch(
       Eigen::Ref<const MatrixRM> qw_batch,
       uint32_t topk,
@@ -3613,7 +3665,9 @@ class KMeansIVFIndex : public IVFIndex {
   }
 
   Status CommitPartitionPatch(const VersionSet& route_versions,
-                              const PartitionPatch& patch) override {
+                              const PartitionPatch& patch,
+                              MainPartitionAdmission* admission,
+                              const std::function<void()>& publish) override {
     if (patch.partition_ids.size() != patch.replacement_records.size()) {
       return Status::InvalidArgument(
           "CommitPartitionPatch: partition_ids size mismatch with replacement_records");
@@ -3860,6 +3914,8 @@ class KMeansIVFIndex : public IVFIndex {
     const double prepare_publish_us = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - prepare_start).count();
     const auto commit_wait_start = std::chrono::steady_clock::now();
+    std::optional<MainPartitionAdmission::WriteTicket> writer_ticket;
+    if (admission != nullptr) writer_ticket.emplace(admission->AcquireWrite(patch.partition_ids));
     std::unique_lock lock(mu_);
     const auto commit_lock_acquired = std::chrono::steady_clock::now();
     const auto validation_start = commit_lock_acquired;
@@ -3935,6 +3991,8 @@ class KMeansIVFIndex : public IVFIndex {
     data.last_patch_pq_reencode_ms = pq_code_assignment_us / 1000.0;
     data.last_patch_profiling = profiling;
     data.last_patch_profiling.commit_done_at = std::chrono::steady_clock::now();
+    lock.unlock();
+    if (publish) publish();
     return Status::OK();
   }
 

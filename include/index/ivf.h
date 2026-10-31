@@ -1,10 +1,15 @@
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <condition_variable>
+#include <functional>
 #include <vector>
+#include <utility>
 
 #include <Eigen/Dense>
 
@@ -12,6 +17,58 @@
 #include "common/types.h"
 
 namespace ann {
+
+class MainPartitionAdmission {
+ public:
+  class ReadTicket {
+   public:
+    ReadTicket() = default;
+    ReadTicket(MainPartitionAdmission* owner, std::vector<uint32_t> ids)
+        : owner_(owner), ids_(std::move(ids)) {}
+    ReadTicket(const ReadTicket&) = delete;
+    ReadTicket& operator=(const ReadTicket&) = delete;
+    ReadTicket(ReadTicket&& x) noexcept : owner_(x.owner_), ids_(std::move(x.ids_)) { x.owner_ = nullptr; }
+    ReadTicket& operator=(ReadTicket&& x) noexcept { if (this != &x) { Release(); owner_=x.owner_; ids_=std::move(x.ids_); x.owner_=nullptr; } return *this; }
+    ~ReadTicket() { Release(); }
+   private:
+    friend class MainPartitionAdmission;
+    void Release();
+    MainPartitionAdmission* owner_{nullptr};
+    std::vector<uint32_t> ids_;
+  };
+  class WriteTicket {
+   public:
+    WriteTicket() = default;
+    WriteTicket(MainPartitionAdmission* owner, std::vector<uint32_t> ids)
+        : owner_(owner), ids_(std::move(ids)) {}
+    WriteTicket(const WriteTicket&) = delete;
+    WriteTicket& operator=(const WriteTicket&) = delete;
+    WriteTicket(WriteTicket&& x) noexcept : owner_(x.owner_), ids_(std::move(x.ids_)) { x.owner_=nullptr; }
+    WriteTicket& operator=(WriteTicket&& x) noexcept { if (this != &x) { Release(); owner_=x.owner_; ids_=std::move(x.ids_); x.owner_=nullptr; } return *this; }
+    ~WriteTicket() { Release(); }
+   private:
+    friend class MainPartitionAdmission;
+    void Release();
+    MainPartitionAdmission* owner_{nullptr};
+    std::vector<uint32_t> ids_;
+  };
+  ReadTicket AcquireRead(const std::vector<uint32_t>& ids);
+  WriteTicket AcquireWrite(const std::vector<uint32_t>& ids);
+  uint64_t epoch() const { return epoch_.load(std::memory_order_acquire); }
+  void Publish() { epoch_.fetch_add(1, std::memory_order_release); }
+ private:
+  friend class ReadTicket;
+  friend class WriteTicket;
+  void ReleaseRead(const std::vector<uint32_t>& ids);
+  void ReleaseWrite(const std::vector<uint32_t>& ids);
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::vector<uint32_t> readers_;
+  std::vector<uint8_t> pending_;
+  std::atomic<uint64_t> epoch_{0};
+};
+
+struct MainSearchPlan { std::vector<std::pair<float, uint32_t>> probes; };
 
 struct PQParams {
   bool enable{false};
@@ -293,6 +350,11 @@ class IVFIndex {
                                       const VersionSet& route_versions,
                                       uint8_t from_new,
                                       bool collect_scan_trace = false) const = 0;
+  virtual Result<MainSearchPlan> PrepareMainSearch(Eigen::Ref<const Eigen::VectorXf> qw,
+      uint32_t nprobe, const VersionSet& route_versions) const = 0;
+  virtual Result<SearchResult> SearchMainAdmitted(Eigen::Ref<const Eigen::VectorXf> qw,
+      uint32_t topk, const VersionSet& route_versions, const MainSearchPlan& plan,
+      uint8_t from_new, bool collect_scan_trace = false) const = 0;
 
   // TS: Batch search for multiple whitened queries.
   virtual Result<std::vector<SearchResult>> SearchBatch(
@@ -326,7 +388,9 @@ class IVFIndex {
       const std::vector<uint32_t>& partition_ids,
       const std::vector<AlignedVector<VectorRecord>>& replacement_records) const = 0;
   virtual Status CommitPartitionPatch(const VersionSet& route_versions,
-                                      const PartitionPatch& patch) = 0;
+                                      const PartitionPatch& patch,
+                                      MainPartitionAdmission* admission = nullptr,
+                                      const std::function<void()>& publish = {}) = 0;
   virtual Result<double> GetLastPatchPQReencodeMs(
       const VersionSet& route_versions) const = 0;
   virtual Result<PatchProfiling> GetLastPatchProfiling(

@@ -965,6 +965,7 @@ int main(int argc, char** argv) {
   std::condition_variable workload_entry_cv;
   bool rebuild_pending = false;
   std::mutex state_mutex;
+  ann::MainPartitionAdmission main_admission;
   std::mutex records_mutex;
   std::mutex version_mutex;
   std::mutex maintenance_mutex;
@@ -1222,7 +1223,14 @@ int main(int argc, char** argv) {
           else {
             auto merged = merge_frozen_delta_into_main(main_index, main_versions,
                                                         snapshot.value(), index_data,
-                                                        merge_options);
+                                                        merge_options, &main_admission, [&] {
+              std::lock_guard<std::mutex> lock(state_mutex);
+              if (state.frozen && state.frozen->id == frozen->id) {
+                state.main_rows += frozen->rows;
+                state.frozen.reset();
+                main_admission.Publish();
+              }
+            });
             if (!merged.ok()) report_failure(merged.status().ToString());
             else {
               merge_succeeded = true;
@@ -1266,11 +1274,6 @@ int main(int argc, char** argv) {
               merge_patch_partitions += merged.value().patch_partitions;
               merge_append_partitions += merged.value().append_partitions;
               merge_recluster_partitions += merged.value().recluster_partitions;
-              std::lock_guard<std::mutex> lock(state_mutex);
-              if (state.frozen && state.frozen->id == frozen->id) {
-                state.main_rows += frozen->rows;
-                state.frozen.reset();
-              }
             }
           }
           const auto merge_end = Clock::now();
@@ -1394,11 +1397,27 @@ int main(int argc, char** argv) {
         std::shared_ptr<IVFIndex> main_index;
         VersionSet main_versions;
         std::optional<Route> frozen, active;
-        {
-          std::lock_guard<std::mutex> lock(state_mutex);
-          main_index = state.main; main_versions = state.main_versions;
-          frozen = state.frozen; active = state.active;
+        MainSearchPlan main_plan;
+        std::optional<MainPartitionAdmission::ReadTicket> main_ticket;
+        for (;;) {
+          const uint64_t route_epoch = main_admission.epoch();
+          {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            main_index = state.main; main_versions = state.main_versions;
+            frozen = state.frozen; active = state.active;
+          }
+          auto prepared = main_index->PrepareMainSearch(
+              query_data.row(qid).transpose(), config.nprobe, main_versions);
+          if (!prepared.ok()) { report_failure(prepared.status().ToString()); stop_queries = true; break; }
+          main_plan = std::move(prepared.value());
+          std::vector<uint32_t> probe_ids;
+          probe_ids.reserve(main_plan.probes.size());
+          for (const auto& probe : main_plan.probes) probe_ids.push_back(probe.second);
+          main_ticket.emplace(main_admission.AcquireRead(probe_ids));
+          if (main_admission.epoch() == route_epoch) break;
+          main_ticket.reset();
         }
+        if (failed.load()) break;
         std::vector<Candidate> candidates;
         auto collect = [&](const std::shared_ptr<IVFIndex>& index, VersionSet versions,
                            uint8_t from_new, uint32_t candidate_count) {
@@ -1421,8 +1440,15 @@ int main(int argc, char** argv) {
         const uint32_t active_candidates = config.active_exact_rerank_candidates
                                                ? config.active_exact_rerank_candidates
                                                : default_candidates;
-        Status status = collect(main_index, main_versions, 0,
-                                config.exact_rerank_enable ? main_candidates : config.topk);
+        auto main_result = main_index->SearchMainAdmitted(
+            query_data.row(qid).transpose(),
+            config.exact_rerank_enable ? main_candidates : config.topk,
+            main_versions, main_plan, 0);
+        Status status = Status::OK();
+        if (!main_result.ok()) status = main_result.status();
+        else candidates.insert(candidates.end(), main_result.value().topk.begin(),
+                               main_result.value().topk.end());
+        main_ticket.reset();
         if (status.ok() && frozen)
           status = collect(frozen->index, frozen->versions, 1,
                            config.exact_rerank_enable ? frozen_candidates : config.topk);

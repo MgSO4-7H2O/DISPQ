@@ -883,7 +883,9 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
                                                  const VectorAccessor* vector_accessor,
                                                  const VectorAccessorMaterializationStats*
                                                      initial_materialization,
-                                                 const MergeOptions& options);
+                                                 const MergeOptions& options,
+                                                 MainPartitionAdmission* admission = nullptr,
+                                                 const std::function<void()>& publish = {});
 
 Result<FrozenDelta> freeze_delta(const std::shared_ptr<IVFIndex>& delta_ivf,
                                  const VersionSet& delta_versions) {
@@ -1550,11 +1552,13 @@ Result<PartitionPatch> PreparePartitionPatchImpl(
 
 Status commit_partition_patch(const std::shared_ptr<IVFIndex>& main_ivf,
                               const VersionSet& main_versions,
-                              const PartitionPatch& patch) {
+                              const PartitionPatch& patch,
+                              MainPartitionAdmission* admission = nullptr,
+                              const std::function<void()>& publish = {}) {
   if (!main_ivf) {
     return Status::InvalidArgument("commit_partition_patch: main_ivf is null");
   }
-  return main_ivf->CommitPartitionPatch(main_versions, patch);
+  return main_ivf->CommitPartitionPatch(main_versions, patch, admission, publish);
 }
 
 Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
@@ -1580,7 +1584,9 @@ Result<MergeReport> merge_frozen_delta_into_main(
     const VersionSet& main_versions,
     const FrozenDelta& frozen_delta,
     const VectorAccessor& vector_accessor,
-    const MergeOptions& options) {
+    const MergeOptions& options,
+    MainPartitionAdmission* admission,
+    const std::function<void()>& publish) {
   return MergeFrozenDeltaIntoMainImpl(
       main_ivf,
       main_versions,
@@ -1588,7 +1594,9 @@ Result<MergeReport> merge_frozen_delta_into_main(
       nullptr,
       &vector_accessor,
       nullptr,
-      options);
+      options,
+      admission,
+      publish);
 }
 
 Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>& main_ivf,
@@ -1598,7 +1606,9 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
                                                  const VectorAccessor* vector_accessor,
                                                  const VectorAccessorMaterializationStats*
                                                      initial_materialization,
-                                                 const MergeOptions& options) {
+                                                 const MergeOptions& options,
+                                                 MainPartitionAdmission* admission,
+                                                 const std::function<void()>& publish) {
   if (!main_ivf) {
     return Status::InvalidArgument("merge_frozen_delta_into_main: main_ivf is null");
   }
@@ -1665,7 +1675,7 @@ Result<MergeReport> MergeFrozenDeltaIntoMainImpl(const std::shared_ptr<IVFIndex>
   const double merge_compute_ms = merge_compute_timer.ElapsedMillis();
   profiling.compute_done_at = ProfilingClock::now();
   Timer commit_timer;
-  Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value());
+  Status commit = commit_partition_patch(main_ivf, main_versions, patch_res.value(), admission, publish);
   if (!commit.ok()) {
     return commit;
   }

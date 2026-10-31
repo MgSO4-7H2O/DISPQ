@@ -219,7 +219,9 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
                                                  const VersionSet& main_versions,
                                                  const FrozenDelta& frozen_delta,
                                                  const VectorAccessor& vector_accessor,
-                                                 const MergeOptions& options);
+                                                 const MergeOptions& options,
+                                                 MainPartitionAdmission* admission = nullptr,
+                                                 const std::function<void()>& publish = {});
 
 Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
                                                  const VersionSet& main_versions,
