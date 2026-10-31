@@ -3,7 +3,15 @@ set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 NODE=0
-DATASET="/home/ydy/data/sift/origin"
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 <dataset_dir>" >&2
+  exit 2
+fi
+if [[ ! -d "$1" ]]; then
+  echo "[ERROR] Dataset directory not found: $1" >&2
+  exit 1
+fi
+DATASET="$(cd "$1" && pwd)"
 CONFIG="$ROOT/configs/sift_concurrent_prepare.json"
 BINARY="$ROOT/build_release/run_concurrent_eval"
 GT_FILE="$ROOT/artifacts/sift_concurrent.gt"

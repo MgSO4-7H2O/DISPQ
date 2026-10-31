@@ -4,7 +4,15 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE=0
 CONFIG="$ROOT/configs/sift_batch.json"
-DATASET="/home/ydy/data/sift/origin"
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 <dataset_dir>" >&2
+  exit 2
+fi
+if [[ ! -d "$1" ]]; then
+  echo "[ERROR] Dataset directory not found: $1" >&2
+  exit 1
+fi
+DATASET="$(cd "$1" && pwd)"
 BINARY="$ROOT/build_release/run_eval"
 
 TS="$(date +%Y%m%d_%H%M%S)"

@@ -3,23 +3,22 @@ set -euo pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 NODE=0
-DATASET="/home/ydy/data/sift/origin"
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 <dataset_dir>" >&2
+  exit 2
+fi
+if [[ ! -d "$1" ]]; then
+  echo "[ERROR] Dataset directory not found: $1" >&2
+  exit 1
+fi
+DATASET="$(cd "$1" && pwd)"
 QUERY_CONFIG="$ROOT/configs/sift_concurrent_query.json"
 BINARY="$ROOT/build_release/run_concurrent_eval"
-PLOT_SCRIPT="$ROOT/scripts/plot_concurrent_timeline.py"
 GT_FILE="$ROOT/artifacts/sift_concurrent.gt"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="$ROOT/logs/sift1m_concurrent_${TS}"
 SUMMARY="$RUN_DIR/query_summary.json"
-TIMELINE="$RUN_DIR/query_summary_timeline.png"
-PYTHON="${PYTHON:-python3}"
-
-if [[ -x "$ROOT/.venv/bin/python3" ]]; then
-  PYTHON="$ROOT/.venv/bin/python3"
-elif [[ -x "/home/ydy/DISPQ_con/.venv/bin/python3" ]]; then
-  PYTHON="/home/ydy/DISPQ_con/.venv/bin/python3"
-fi
 
 cd "$ROOT"
 
@@ -28,7 +27,7 @@ if [[ ! -f "$GT_FILE" ]]; then
   echo "Run run_sift1m_concurrent_gt_prepare.sh first." >&2
   exit 1
 fi
-for path in "$QUERY_CONFIG" "$BINARY" "$PLOT_SCRIPT"; do
+for path in "$QUERY_CONFIG" "$BINARY"; do
   if [[ ! -f "$path" ]]; then
     echo "[ERROR] Required file not found: $path" >&2
     exit 1
@@ -59,13 +58,5 @@ numactl --cpunodebind="$NODE" --membind="$NODE" \
   "$SUMMARY" \
   2>&1 | tee "$RUN_DIR/query.log"
 
-echo "[2/2] Plotting concurrent timeline..."
-numactl --cpunodebind="$NODE" --membind="$NODE" \
-  "$PYTHON" "$PLOT_SCRIPT" \
-  "$SUMMARY" \
-  --output "$TIMELINE" \
-  2>&1 | tee "$RUN_DIR/plot.log"
-
 echo "[DONE] Summary: $SUMMARY"
-echo "Timeline: $TIMELINE"
 echo "Logs: $RUN_DIR"
