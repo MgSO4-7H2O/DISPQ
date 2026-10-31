@@ -1683,30 +1683,6 @@ void SwapEraseListPQCode(IndexData* data, uint32_t list_id, size_t pos) {
   }
 }
 
-using OrderedIVFProbes = std::vector<std::pair<float, uint32_t>>;
-
-OrderedIVFProbes SelectMainProbes(const IndexData& data,
-                                 Eigen::Ref<const Eigen::VectorXf> qw,
-                                 uint32_t probes) {
-  const bool has_routing_norms =
-      data.routing_centroid_norms.size() == data.routing_centroids.rows();
-  const float qw_norm = qw.squaredNorm();
-  OrderedIVFProbes centroid_dists(data.nlist);
-  for (uint32_t i = 0; i < data.nlist; ++i) {
-    const float dot = data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
-    const float centroid_norm =
-        has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i))
-                          : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
-    const float dist = SquaredL2FromNormDot(centroid_norm, qw_norm, dot);
-    centroid_dists[static_cast<size_t>(i)] = {dist, i};
-  }
-  std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
-                    [](const auto& a, const auto& b) { return a.first < b.first; });
-
-  centroid_dists.resize(probes);
-  return centroid_dists;
-}
-
 SearchResult SearchSingleQuery(const IndexData& data,
                                Eigen::Ref<const Eigen::VectorXf> qw,
                                uint32_t topk,
@@ -1728,8 +1704,20 @@ SearchResult SearchSingleQuery(const IndexData& data,
   const bool use_vectorized_code_soa_scan =
       use_pq && data.pq_codes_subquantizer_major &&
       internal::HasVectorizedPQCodeSoAScan();
+  const bool has_routing_norms =
+      data.routing_centroid_norms.size() == data.routing_centroids.rows();
   const float qw_norm = qw.squaredNorm();
-  const auto centroid_dists = SelectMainProbes(data, qw, probes);
+  std::vector<std::pair<float, uint32_t>> centroid_dists(data.nlist);
+  for (uint32_t i = 0; i < data.nlist; ++i) {
+    const float dot = data.routing_centroids.row(static_cast<Eigen::Index>(i)).dot(qw);
+    const float centroid_norm =
+        has_routing_norms ? data.routing_centroid_norms(static_cast<Eigen::Index>(i))
+                          : data.routing_centroids.row(static_cast<Eigen::Index>(i)).squaredNorm();
+    const float dist = SquaredL2FromNormDot(centroid_norm, qw_norm, dot);
+    centroid_dists[static_cast<size_t>(i)] = {dist, i};
+  }
+  std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + probes, centroid_dists.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
 
   struct ProbeResult {
     std::vector<Candidate> heap;
