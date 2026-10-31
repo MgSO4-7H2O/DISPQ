@@ -3334,7 +3334,7 @@ class KMeansIVFIndex : public IVFIndex {
   }
 
   Result<SearchResult> SearchMainAdmitted(Eigen::Ref<const Eigen::VectorXf> qw,
-      uint32_t topk,const VersionSet& route_versions,const MainSearchPlan& plan,
+      uint32_t topk,const MainSearchPlan& plan,
       uint8_t from_new,bool collect_scan_trace) const override {
     if(topk==0) return Status::InvalidArgument("topk must be positive");
     // The evaluator's workload shared barrier keeps this pointed-to Main object alive.

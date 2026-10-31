@@ -356,7 +356,7 @@ class IVFIndex {
   virtual Result<MainSearchPlan> PrepareMainSearch(Eigen::Ref<const Eigen::VectorXf> qw,
       uint32_t nprobe, const VersionSet& route_versions) const = 0;
   virtual Result<SearchResult> SearchMainAdmitted(Eigen::Ref<const Eigen::VectorXf> qw,
-      uint32_t topk, const VersionSet& route_versions, const MainSearchPlan& plan,
+      uint32_t topk, const MainSearchPlan& plan,
       uint8_t from_new, bool collect_scan_trace = false) const = 0;
 
   // TS: Batch search for multiple whitened queries.

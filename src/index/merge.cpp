@@ -1579,6 +1579,18 @@ Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>
       main_ivf, main_versions, frozen_delta, vector_accessor, options);
 }
 
+Result<MergeReport> merge_frozen_delta_into_main(const std::shared_ptr<IVFIndex>& main_ivf,
+                                                 const VersionSet& main_versions,
+                                                 const FrozenDelta& frozen_delta,
+                                                 const MatrixRM& base_vectors,
+                                                 const MergeOptions& options,
+                                                 MainPartitionAdmission* admission,
+                                                 const std::function<void()>& publish) {
+  MatrixVectorAccessor vector_accessor(base_vectors);
+  return merge_frozen_delta_into_main(
+      main_ivf, main_versions, frozen_delta, vector_accessor, options, admission, publish);
+}
+
 Result<MergeReport> merge_frozen_delta_into_main(
     const std::shared_ptr<IVFIndex>& main_ivf,
     const VersionSet& main_versions,

@@ -1443,7 +1443,7 @@ int main(int argc, char** argv) {
         auto main_result = main_index->SearchMainAdmitted(
             query_data.row(qid).transpose(),
             config.exact_rerank_enable ? main_candidates : config.topk,
-            main_versions, main_plan, 0);
+            main_plan, 0);
         Status status = Status::OK();
         if (!main_result.ok()) status = main_result.status();
         else candidates.insert(candidates.end(), main_result.value().topk.begin(),
